@@ -15,3 +15,8 @@ test_sort_proper
 test_match
 test_eval
 test_offset_sum
+test_sort_single
+test_sort_two
+test_chain_debug
+test_chain_debug2
+test_simple_sort

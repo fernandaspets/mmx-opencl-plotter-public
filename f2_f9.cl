@@ -283,7 +283,7 @@ __kernel void hybrid_sort_y(
     const uint num_sub_buckets)
 {
     const uint x = get_local_id(0);
-    const uint y = get_group_id(0);  // sub-bucket index
+    const uint y = get_group_id(1);  // sub-bucket index
 
     if (y >= num_sub_buckets) return;
 
@@ -330,6 +330,7 @@ __kernel void hybrid_sort_y(
         if (x < len) {
             data[y * max_bucket_size + off + x] = buffer[x * (NUM_THREADS + 1) + i];
         }
+        barrier(CLK_LOCAL_MEM_FENCE);  // ensure all reads from buffer before next off
         off += len;
     }
 }
@@ -526,7 +527,7 @@ __kernel void write_pd_kernel(
     const uint max_bucket_size)
 {
     const uint x = get_global_id(0);
-    const uint y = get_group_id(0);
+    const uint y = get_group_id(1);
 
     if (x >= min(bucket_size[y], max_bucket_size)) return;
 
@@ -552,7 +553,7 @@ __kernel void write_x2_kernel(
     const uint xbits_arg2)
 {
     const uint x = get_global_id(0);
-    const uint y = get_group_id(0);
+    const uint y = get_group_id(1);
 
     if (x >= min(bucket_size[y], max_bucket_size)) return;
 
@@ -578,7 +579,7 @@ __kernel void write_y_kernel(
     const uint max_bucket_size)
 {
     const uint x = get_global_id(0);
-    const uint y = get_group_id(0);
+    const uint y = get_group_id(1);
 
     if (x >= min(bucket_size[y], max_bucket_size)) return;
 
@@ -599,7 +600,7 @@ __kernel void write_meta_kernel(
     const uint max_bucket_size)
 {
     const uint x = get_global_id(0);
-    const uint y = get_group_id(0);
+    const uint y = get_group_id(1);
 
     if (x >= min(bucket_size[y], max_bucket_size)) return;
 
