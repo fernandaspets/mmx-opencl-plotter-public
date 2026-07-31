@@ -7,3 +7,11 @@ verify_pd
 *.o
 *.a
 *.so
+test_scatter_2
+test_sort
+test_sort_simple
+test_sort_debug
+test_sort_proper
+test_match
+test_eval
+test_offset_sum
