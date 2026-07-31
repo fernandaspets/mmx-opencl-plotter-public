@@ -1,0 +1,9 @@
+build/
+debug_plot
+test_pipeline
+test_table_hash
+trace_proof
+verify_pd
+*.o
+*.a
+*.so
