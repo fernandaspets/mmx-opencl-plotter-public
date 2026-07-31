@@ -1262,6 +1262,8 @@ struct MemBucketStore {
     std::vector<uint32_t> counts;
     // PD tracking: pd_buckets[y] = [count * 2] flat array of (sorted_pos, delta) pairs
     std::vector<std::vector<uint32_t>> pd_buckets;
+    // X values (F1 indices): x_values[y] = [count] flat array of F1 indices
+    std::vector<std::vector<uint32_t>> x_values;
     
     MemBucketStore(int nb, int mbs, int nm)
         : num_buckets(nb), max_bucket_size(mbs), n_meta(nm)
@@ -1269,11 +1271,13 @@ struct MemBucketStore {
         buckets.resize(nb);
         counts.resize(nb, 0);
         pd_buckets.resize(nb);
+        x_values.resize(nb);
     }
     
     void clear() {
         for(auto& b : buckets) b.clear();
         for(auto& p : pd_buckets) p.clear();
+        for(auto& x : x_values) x.clear();
         std::fill(counts.begin(), counts.end(), 0);
     }
     
@@ -1292,6 +1296,12 @@ struct MemBucketStore {
         if(bucket < 0 || bucket >= num_buckets) return;
         auto& p = pd_buckets[bucket];
         p.insert(p.end(), pd, pd + count * 2);  // 2 uint32s per entry: (sorted_pos, delta)
+    }
+    
+    void append_x(int bucket, const uint32_t* x, uint32_t count) {
+        if(bucket < 0 || bucket >= num_buckets) return;
+        auto& xv = x_values[bucket];
+        xv.insert(xv.end(), x, x + count);
     }
 };
 
@@ -1321,6 +1331,8 @@ void compute_f1_chunked(
         plotter.compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
         
         for(int i = 0; i < num_buckets; i++) batch_buckets[i].clear();
+        // Also batch X values (F1 indices) per bucket
+        std::vector<std::vector<uint32_t>> batch_x(num_buckets);
         
         for(uint32_t i = 0; i < count; i++) {
             uint32_t Y = Y_batch[i];
@@ -1328,12 +1340,14 @@ void compute_f1_chunked(
             if(bucket >= (uint32_t)num_buckets) bucket = num_buckets - 1;
             for(int j = 0; j < n_meta; j++)
                 batch_buckets[bucket].push_back(M_batch[i * n_meta + j]);
+            batch_x[bucket].push_back(X_batch[i]);  // Save F1 index
         }
         
         for(int y = 0; y < num_buckets; y++) {
             if(batch_buckets[y].empty()) continue;
             uint32_t cnt = batch_buckets[y].size() / n_meta;
             store.append(y, batch_buckets[y].data(), cnt);
+            store.append_x(y, batch_x[y].data(), cnt);
         }
         
         if(b % 16 == 0 || b == num_batches - 1) {
@@ -1440,7 +1454,8 @@ void process_bucket_gpu(
     MemBucketStore& src,
     MemBucketStore& dst,
     int y,
-    int table)
+    int table,
+    std::vector<std::pair<uint32_t, uint32_t>>* x_pairs_out = nullptr)
 {
     const int n_meta = src.n_meta;
     const int shift = KSIZE - LOGBUCKETS;
@@ -1566,6 +1581,19 @@ void process_bucket_gpu(
     std::vector<uint32_t> LR_filtered(gpu_matches * 2);
     clEnqueueReadBuffer(plotter.queue, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
     
+    // For table 2: save LR pairs as X_pairs (lookup F1 indices from store)
+    if(x_pairs_out && table == 2) {
+        const std::vector<uint32_t>& x_vals = src.x_values[y];
+        for(uint32_t i = 0; i < gpu_matches; i++) {
+            uint32_t left_local = LR_filtered[i * 2];
+            uint32_t right_local = LR_filtered[i * 2 + 1];
+            // Look up global F1 indices
+            uint32_t left_x = (left_local < x_vals.size()) ? x_vals[left_local] : 0;
+            uint32_t right_x = (right_local < x_vals.size()) ? x_vals[right_local] : 0;
+            x_pairs_out->push_back({left_x, right_x});
+        }
+    }
+    
     if(LR_filtered.empty()) {
         clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
         clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
@@ -1686,15 +1714,19 @@ void compute_f2_f9_chunked(
     int max_bucket_size,
     int n_meta,
     bool gpu_yield,
-    std::vector<std::vector<PDEntry>>& pd_all)
+    std::vector<std::vector<PDEntry>>& pd_all,
+    std::vector<std::pair<uint32_t, uint32_t>>& x_pairs_all)
 {
     MemBucketStore src(num_buckets, max_bucket_size, n_meta);
     MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
     
-    // Copy F1 output to src
+    // Copy F1 output to src (metadata + X values)
     for(int y = 0; y < num_buckets; y++) {
-        if(store.counts[y] > 0)
+        if(store.counts[y] > 0) {
             src.append(y, store.buckets[y].data(), store.counts[y]);
+            if(store.x_values[y].size() > 0)
+                src.append_x(y, store.x_values[y].data(), store.counts[y]);
+        }
     }
     
     pd_all.resize(MY_N_TABLE + 1);
@@ -1706,7 +1738,7 @@ void compute_f2_f9_chunked(
         
         for(int y = 0; y < num_buckets; y++) {
             if(src.counts[y] == 0) continue;
-            process_bucket_gpu(plotter, src, dst, y, t);
+            process_bucket_gpu(plotter, src, dst, y, t, (t == 2) ? &x_pairs_all : nullptr);
             
             // Display yield
             if(gpu_yield) {
@@ -1755,10 +1787,17 @@ void compute_f2_f9_chunked(
         std::cout << "[T" << t << "] PD saved: " << pd_all[t].size() << " entries ("
                   << (my_time_ms() - tpd0) / 1000.0 << " sec)" << std::endl;
         
+        // For table 2, X_pairs were saved during process_bucket_gpu
+        // x_pairs_all now has all LR pairs (F1 indices) for table 2
+        if(t == 2) {
+            std::cout << "[T2] X_pairs saved: " << x_pairs_all.size() << " entries" << std::endl;
+        }
+        
         // Swap src and dst
         std::swap(src.buckets, dst.buckets);
         std::swap(src.counts, dst.counts);
         std::swap(src.pd_buckets, dst.pd_buckets);
+std::swap(src.x_values, dst.x_values);
         dst.clear();
     }
     
@@ -1779,7 +1818,8 @@ void compute_f2_f9_chunked(
 void build_plot_data_from_store(
     MemBucketStore& store,
     PlotData& plot,
-    std::vector<std::vector<PDEntry>>& pd_all)
+    std::vector<std::vector<PDEntry>>& pd_all,
+    std::vector<std::pair<uint32_t, uint32_t>>& x_pairs_all)
 {
     const int n_meta = store.n_meta;
     
@@ -1875,7 +1915,28 @@ void build_plot_data_from_store(
         
         std::cout << "[Plot] PD[" << t << "]: " << plot.PD[t].size() << " entries" << std::endl;
     }
-    plot.X_pairs.clear();
+    // Build X_pairs from x_pairs_all (table 2 LR pairs = F1 indices)
+    // Sort by Y to match PD[2] ordering
+    if(!x_pairs_all.empty() && pd_all.size() > 2 && !pd_all[2].empty()) {
+        // Sort x_pairs by the Y values from pd_all[2]
+        std::vector<uint32_t> x_indices(x_pairs_all.size());
+        for(size_t i = 0; i < x_indices.size(); i++) x_indices[i] = i;
+        
+        auto x_sort = [&pd_all](uint32_t a, uint32_t b) {
+            if(a < pd_all[2].size() && b < pd_all[2].size())
+                return pd_all[2][a].Y < pd_all[2][b].Y;
+            return a < b;
+        };
+        std::sort(x_indices.begin(), x_indices.end(), x_sort);
+        
+        plot.X_pairs.resize(x_indices.size());
+        for(size_t i = 0; i < x_indices.size(); i++) {
+            plot.X_pairs[i] = x_pairs_all[x_indices[i]];
+        }
+        std::cout << "[Plot] X_pairs: " << plot.X_pairs.size() << " entries" << std::endl;
+    } else {
+        plot.X_pairs.clear();
+    }
     plot.num_entries.resize(MY_N_TABLE + 1);
     plot.num_entries[MY_N_TABLE] = unique_indices.size();
     plot.num_entries[MY_N_TABLE] = unique_indices.size();
@@ -2013,12 +2074,13 @@ std::vector<std::vector<PDEntry>> pd_all;
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
-        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield, pd_all);
+        std::vector<std::pair<uint32_t, uint32_t>> x_pairs_all;
+        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield, pd_all, x_pairs_all);
         
         // Build PlotData from final bucket store
         std::cout << "\n[Plot] Building plot data from bucket store..." << std::endl;
         PlotData plot;
-        build_plot_data_from_store(store, plot, pd_all);
+        build_plot_data_from_store(store, plot, pd_all, x_pairs_all);
         
         // Write plot file
         std::cout << "\n[Plot] Writing plot file..." << std::endl;
