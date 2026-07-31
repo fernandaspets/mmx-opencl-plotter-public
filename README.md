@@ -12,14 +12,16 @@ This is a hybrid GPU+CPU plotter — F1 runs on GPU, F2-F9 matching/sorting/hash
 2. **F2-F9 on CPU** — parallel radix sort + Y,Y+1 matching + GPU-assisted SHA-512 table hashing
 3. **Plot file writing** — parallel park generation with bit-stream encoding
 
-## Performance (k26)
+## Performance (k26, RAM disk)
 
 | Component | Time |
 |-----------|------|
 | F1 (GPU) | 51 sec |
-| F2-F9 (CPU + GPU hash) | 211 sec |
-| Plot writing | 12 sec |
-| **Total** | **274 sec** |
+| F2-F9 (CPU sort + GPU hash) | 115 sec |
+| Plot writing + copy | 13 sec |
+| **Total** | **178 sec** |
+
+Without RAM disk (direct to SSD): ~237 sec.
 
 ## Verification
 
