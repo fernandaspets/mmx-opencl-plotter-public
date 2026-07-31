@@ -1673,13 +1673,20 @@ void process_bucket_gpu(
     clReleaseMemObject(Y_out_buf); clReleaseMemObject(M_out_buf);
 }
 
+// PD per table entry: Y value + (sorted_pos, delta)
+struct PDEntry {
+    uint32_t Y;
+    uint32_t sorted_pos;
+    uint32_t delta;
+};
 void compute_f2_f9_chunked(
     OCL_Plotter& plotter,
     MemBucketStore& store,
     int num_buckets,
     int max_bucket_size,
     int n_meta,
-    bool gpu_yield)
+    bool gpu_yield,
+    std::vector<std::vector<PDEntry>>& pd_all)
 {
     MemBucketStore src(num_buckets, max_bucket_size, n_meta);
     MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
@@ -1690,6 +1697,7 @@ void compute_f2_f9_chunked(
             src.append(y, store.buckets[y].data(), store.counts[y]);
     }
     
+    pd_all.resize(MY_N_TABLE + 1);
     auto t0 = my_time_ms();
     
     for(int t = 2; t <= MY_N_TABLE; t++) {
@@ -1700,10 +1708,11 @@ void compute_f2_f9_chunked(
             if(src.counts[y] == 0) continue;
             process_bucket_gpu(plotter, src, dst, y, t);
             
-            // Display yield: let GPU service display output between buckets
-            // Prevents display freeze on GPUs that also drive display
-            clFinish(plotter.queue);
-            usleep(500);  // 0.5 ms yield
+            // Display yield
+            if(gpu_yield) {
+                clFinish(plotter.queue);
+                usleep(500);
+            }
             
             if(y % 32 == 0 || y == num_buckets - 1) {
                 std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
@@ -1717,9 +1726,39 @@ void compute_f2_f9_chunked(
         for(int y = 0; y < num_buckets; y++) total += dst.counts[y];
         std::cout << "\n[T" << t << "] " << total << " entries (" << elapsed << " sec)" << std::endl;
         
+        // Save PD for this table: collect (Y, sorted_pos, delta) from dst
+        auto tpd0 = my_time_ms();
+        pd_all[t].clear();
+        pd_all[t].reserve(total);
+        for(int y = 0; y < num_buckets; y++) {
+            uint32_t cnt = dst.counts[y];
+            if(cnt == 0) continue;
+            const uint32_t* meta = dst.buckets[y].data();
+            const uint32_t* pd = dst.pd_buckets[y].data();
+            bool has_pd = (dst.pd_buckets[y].size() >= (size_t)cnt * 2);
+            for(uint32_t i = 0; i < cnt; i++) {
+                uint32_t Y = 0;
+                for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
+                Y &= KMASK;
+                PDEntry entry;
+                entry.Y = Y;
+                if(has_pd) {
+                    entry.sorted_pos = pd[i * 2];
+                    entry.delta = pd[i * 2 + 1];
+                } else {
+                    entry.sorted_pos = 0;
+                    entry.delta = 0;
+                }
+                pd_all[t].push_back(entry);
+            }
+        }
+        std::cout << "[T" << t << "] PD saved: " << pd_all[t].size() << " entries ("
+                  << (my_time_ms() - tpd0) / 1000.0 << " sec)" << std::endl;
+        
+        // Swap src and dst
         std::swap(src.buckets, dst.buckets);
         std::swap(src.counts, dst.counts);
-std::swap(src.pd_buckets, dst.pd_buckets);
+        std::swap(src.pd_buckets, dst.pd_buckets);
         dst.clear();
     }
     
@@ -1739,7 +1778,8 @@ std::swap(src.pd_buckets, dst.pd_buckets);
 // Collects all entries from all buckets, sorts by Y, deduplicates
 void build_plot_data_from_store(
     MemBucketStore& store,
-    PlotData& plot)
+    PlotData& plot,
+    std::vector<std::vector<PDEntry>>& pd_all)
 {
     const int n_meta = store.n_meta;
     
@@ -1807,17 +1847,33 @@ void build_plot_data_from_store(
         plot.final_meta[i] = all_meta[unique_indices[i]];
     }
     
-    // Build PD[9] from collected PD data (sorted by Y)
+    // Build PD for ALL tables (2..9) from pd_all
+    // Each pd_all[t] has entries with (Y, sorted_pos, delta)
+    // Sort by Y — NO deduplication (PD must have one entry per match)
     plot.PD.resize(MY_N_TABLE + 1);
-    plot.PD[MY_N_TABLE].resize(unique_indices.size());
-    for(size_t i = 0; i < unique_indices.size(); i++) {
-        plot.PD[MY_N_TABLE][i] = all_pd[unique_indices[i]];
-    }
-    
-    // Earlier PD tables (2..8) are not yet tracked — WIP
-    // For now, leave them empty. mmx_postool will fail on tables 2-8 PD reads.
-    for(int t = 2; t < MY_N_TABLE; t++) {
-        plot.PD[t].clear();  // empty
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        if(t >= (int)pd_all.size() || pd_all[t].empty()) {
+            plot.PD[t].clear();
+            continue;
+        }
+        
+        // Sort pd_all[t] by Y
+        std::vector<uint32_t> pd_indices(pd_all[t].size());
+        for(size_t i = 0; i < pd_indices.size(); i++) pd_indices[i] = i;
+        
+        auto pd_sort = [&pd_all, t](uint32_t a, uint32_t b) {
+            return pd_all[t][a].Y < pd_all[t][b].Y;
+        };
+        std::sort(pd_indices.begin(), pd_indices.end(), pd_sort);
+        
+        // Build PD[t] sorted by Y (NO deduplication)
+        plot.PD[t].resize(pd_indices.size());
+        for(size_t i = 0; i < pd_indices.size(); i++) {
+            auto& pe = pd_all[t][pd_indices[i]];
+            plot.PD[t][i] = {pe.sorted_pos, pe.delta};
+        }
+        
+        std::cout << "[Plot] PD[" << t << "]: " << plot.PD[t].size() << " entries" << std::endl;
     }
     plot.X_pairs.clear();
     plot.num_entries.resize(MY_N_TABLE + 1);
@@ -1951,17 +2007,18 @@ else if(arg == "--no-yield") gpu_yield = false;
         MemBucketStore store(num_buckets, max_bucket_size, n_meta);
         
 auto t0 = my_time_ms();
+std::vector<std::vector<PDEntry>> pd_all;
         // F1 → bucket store
         compute_f1_chunked(plotter, plot_id, store, 1 << 18);
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
-        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield);
+        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield, pd_all);
         
         // Build PlotData from final bucket store
         std::cout << "\n[Plot] Building plot data from bucket store..." << std::endl;
         PlotData plot;
-        build_plot_data_from_store(store, plot);
+        build_plot_data_from_store(store, plot, pd_all);
         
         // Write plot file
         std::cout << "\n[Plot] Writing plot file..." << std::endl;
