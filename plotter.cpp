@@ -285,6 +285,9 @@ public:
     }
     
     cl_kernel table_hash_kernel = nullptr;
+    cl_kernel hash_lr_kernel = nullptr;
+    cl_kernel eval_p1_tx_kernel = nullptr;
+    cl_program f2f9_program = nullptr;
     
     void init_table_hash() {
         std::string kernel_path = "table_hash.cl";
@@ -303,6 +306,8 @@ public:
         }
         
         table_hash_kernel = clCreateKernel(prog, "hash_table_entries", &err);
+        hash_lr_kernel = clCreateKernel(prog, "hash_table_lr", &err);
+        if(err != CL_SUCCESS) throw std::runtime_error("hash_table_lr not found");
         if(err != CL_SUCCESS) throw std::runtime_error("hash_table_entries not found");
         std::cout << "[OCL] Table hash kernel loaded" << std::endl;
     }
@@ -343,6 +348,193 @@ public:
         
         clReleaseMemObject(Lb); clReleaseMemObject(Rb);
         clReleaseMemObject(Yb); clReleaseMemObject(Mb);
+    }
+    
+    // Optimized: hash using M_curr + LR pairs directly (no CPU meta extraction)
+    void gpu_hash_table_lr(
+        const std::vector<uint32_t>& M_curr_flat,  // [num_total * 14] all metadata
+        const std::vector<uint32_t>& LR_flat,      // [num_matches * 2] P1,P2 indices
+        std::vector<uint32_t>& Y_out,
+        std::vector<uint32_t>& M_out,
+        uint32_t kmask)
+    {
+        const size_t num = LR_flat.size() / 2;
+        if(num == 0) { Y_out.clear(); M_out.clear(); return; }
+        
+        cl_int err2;
+        cl_mem Mb = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            M_curr_flat.size() * 4, (void*)M_curr_flat.data(), &err2);
+        cl_mem LRb = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            LR_flat.size() * 4, (void*)LR_flat.data(), &err2);
+        cl_mem Yb = clCreateBuffer(context, CL_MEM_WRITE_ONLY, num * 4, nullptr, &err2);
+        cl_mem Mb_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, num * MY_N_META * 4, nullptr, &err2);
+        
+        uint32_t num_u32 = (uint32_t)num;
+        clSetKernelArg(hash_lr_kernel, 0, sizeof(cl_mem), &Mb);
+        clSetKernelArg(hash_lr_kernel, 1, sizeof(cl_mem), &LRb);
+        clSetKernelArg(hash_lr_kernel, 2, sizeof(cl_mem), &Yb);
+        clSetKernelArg(hash_lr_kernel, 3, sizeof(cl_mem), &Mb_out);
+        clSetKernelArg(hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(hash_lr_kernel, 5, sizeof(uint32_t), &num_u32);
+        
+        size_t global = num, local = 64;
+        if(global % local) global = ((global/local)+1)*local;
+        clEnqueueNDRangeKernel(queue, hash_lr_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        
+        Y_out.resize(num);
+        M_out.resize(num * MY_N_META);
+        clEnqueueReadBuffer(queue, Yb, CL_TRUE, 0, num*4, Y_out.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(queue, Mb_out, CL_TRUE, 0, num*MY_N_META*4, M_out.data(), 0, nullptr, nullptr);
+        
+        clReleaseMemObject(Mb); clReleaseMemObject(LRb);
+        clReleaseMemObject(Yb); clReleaseMemObject(Mb_out);
+    }
+    
+    void init_eval_kernel() {
+        std::string kernel_path = "f2_f9.cl";
+        FILE* f = fopen(kernel_path.c_str(), "r");
+        if(!f) throw std::runtime_error("Cannot open " + kernel_path);
+        fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char* src = new char[sz+1]; size_t rd = fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+        
+        cl_int err2;
+        f2f9_program = clCreateProgramWithSource(context, 1, (const char**)&src, &sz, &err2);
+        delete[] src;
+        
+        // Build with current constants
+        std::string opts = "-DKSIZE=" + std::to_string(KSIZE)
+                         + " -DLOGBUCKETS=" + std::to_string(LOGBUCKETS)
+                         + " -DLOGBUCKETS2=" + std::to_string(KSIZE - LOGBUCKETS - 9)
+                         + " -DN_META=" + std::to_string(MY_N_META)
+                         + " -DN_META_OUT=" + std::to_string(MY_N_META_OUT)
+                         + " -DN_TABLE=" + std::to_string(MY_N_TABLE)
+                         + " -DDSIZE_=5 -DPSIZE_=" + std::to_string(KSIZE + 1)
+                         + " -DPDSIZE=" + std::to_string(PDSIZE)
+                         + " -DX2SIZE=" + std::to_string(2 * XBITS - 1)
+                         + " -DXBITS=" + std::to_string(XBITS)
+                         + " -DHYBRID_SORT_LOG_THREADS=6 -DNUM_THREADS=64"
+                         + " -DKMASK=" + std::to_string(KMASK)
+                         + " -DDMASK=31 -DMETA_BYTES=" + std::to_string(MY_N_META * 4)
+                         + " -DMAX_LOCAL_SIZE=40";
+        
+        err2 = clBuildProgram(f2f9_program, 1, &device, opts.c_str(), nullptr, nullptr);
+        if(err2 != CL_SUCCESS) {
+            char log[4096]; clGetProgramBuildInfo(f2f9_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+            throw std::runtime_error(std::string("f2_f9 build failed: ") + log);
+        }
+        
+        eval_p1_tx_kernel = clCreateKernel(f2f9_program, "eval_p1_tx", &err2);
+        if(err2 != CL_SUCCESS) throw std::runtime_error("eval_p1_tx not found");
+        std::cout << "[OCL] eval_p1_tx kernel loaded" << std::endl;
+    }
+    
+    // New method: hash table using eval_p1_tx kernel (indexes C_in directly via LR pairs)
+    void gpu_eval_table(
+        const std::vector<uint32_t>& C_in,      // [num_entries * N_META] metadata for all entries
+        const std::vector<uint32_t>& LR_flat,   // [num_matches * 2] P_1, P_2 pairs
+        std::vector<uint32_t>& Y_out,
+        std::vector<uint32_t>& M_out,
+        int table)
+    {
+        const size_t num = LR_flat.size() / 2;
+        if(num == 0) { Y_out.clear(); M_out.clear(); return; }
+        
+        const int num_buckets = 1 << LOGBUCKETS;
+        // Max entries per output bucket. For k entries distributed into num_buckets,
+        // avg per bucket = k / num_buckets. Use 4x avg + 4096 as safety margin.
+        const size_t avg_per_bucket = num / num_buckets;
+        const int max_bucket_size = std::max((size_t)4096, avg_per_bucket * 2 + 4096);
+        
+        cl_int err2;
+        cl_mem C_in_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            C_in.size() * 4, (void*)C_in.data(), &err2);
+        cl_mem LR_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            LR_flat.size() * 4, (void*)LR_flat.data(), &err2);
+        uint32_t num32 = (uint32_t)num;
+        cl_mem num_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            4, (void*)&num32, &err2);
+        
+        ulong PD_0 = 0;
+        uint max_bs = max_bucket_size;
+        uint x2size = 2 * XBITS - 1, xbits = XBITS;
+        uint write_y = (table >= MY_N_TABLE) ? 1 : 0;
+        uint write_c = 1, has_pd_in = 0, has_x_in = 0;
+        
+        // Y_out: only needed for table >= N_TABLE, otherwise minimal
+        size_t y_buf_size = write_y ? (size_t)num_buckets * max_bucket_size * 4 : 4;
+        // C_out: always needed (metadata for next table)
+        size_t c_buf_size = (size_t)num_buckets * max_bucket_size * MY_N_META * 4;
+        // PD_out: not needed for our CPU-driven pipeline (PD computed separately on CPU)
+        // But kernel always writes to it, so allocate minimal size
+        size_t pd_buf_size = 4;
+        
+        cl_mem Y_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY, y_buf_size, nullptr, &err2);
+        cl_mem C_out_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY, c_buf_size, nullptr, &err2);
+        cl_mem cnt_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, num_buckets * 4, nullptr, &err2);
+        cl_mem PD_out_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY, pd_buf_size, nullptr, &err2);
+        cl_mem null_mem = nullptr;
+        
+        int zero = 0;
+        clEnqueueFillBuffer(queue, cnt_buf, &zero, 4, 0, num_buckets * 4, 0, nullptr, nullptr);
+        clEnqueueFillBuffer(queue, PD_out_buf, &zero, 4, 0, pd_buf_size, 0, nullptr, nullptr);
+        
+        clSetKernelArg(eval_p1_tx_kernel, 0, sizeof(cl_mem), &Y_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 1, sizeof(cl_mem), &C_out_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 2, sizeof(cl_mem), &PD_out_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 3, sizeof(cl_mem), &cnt_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 4, sizeof(cl_mem), &C_in_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 5, sizeof(cl_mem), &null_mem);
+        clSetKernelArg(eval_p1_tx_kernel, 6, sizeof(cl_mem), &null_mem);
+        clSetKernelArg(eval_p1_tx_kernel, 7, sizeof(cl_mem), &LR_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 8, sizeof(cl_mem), &num_buf);
+        clSetKernelArg(eval_p1_tx_kernel, 9, sizeof(ulong), &PD_0);
+        clSetKernelArg(eval_p1_tx_kernel, 10, sizeof(uint), &max_bs);
+        clSetKernelArg(eval_p1_tx_kernel, 11, sizeof(uint), &x2size);
+        clSetKernelArg(eval_p1_tx_kernel, 12, sizeof(uint), &xbits);
+        uint table_u32 = (uint)table;
+        clSetKernelArg(eval_p1_tx_kernel, 13, sizeof(uint), &table_u32);
+        clSetKernelArg(eval_p1_tx_kernel, 14, sizeof(uint), &write_y);
+        clSetKernelArg(eval_p1_tx_kernel, 15, sizeof(uint), &write_c);
+        clSetKernelArg(eval_p1_tx_kernel, 16, sizeof(uint), &has_pd_in);
+        clSetKernelArg(eval_p1_tx_kernel, 17, sizeof(uint), &has_x_in);
+        
+        size_t global = num;
+        if(global % 64) global = ((global / 64) + 1) * 64;
+        clEnqueueNDRangeKernel(queue, eval_p1_tx_kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+        
+        // Read back bucket counts
+        std::vector<uint32_t> cnt(num_buckets);
+        clEnqueueReadBuffer(queue, cnt_buf, CL_TRUE, 0, num_buckets * 4, cnt.data(), 0, nullptr, nullptr);
+        
+        // Read back Y (only if write_y) and C
+        std::vector<uint32_t> Y_gpu(write_y ? num_buckets * max_bucket_size : 0, 0);
+        std::vector<uint32_t> C_gpu(num_buckets * max_bucket_size * MY_N_META, 0);
+        if(write_y) {
+            clEnqueueReadBuffer(queue, Y_buf, CL_TRUE, 0, num_buckets * max_bucket_size * 4, Y_gpu.data(), 0, nullptr, nullptr);
+        }
+        clEnqueueReadBuffer(queue, C_out_buf, CL_TRUE, 0, num_buckets * max_bucket_size * MY_N_META * 4, C_gpu.data(), 0, nullptr, nullptr);
+        
+        // Flatten output
+        Y_out.clear(); M_out.clear();
+        for(int b = 0; b < num_buckets; b++) {
+            for(int j = 0; j < (int)cnt[b]; j++) {
+                if(write_y && b * max_bucket_size + j < (int)Y_gpu.size()) {
+                    Y_out.push_back(Y_gpu[b * max_bucket_size + j]);
+                } else {
+                    // Compute Y from metadata
+                    uint32_t Y = 0;
+                    for(int m = 0; m < MY_N_META; m++) Y ^= C_gpu[(b * max_bucket_size + j) * MY_N_META + m];
+                    Y_out.push_back(Y & KMASK);
+                }
+                for(int m = 0; m < MY_N_META; m++) {
+                    M_out.push_back(C_gpu[(b * max_bucket_size + j) * MY_N_META + m]);
+                }
+            }
+        }
+        
+        clReleaseMemObject(C_in_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(num_buf);
+        clReleaseMemObject(Y_buf); clReleaseMemObject(C_out_buf); clReleaseMemObject(cnt_buf);
+        clReleaseMemObject(PD_out_buf);
     }
 };
 
@@ -498,6 +690,8 @@ void compute_full_pipeline(
         
         std::cerr << "[T" << t << "] " << total_matches << " matches. Hashing...            \r" << std::flush;
         
+        auto t_meta_start = my_time_ms();
+        
         // Flatten LR pairs
         std::vector<std::pair<uint32_t, uint32_t>> all_lr;
         all_lr.reserve(total_matches);
@@ -505,22 +699,31 @@ void compute_full_pipeline(
             for(const auto& p : thread_lr[ti]) all_lr.push_back(p);
         }
         
-        // GPU hash computation — look up metadata via sorted indices
-        std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
-        std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
+        // GPU hash: upload M_curr flat + LR pairs, kernel indexes directly
+        // No CPU meta extraction needed!
+        std::vector<uint32_t> M_curr_flat(M_curr.size() * MY_N_META);
         #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < total_matches; i++) {
-            const auto& [sorted_L, sorted_R] = all_lr[i];
-            uint32_t orig_L = entries[sorted_L].second;
-            uint32_t orig_R = entries[sorted_R].second;
+        for(size_t i = 0; i < M_curr.size(); i++) {
             for(int j = 0; j < MY_N_META; j++) {
-                L_meta_flat[i * MY_N_META + j] = M_curr[orig_L][j];
-                R_meta_flat[i * MY_N_META + j] = M_curr[orig_R][j];
+                M_curr_flat[i * MY_N_META + j] = M_curr[i][j];
             }
         }
+        std::vector<uint32_t> LR_flat(total_matches * 2);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < total_matches; i++) {
+            LR_flat[i * 2] = entries[all_lr[i].first].second;
+            LR_flat[i * 2 + 1] = entries[all_lr[i].second].second;
+        }
+        
+        auto t_hash_start = my_time_ms();
         
         std::vector<uint32_t> Y_results, M_results;
-        gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
+        gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
+        
+        auto t_hash_end = my_time_ms();
+        double meta_time = (t_hash_start - t_meta_start) / 1000.0;
+        double hash_time = (t_hash_end - t_hash_start) / 1000.0;
+        std::cerr << "[T" << t << "] meta=" << meta_time << "s hash=" << hash_time << "s             \r" << std::flush;
         
         // Convert to M_next format
         std::vector<std::array<uint32_t, 14>> M_next(total_matches);

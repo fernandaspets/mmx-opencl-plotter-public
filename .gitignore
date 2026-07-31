@@ -20,3 +20,8 @@ test_sort_two
 test_chain_debug
 test_chain_debug2
 test_simple_sort
+test_multi_table
+test_chain_debug
+test_chain_debug2
+test_sort_single
+test_sort_two
