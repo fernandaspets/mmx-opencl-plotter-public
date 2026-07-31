@@ -48,7 +48,7 @@ Requires: mmx-node built with OpenCL support at `~/mmx-node/build_opencl/`.
 Example:
 ```bash
 ./mmx_opencl_plotter $(python3 -c "import os; print(os.urandom(32).hex())") \
-    02292cd11aa18e5f64344cbe6c580249364dfe5a3683adc25446aadcc1b38555d7 \
+    <farmer_public_key_hex> \
     /mnt/e/plots/ --k 26
 ```
 
