@@ -1217,13 +1217,24 @@ void write_plot(
 
 int main(int argc, char** argv)
 {
-    std::string output_dir = "/mnt/hdd/";
+    std::string output_dir = "./";  // default: current directory
     std::string plot_name;
     bool test_mode = false;
     uint64_t test_limit = 0;
+    bool use_ramdisk = false;
+    std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
     if(argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <plot_id_hex> <farmer_key_hex> [output_dir] [--k KSIZE] [--test] [--limit N]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <plot_id_hex> <farmer_key_hex> [output_dir] [options]" << std::endl;
+        std::cerr << "Options:" << std::endl;
+        std::cerr << "  --k N           Set plot k-size (default: 26)" << std::endl;
+        std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for plotting, then copy to output_dir" << std::endl;
+        std::cerr << "  --test          Run in test mode" << std::endl;
+        std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "To use a RAM disk (recommended for speed):" << std::endl;
+        std::cerr << "  sudo mount -t tmpfs -o size=8G tmpfs /mnt/ramdisk" << std::endl;
+        std::cerr << "  ./mmx_opencl_plotter <pid> <fkey> /mnt/hdd/ --ramdisk /mnt/ramdisk --k 26" << std::endl;
         return 1;
     }
     
@@ -1235,6 +1246,11 @@ int main(int argc, char** argv)
         if(arg == "--test") test_mode = true;
         else if(arg == "--limit" && i+1 < argc) test_limit = std::stoull(argv[++i]);
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
+        else if(arg == "--ramdisk" && i+1 < argc) {
+            use_ramdisk = true;
+            final_dir = output_dir;
+            output_dir = argv[++i];
+        }
         else output_dir = arg;
     }
     
@@ -1273,6 +1289,10 @@ int main(int argc, char** argv)
     std::cout << "Farmer Key: " << farmer_key.to_string() << std::endl;
     std::cout << "KSIZE: " << KSIZE << ", XBITS: " << XBITS << std::endl;
     std::cout << "Output: " << plot_path << std::endl;
+    if(use_ramdisk) {
+        std::cout << "RAM disk: " << output_dir << " (plot written here first)" << std::endl;
+        std::cout << "Final dir: " << final_dir << " (plot copied here after)" << std::endl;
+    }
     std::cout << std::endl;
     
     // Initialize OpenCL
@@ -1311,6 +1331,28 @@ int main(int argc, char** argv)
     // Write plot file
     std::cout << "\n[Plot] Writing plot file..." << std::endl;
     write_plot(plot_path, plot_id, farmer_key, plot, true);
+    
+    // If using ramdisk, copy plot to final destination
+    if(use_ramdisk && !final_dir.empty()) {
+        std::string final_path = final_dir;
+        if(!final_path.empty() && final_path.back() != '/') final_path += "/";
+        final_path += plot_name;
+        std::cout << "[Plot] Copying from RAM disk to " << final_path << "..." << std::endl;
+        std::ifstream src(plot_path, std::ios::binary);
+        std::ofstream dst(final_path, std::ios::binary);
+        if(!dst.good()) {
+            std::cerr << "ERROR: Cannot write to " << final_path << std::endl;
+            std::cerr << "Plot remains on RAM disk at: " << plot_path << std::endl;
+            clReleaseContext(ctx);
+            return 1;
+        }
+        dst << src.rdbuf();
+        dst.close();
+        src.close();
+        // Remove from RAM disk to free memory
+        std::remove(plot_path.c_str());
+        plot_path = final_path;
+    }
     
     auto t2 = my_time_ms();
     std::cout << "\n[Done] Total time: " << (t2 - t0) / 1000.0 << " sec" << std::endl;

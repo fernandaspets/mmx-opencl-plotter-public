@@ -43,15 +43,46 @@ make -j$(nproc)
 ## Usage
 
 ```bash
-./mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> [output_dir] [--k KSIZE]
+./mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> [output_dir] [options]
 ```
 
-Example:
+Options:
+- `--k N` — Set plot k-size (default: 26)
+- `--ramdisk DIR` — Write plot to tmpfs at DIR first, then copy to output_dir. Eliminates disk I/O bottleneck during plotting.
+- `--test` — Run in test mode
+- `--limit N` — Limit entries (test mode)
+
+### Direct output (simple)
+
 ```bash
 ./mmx_opencl_plotter $(python3 -c "import os; print(os.urandom(32).hex())") \
     <farmer_public_key_hex> \
     /output/plots/ --k 26
 ```
+
+### RAM disk output (faster)
+
+Writing to a RAM disk (tmpfs) avoids disk I/O during plotting, which is a major bottleneck for large k-sizes.
+
+```bash
+# 1. Mount a tmpfs (one-time, requires root)
+sudo mount -t tmpfs -o size=8G tmpfs /mnt/ramdisk
+
+# 2. Plot to RAM disk, auto-copy to final destination after
+./mmx_opencl_plotter $(python3 -c "import os; print(os.urandom(32).hex())") \
+    <farmer_public_key_hex> \
+    /output/plots/ --ramdisk /mnt/ramdisk --k 26
+```
+
+The plot is written to `/mnt/ramdisk` (in RAM), then copied to `/output/plots/` and removed from RAM disk.
+
+**RAM disk size guide:**
+
+| k-size | Plot size | RAM disk needed |
+|--------|-----------|-----------------|
+| k22 | ~250 MB | 512 MB |
+| k26 | ~4.7 GB | 8 GB |
+| k30 | ~75 GB | 80 GB |
 
 ## Verify
 
