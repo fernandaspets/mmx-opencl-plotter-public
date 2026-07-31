@@ -1,6 +1,6 @@
 # MMX OpenCL Plotter
 
-First working MMX plotter for AMD GPUs (gfx1100 / RX 7900 XTX).
+MMX plotter using OpenCL for F1 computation and CPU for the F2-F9 pipeline.
 
 All HIP, CUDA, and ZLUDA approaches fail on gfx1100 due to a hardware-level fp32 bug.
 OpenCL avoids the bug by using a different compiler path (clang OpenCL frontend → AMDGPU backend).
