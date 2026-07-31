@@ -10,8 +10,13 @@ find_package(OpenCL REQUIRED)
 # Find OpenMP
 find_package(OpenMP REQUIRED)
 
-# Find mmx-node
-set(MMX_NODE_DIR $ENV{HOME}/mmx-node CACHE PATH "Path to mmx-node")
+# Path to mmx-node source tree (headers + libs for plot file format types)
+# Standard mmx-node build is sufficient — no OpenCL branch needed.
+set(MMX_NODE_DIR "" CACHE PATH "Path to mmx-node source directory")
+
+if(NOT MMX_NODE_DIR)
+    message(FATAL_ERROR "Please set MMX_NODE_DIR, e.g. -DMMX_NODE_DIR=/path/to/mmx-node")
+endif()
 
 include_directories(
     ${OpenCL_INCLUDE_DIRS}
@@ -23,7 +28,7 @@ include_directories(
     ${MMX_NODE_DIR}/generated/solution/include
     ${MMX_NODE_DIR}/vnx-base/include
     ${MMX_NODE_DIR}/vnx-base/generated/include
-    ${MMX_NODE_DIR}/build_opencl/vnx-base
+    ${MMX_NODE_DIR}/build/vnx-base
     ${MMX_NODE_DIR}/vnx-addons/include
     ${MMX_NODE_DIR}/vnx-addons/generated/include
     ${MMX_NODE_DIR}/uint256_t
@@ -33,9 +38,9 @@ include_directories(
 )
 
 link_directories(
-    ${MMX_NODE_DIR}/build_opencl
-    ${MMX_NODE_DIR}/build_opencl/vnx-base
-    ${MMX_NODE_DIR}/build_opencl/vnx-addons
+    ${MMX_NODE_DIR}/build
+    ${MMX_NODE_DIR}/build/vnx-base
+    ${MMX_NODE_DIR}/build/vnx-addons
 )
 
 add_executable(mmx_opencl_plotter plotter.cpp)

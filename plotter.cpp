@@ -161,7 +161,7 @@ public:
         queue = clCreateCommandQueue(context, device, 0, &err);
         if(err != CL_SUCCESS) throw std::runtime_error("Failed to create command queue");
         
-        std::string kernel_path = std::string(getenv("HOME")) + "/mmx-app/opencl-recompute/pos_recompute.cl";
+        std::string kernel_path = "pos_recompute.cl";
         FILE* f = fopen(kernel_path.c_str(), "r");
         if(!f) throw std::runtime_error("Cannot open " + kernel_path);
         fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -287,7 +287,7 @@ public:
     cl_kernel table_hash_kernel = nullptr;
     
     void init_table_hash() {
-        std::string kernel_path = std::string(getenv("HOME")) + "/mmx-app/opencl-recompute/table_hash.cl";
+        std::string kernel_path = "table_hash.cl";
         FILE* f = fopen(kernel_path.c_str(), "r");
         if(!f) throw std::runtime_error("Cannot open " + kernel_path);
         fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
