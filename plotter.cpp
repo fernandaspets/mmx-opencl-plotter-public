@@ -1777,7 +1777,7 @@ int main(int argc, char** argv)
         const int num_buckets = 1 << LOGBUCKETS;
         const int n_meta = MY_N_META;
         const uint64_t entries_per_bucket = (uint64_t)1 << (KSIZE - LOGBUCKETS);
-        const int max_bucket_size = entries_per_bucket * 2 + 256;
+        const int max_bucket_size = entries_per_bucket * 3 / 2 + 256;
         
         std::cout << "[Chunked] Entries per bucket: " << entries_per_bucket << std::endl;
         std::cout << "[Chunked] Max bucket size: " << max_bucket_size << std::endl;
