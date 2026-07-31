@@ -1260,16 +1260,20 @@ struct MemBucketStore {
     int n_meta;
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<uint32_t> counts;
+    // PD tracking: pd_buckets[y] = [count * 2] flat array of (sorted_pos, delta) pairs
+    std::vector<std::vector<uint32_t>> pd_buckets;
     
     MemBucketStore(int nb, int mbs, int nm)
         : num_buckets(nb), max_bucket_size(mbs), n_meta(nm)
     {
         buckets.resize(nb);
         counts.resize(nb, 0);
+        pd_buckets.resize(nb);
     }
     
     void clear() {
         for(auto& b : buckets) b.clear();
+        for(auto& p : pd_buckets) p.clear();
         std::fill(counts.begin(), counts.end(), 0);
     }
     
@@ -1282,6 +1286,12 @@ struct MemBucketStore {
         auto& b = buckets[bucket];
         b.insert(b.end(), meta, meta + count * n_meta);
         counts[bucket] += count;
+    }
+    
+    void append_pd(int bucket, const uint32_t* pd, uint32_t count) {
+        if(bucket < 0 || bucket >= num_buckets) return;
+        auto& p = pd_buckets[bucket];
+        p.insert(p.end(), pd, pd + count * 2);  // 2 uint32s per entry: (sorted_pos, delta)
     }
 };
 
@@ -1563,12 +1573,57 @@ void process_bucket_gpu(
         return;
     }
     
+    // Step 6b: Download sorted PY array to build position mapping for PD tracking
+    // PY[sub * max_bs2 + sorted_pos] = (Y << (64-KSIZE)) | original_pos
+    // We need: original_pos → (sub_bucket, sorted_pos_in_sub)
+    std::vector<uint64_t> PY_sorted(num_sub * max_bs2);
+    clEnqueueReadBuffer(plotter.queue, PY_buf, CL_TRUE, 0, (size_t)num_sub * max_bs2 * 8, PY_sorted.data(), 0, nullptr, nullptr);
+    
+    // Build mapping: original_pos → global_sorted_pos within this bucket
+    // global_sorted_pos_in_bucket = sub_offset[sub] + sorted_pos_in_sub
+    std::unordered_map<uint32_t, uint32_t> pos_map;
+    pos_map.reserve(total);
+    for(int s = 0; s < num_sub; s++) {
+        uint32_t cnt = sub_cnt[s];
+        uint32_t base = sub_off[s];  // offset within bucket
+        for(uint32_t i = 0; i < cnt; i++) {
+            uint64_t py = PY_sorted[s * max_bs2 + i];
+            uint32_t orig_pos = (uint32_t)py;  // lower bits = original position
+            pos_map[orig_pos] = base + i;     // sorted position within bucket
+        }
+    }
+    
+    // Compute PD for each match
+    // Global sorted position = bucket_offset[y] + sorted_pos_in_bucket
+    // bucket_offset[y] = sum of counts of all previous buckets in src store
+    uint32_t bucket_offset = 0;
+    for(int b = 0; b < y; b++) bucket_offset += src.counts[b];
+    
+    uint32_t num_filt = LR_filtered.size() / 2;
+    std::vector<uint32_t> pd_data(num_filt * 2);  // (global_sorted_pos, delta) per match
+    for(uint32_t i = 0; i < num_filt; i++) {
+        uint32_t left_orig = LR_filtered[i * 2];
+        uint32_t right_orig = LR_filtered[i * 2 + 1];
+        
+        auto it_l = pos_map.find(left_orig);
+        auto it_r = pos_map.find(right_orig);
+        if(it_l != pos_map.end() && it_r != pos_map.end()) {
+            uint32_t sorted_l = bucket_offset + it_l->second;
+            uint32_t sorted_r = bucket_offset + it_r->second;
+            uint32_t delta = sorted_r - sorted_l;
+            pd_data[i * 2] = sorted_l;
+            pd_data[i * 2 + 1] = delta;
+        } else {
+            pd_data[i * 2] = 0;
+            pd_data[i * 2 + 1] = 0;
+        }
+    }
+    
     // Step 7: GPU hash — hash_table_lr (uses C_in + LR)
     // Upload LR (C_in is already on GPU)
     cl_mem LR_filt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         LR_filtered.size() * 4, (void*)LR_filtered.data(), &err);
     
-    uint32_t num_filt = LR_filtered.size() / 2;
     cl_mem Y_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
         num_filt * 4, nullptr, &err);
     cl_mem M_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
@@ -1592,18 +1647,23 @@ void process_bucket_gpu(
     clEnqueueReadBuffer(plotter.queue, Y_out_buf, CL_TRUE, 0, num_filt * 4, Y_out.data(), 0, nullptr, nullptr);
     clEnqueueReadBuffer(plotter.queue, M_out_buf, CL_TRUE, 0, num_filt * n_meta * 4, M_out.data(), 0, nullptr, nullptr);
     
-    // Step 9: Bucket output → dst store
+    // Step 9: Bucket output → dst store (metadata + PD)
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
+    std::vector<std::vector<uint32_t>> dst_pd_batch(dst.num_buckets);
     for(uint32_t i = 0; i < num_filt; i++) {
         uint32_t bucket = Y_out[i] >> shift;
         if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
         for(int j = 0; j < n_meta; j++)
             dst_batch[bucket].push_back(M_out[i * n_meta + j]);
+        // Store PD alongside: (sorted_pos, delta)
+        dst_pd_batch[bucket].push_back(pd_data[i * 2]);
+        dst_pd_batch[bucket].push_back(pd_data[i * 2 + 1]);
     }
     for(int b = 0; b < dst.num_buckets; b++) {
         if(dst_batch[b].empty()) continue;
         uint32_t cnt = dst_batch[b].size() / n_meta;
         dst.append(b, dst_batch[b].data(), cnt);
+        dst.append_pd(b, dst_pd_batch[b].data(), cnt);
     }
     
     // Cleanup GPU resources
@@ -1659,6 +1719,7 @@ void compute_f2_f9_chunked(
         
         std::swap(src.buckets, dst.buckets);
         std::swap(src.counts, dst.counts);
+std::swap(src.pd_buckets, dst.pd_buckets);
         dst.clear();
     }
     
@@ -1682,10 +1743,10 @@ void build_plot_data_from_store(
 {
     const int n_meta = store.n_meta;
     
-    // Collect all entries from all buckets
-    std::vector<std::pair<uint32_t, uint32_t>> entries;  // (Y, bucket_index)
+    // Collect all entries from all buckets (with PD data)
     std::vector<uint32_t> all_Y;
     std::vector<std::array<uint32_t, 14>> all_meta;
+    std::vector<std::pair<uint32_t, uint32_t>> all_pd;  // (sorted_pos, delta) per entry
     
     uint64_t total = 0;
     for(int y = 0; y < store.num_buckets; y++) total += store.counts[y];
@@ -1693,11 +1754,13 @@ void build_plot_data_from_store(
     
     all_Y.reserve(total);
     all_meta.reserve(total);
+    all_pd.reserve(total);
     
     for(int y = 0; y < store.num_buckets; y++) {
         uint32_t cnt = store.counts[y];
         if(cnt == 0) continue;
         const uint32_t* meta = store.buckets[y].data();
+        const uint32_t* pd = store.pd_buckets[y].data();
         for(uint32_t i = 0; i < cnt; i++) {
             uint32_t Y = 0;
             for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
@@ -1706,6 +1769,12 @@ void build_plot_data_from_store(
             std::array<uint32_t, 14> m;
             for(int j = 0; j < n_meta; j++) m[j] = meta[i * n_meta + j];
             all_meta.push_back(m);
+            // PD data: (sorted_pos, delta) — if available
+            if(store.pd_buckets[y].size() >= (i + 1) * 2) {
+                all_pd.push_back({pd[i * 2], pd[i * 2 + 1]});
+            } else {
+                all_pd.push_back({0, 0});
+            }
         }
     }
     
@@ -1730,7 +1799,7 @@ void build_plot_data_from_store(
     
     std::cout << "[Plot] " << unique_indices.size() << " unique entries (was " << indices.size() << ")" << std::endl;
     
-    // Build final arrays
+    // Build final arrays (sorted by Y, deduplicated)
     plot.final_Y.resize(unique_indices.size());
     plot.final_meta.resize(unique_indices.size());
     for(size_t i = 0; i < unique_indices.size(); i++) {
@@ -1738,14 +1807,21 @@ void build_plot_data_from_store(
         plot.final_meta[i] = all_meta[unique_indices[i]];
     }
     
-    // Re-sort by Y (final table should be sorted by Y)
-    // Actually they're already sorted by Y from the dedup
+    // Build PD[9] from collected PD data (sorted by Y)
+    plot.PD.resize(MY_N_TABLE + 1);
+    plot.PD[MY_N_TABLE].resize(unique_indices.size());
+    for(size_t i = 0; i < unique_indices.size(); i++) {
+        plot.PD[MY_N_TABLE][i] = all_pd[unique_indices[i]];
+    }
     
-    // PD and X_pairs are not yet tracked in chunked mode — WIP
-    // For now, leave them empty. Plot file writing will need adaptation.
-    plot.num_entries.resize(MY_N_TABLE + 1);
-plot.PD.resize(MY_N_TABLE + 1);  // empty PD vectors — WIP, no proof reconstruction yet
+    // Earlier PD tables (2..8) are not yet tracked — WIP
+    // For now, leave them empty. mmx_postool will fail on tables 2-8 PD reads.
+    for(int t = 2; t < MY_N_TABLE; t++) {
+        plot.PD[t].clear();  // empty
+    }
     plot.X_pairs.clear();
+    plot.num_entries.resize(MY_N_TABLE + 1);
+    plot.num_entries[MY_N_TABLE] = unique_indices.size();
     plot.num_entries[MY_N_TABLE] = unique_indices.size();
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
