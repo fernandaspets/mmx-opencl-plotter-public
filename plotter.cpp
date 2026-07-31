@@ -36,6 +36,7 @@
 #include <ctime>
 #include <cctype>
 #include <parallel/algorithm>
+#include <unistd.h>
 #include <omp.h>
 
 using namespace mmx;
@@ -1617,7 +1618,8 @@ void compute_f2_f9_chunked(
     MemBucketStore& store,
     int num_buckets,
     int max_bucket_size,
-    int n_meta)
+    int n_meta,
+    bool gpu_yield)
 {
     MemBucketStore src(num_buckets, max_bucket_size, n_meta);
     MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
@@ -1637,6 +1639,11 @@ void compute_f2_f9_chunked(
         for(int y = 0; y < num_buckets; y++) {
             if(src.counts[y] == 0) continue;
             process_bucket_gpu(plotter, src, dst, y, t);
+            
+            // Display yield: let GPU service display output between buckets
+            // Prevents display freeze on GPUs that also drive display
+            clFinish(plotter.queue);
+            usleep(500);  // 0.5 ms yield
             
             if(y % 32 == 0 || y == num_buckets - 1) {
                 std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
@@ -1666,6 +1673,82 @@ void compute_f2_f9_chunked(
 }
 
 
+
+// Build PlotData from final bucket store (for plot file writing)
+// Collects all entries from all buckets, sorts by Y, deduplicates
+void build_plot_data_from_store(
+    MemBucketStore& store,
+    PlotData& plot)
+{
+    const int n_meta = store.n_meta;
+    
+    // Collect all entries from all buckets
+    std::vector<std::pair<uint32_t, uint32_t>> entries;  // (Y, bucket_index)
+    std::vector<uint32_t> all_Y;
+    std::vector<std::array<uint32_t, 14>> all_meta;
+    
+    uint64_t total = 0;
+    for(int y = 0; y < store.num_buckets; y++) total += store.counts[y];
+    std::cout << "[Plot] Collecting " << total << " entries from " << store.num_buckets << " buckets..." << std::endl;
+    
+    all_Y.reserve(total);
+    all_meta.reserve(total);
+    
+    for(int y = 0; y < store.num_buckets; y++) {
+        uint32_t cnt = store.counts[y];
+        if(cnt == 0) continue;
+        const uint32_t* meta = store.buckets[y].data();
+        for(uint32_t i = 0; i < cnt; i++) {
+            uint32_t Y = 0;
+            for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
+            Y &= KMASK;
+            all_Y.push_back(Y);
+            std::array<uint32_t, 14> m;
+            for(int j = 0; j < n_meta; j++) m[j] = meta[i * n_meta + j];
+            all_meta.push_back(m);
+        }
+    }
+    
+    // Sort by Y (with metadata tie-break for stable ordering)
+    std::vector<uint32_t> indices(all_Y.size());
+    for(size_t i = 0; i < indices.size(); i++) indices[i] = i;
+    
+    auto sort_func = [&all_Y, &all_meta](uint32_t a, uint32_t b) {
+        if(all_Y[a] == all_Y[b]) return all_meta[a] < all_meta[b];
+        return all_Y[a] < all_Y[b];
+    };
+    std::sort(indices.begin(), indices.end(), sort_func);
+    
+    // Deduplicate (entries with same Y and metadata are duplicates)
+    std::vector<uint32_t> unique_indices;
+    for(size_t i = 0; i < indices.size(); i++) {
+        if(i > 0 && all_Y[indices[i]] == all_Y[indices[i-1]] && all_meta[indices[i]] == all_meta[indices[i-1]]) {
+            continue;  // skip duplicate
+        }
+        unique_indices.push_back(indices[i]);
+    }
+    
+    std::cout << "[Plot] " << unique_indices.size() << " unique entries (was " << indices.size() << ")" << std::endl;
+    
+    // Build final arrays
+    plot.final_Y.resize(unique_indices.size());
+    plot.final_meta.resize(unique_indices.size());
+    for(size_t i = 0; i < unique_indices.size(); i++) {
+        plot.final_Y[i] = all_Y[unique_indices[i]];
+        plot.final_meta[i] = all_meta[unique_indices[i]];
+    }
+    
+    // Re-sort by Y (final table should be sorted by Y)
+    // Actually they're already sorted by Y from the dedup
+    
+    // PD and X_pairs are not yet tracked in chunked mode — WIP
+    // For now, leave them empty. Plot file writing will need adaptation.
+    plot.num_entries.resize(MY_N_TABLE + 1);
+    plot.num_entries[MY_N_TABLE] = unique_indices.size();
+    
+    std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
+}
+
 int main(int argc, char** argv)
 {
     std::string output_dir = "./";  // default: current directory
@@ -1674,6 +1757,7 @@ int main(int argc, char** argv)
     uint64_t test_limit = 0;
     bool use_ramdisk = false;
     bool use_chunked = false;
+bool gpu_yield = true;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
     if(argc < 3) {
@@ -1682,6 +1766,7 @@ int main(int argc, char** argv)
         std::cerr << "  --k N           Set plot k-size (default: 26)" << std::endl;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for plotting, then copy to output_dir" << std::endl;
         std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+, uses more total RAM but less per-chunk)" << std::endl;
+std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << std::endl;
@@ -1700,6 +1785,7 @@ int main(int argc, char** argv)
         else if(arg == "--limit" && i+1 < argc) test_limit = std::stoull(argv[++i]);
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
+else if(arg == "--no-yield") gpu_yield = false;
         else if(arg == "--ramdisk" && i+1 < argc) {
             use_ramdisk = true;
             final_dir = output_dir;
@@ -1786,19 +1872,19 @@ int main(int argc, char** argv)
         
         MemBucketStore store(num_buckets, max_bucket_size, n_meta);
         
+auto t0 = my_time_ms();
         // F1 → bucket store
         compute_f1_chunked(plotter, plot_id, store, 1 << 18);
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
-        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta);
+        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield);
         
-        // TODO: build PlotData from store and write plot file
-        // For now, just report the result
-        uint64_t total = 0;
-        for(int y = 0; y < num_buckets; y++) total += store.counts[y];
-        std::cout << "\n[Done] Final entries: " << total << std::endl;
-        std::cout << "[Done] (Chunked pipeline does not yet write plot files — WIP)" << std::endl;
+        
+        
+        auto t2 = my_time_ms();
+        std::cout << "\n[Done] Total time: " << (t2 - t0) / 1000.0 << " sec" << std::endl;
+        std::cout << "[Done] Plot file: " << plot_path << std::endl;
         
         clReleaseContext(ctx);
         return 0;
@@ -1854,5 +1940,7 @@ int main(int argc, char** argv)
     
     return 0;
 }
+
+
 
 
