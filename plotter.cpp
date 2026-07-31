@@ -1215,6 +1215,238 @@ void write_plot(
 // Main
 // ============================================================================
 
+
+// ============================================================================
+// Chunked Pipeline (for large k-sizes: k29+)
+// Processes one first-level bucket at a time to limit memory usage.
+// Uses in-memory bucket store (requires ~66 GB RAM for k29).
+// ============================================================================
+
+#include "bucket_store.h"
+
+struct MemBucketStore {
+    int num_buckets;
+    int max_bucket_size;
+    int n_meta;
+    std::vector<std::vector<uint32_t>> buckets;
+    std::vector<uint32_t> counts;
+    
+    MemBucketStore(int nb, int mbs, int nm)
+        : num_buckets(nb), max_bucket_size(mbs), n_meta(nm)
+    {
+        buckets.resize(nb);
+        counts.resize(nb, 0);
+    }
+    
+    void clear() {
+        for(auto& b : buckets) b.clear();
+        std::fill(counts.begin(), counts.end(), 0);
+    }
+    
+    void append(int bucket, const uint32_t* meta, uint32_t count) {
+        if(bucket < 0 || bucket >= num_buckets) return;
+        if(counts[bucket] + count > (uint32_t)max_bucket_size) {
+            count = max_bucket_size - counts[bucket];
+        }
+        if(count == 0) return;
+        auto& b = buckets[bucket];
+        b.insert(b.end(), meta, meta + count * n_meta);
+        counts[bucket] += count;
+    }
+};
+
+void compute_f1_chunked(
+    OCL_Plotter& plotter,
+    const hash_t& plot_id,
+    MemBucketStore& store,
+    int batch_size)
+{
+    const uint64_t total_entries = (uint64_t)1 << KSIZE;
+    const int num_buckets = store.num_buckets;
+    const int n_meta = store.n_meta;
+    const int shift = KSIZE - LOGBUCKETS;
+    
+    const uint32_t num_batches = (total_entries + batch_size - 1) / batch_size;
+    std::cout << "[F1] Computing " << total_entries << " entries in " << num_batches << " batches..." << std::endl;
+    auto t0 = my_time_ms();
+    
+    std::vector<uint32_t> X_batch(batch_size), Y_batch(batch_size), M_batch(batch_size * n_meta);
+    std::vector<std::vector<uint32_t>> batch_buckets(num_buckets);
+    
+    for(uint32_t b = 0; b < num_batches; b++) {
+        const uint32_t start = b * batch_size;
+        const uint32_t count = std::min((uint32_t)batch_size, (uint32_t)(total_entries - start));
+        
+        for(uint32_t i = 0; i < count; i++) X_batch[i] = start + i;
+        plotter.compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+        
+        for(int i = 0; i < num_buckets; i++) batch_buckets[i].clear();
+        
+        for(uint32_t i = 0; i < count; i++) {
+            uint32_t Y = Y_batch[i];
+            uint32_t bucket = Y >> shift;
+            if(bucket >= (uint32_t)num_buckets) bucket = num_buckets - 1;
+            for(int j = 0; j < n_meta; j++)
+                batch_buckets[bucket].push_back(M_batch[i * n_meta + j]);
+        }
+        
+        for(int y = 0; y < num_buckets; y++) {
+            if(batch_buckets[y].empty()) continue;
+            uint32_t cnt = batch_buckets[y].size() / n_meta;
+            store.append(y, batch_buckets[y].data(), cnt);
+        }
+        
+        if(b % 16 == 0 || b == num_batches - 1) {
+            std::cerr << "\r[F1] Batch " << (b+1) << "/" << num_batches
+                      << " (" << (b+1)*100/num_batches << "%) "
+                      << (my_time_ms() - t0) / 1000.0 << "s" << std::flush;
+        }
+    }
+    std::cout << "\n[F1] Done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
+    
+    uint64_t total = 0;
+    for(int i = 0; i < num_buckets; i++) total += store.counts[i];
+    std::cout << "[F1] Total entries: " << total << std::endl;
+}
+
+void process_bucket_chunk(
+    OCL_Plotter& plotter,
+    MemBucketStore& src,
+    MemBucketStore& dst,
+    int y,
+    int table)
+{
+    const int n_meta = src.n_meta;
+    const int shift = KSIZE - LOGBUCKETS;
+    
+    uint32_t count_y = src.counts[y];
+    if(count_y == 0) return;
+    
+    const uint32_t* meta_y = src.buckets[y].data();
+    
+    uint32_t count_ynext = 0;
+    const uint32_t* meta_ynext = nullptr;
+    if(y + 1 < src.num_buckets && src.counts[y + 1] > 0) {
+        count_ynext = src.counts[y + 1];
+        meta_ynext = src.buckets[y + 1].data();
+    }
+    
+    uint32_t total = count_y + count_ynext;
+    
+    // Compute Y values
+    std::vector<uint32_t> Y_all(total);
+    for(uint32_t i = 0; i < count_y; i++) {
+        uint32_t Y = 0;
+        for(int j = 0; j < n_meta; j++) Y ^= meta_y[i * n_meta + j];
+        Y_all[i] = Y & KMASK;
+    }
+    for(uint32_t i = 0; i < count_ynext; i++) {
+        uint32_t Y = 0;
+        for(int j = 0; j < n_meta; j++) Y ^= meta_ynext[i * n_meta + j];
+        Y_all[count_y + i] = Y & KMASK;
+    }
+    
+    // Sort entries by Y
+    std::vector<std::pair<uint32_t, uint32_t>> entries(total);
+    for(uint32_t i = 0; i < total; i++) entries[i] = {Y_all[i], i};
+    std::sort(entries.begin(), entries.end());
+    
+    // Match Y,Y+1 — only LEFT in bucket y
+    std::vector<uint32_t> LR_flat;
+    for(size_t i = 0; i < entries.size(); i++) {
+        if(entries[i].second >= count_y) continue;
+        uint32_t YL = entries[i].first;
+        for(size_t j = i + 1; j < entries.size(); j++) {
+            uint32_t YR = entries[j].first;
+            if(YR == YL + 1) {
+                LR_flat.push_back(entries[i].second);
+                LR_flat.push_back(entries[j].second);
+            } else if(YR > YL + 1) break;
+        }
+    }
+    
+    if(LR_flat.empty()) return;
+    
+    // Build combined metadata
+    std::vector<uint32_t> M_combined(total * n_meta);
+    std::memcpy(M_combined.data(), meta_y, count_y * n_meta * 4);
+    if(count_ynext > 0)
+        std::memcpy(M_combined.data() + count_y * n_meta, meta_ynext, count_ynext * n_meta * 4);
+    
+    // GPU hash
+    std::vector<uint32_t> Y_out, M_out;
+    plotter.gpu_hash_table_lr(M_combined, LR_flat, Y_out, M_out, KMASK);
+    
+    // Bucket new metadata → dst store
+    std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
+    for(size_t i = 0; i < Y_out.size(); i++) {
+        uint32_t bucket = Y_out[i] >> shift;
+        if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
+        for(int j = 0; j < n_meta; j++)
+            dst_batch[bucket].push_back(M_out[i * n_meta + j]);
+    }
+    
+    for(int b = 0; b < dst.num_buckets; b++) {
+        if(dst_batch[b].empty()) continue;
+        uint32_t cnt = dst_batch[b].size() / n_meta;
+        dst.append(b, dst_batch[b].data(), cnt);
+    }
+}
+
+void compute_f2_f9_chunked(
+    OCL_Plotter& plotter,
+    MemBucketStore& store,
+    int num_buckets,
+    int max_bucket_size,
+    int n_meta)
+{
+    MemBucketStore src(num_buckets, max_bucket_size, n_meta);
+    MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
+    
+    // Copy F1 output to src
+    for(int y = 0; y < num_buckets; y++) {
+        if(store.counts[y] > 0)
+            src.append(y, store.buckets[y].data(), store.counts[y]);
+    }
+    
+    auto t0 = my_time_ms();
+    
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        auto tt0 = my_time_ms();
+        dst.clear();
+        
+        for(int y = 0; y < num_buckets; y++) {
+            if(src.counts[y] == 0) continue;
+            process_bucket_chunk(plotter, src, dst, y, t);
+            
+            if(y % 32 == 0 || y == num_buckets - 1) {
+                std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
+                          << " (" << (y+1)*100/num_buckets << "%) "
+                          << (my_time_ms() - tt0) / 1000.0 << "s" << std::flush;
+            }
+        }
+        
+        double elapsed = (my_time_ms() - tt0) / 1000.0;
+        uint64_t total = 0;
+        for(int y = 0; y < num_buckets; y++) total += dst.counts[y];
+        std::cout << "\n[T" << t << "] " << total << " entries (" << elapsed << " sec)" << std::endl;
+        
+        std::swap(src.buckets, dst.buckets);
+        std::swap(src.counts, dst.counts);
+        dst.clear();
+    }
+    
+    // Copy final result back to store
+    store.clear();
+    for(int y = 0; y < num_buckets; y++) {
+        if(src.counts[y] > 0)
+            store.append(y, src.buckets[y].data(), src.counts[y]);
+    }
+    
+    std::cout << "[CPU] F2-F9 done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
+}
+
+
 int main(int argc, char** argv)
 {
     std::string output_dir = "./";  // default: current directory
@@ -1222,6 +1454,7 @@ int main(int argc, char** argv)
     bool test_mode = false;
     uint64_t test_limit = 0;
     bool use_ramdisk = false;
+    bool use_chunked = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
     if(argc < 3) {
@@ -1229,6 +1462,7 @@ int main(int argc, char** argv)
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --k N           Set plot k-size (default: 26)" << std::endl;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for plotting, then copy to output_dir" << std::endl;
+        std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+, uses more total RAM but less per-chunk)" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << std::endl;
@@ -1246,6 +1480,7 @@ int main(int argc, char** argv)
         if(arg == "--test") test_mode = true;
         else if(arg == "--limit" && i+1 < argc) test_limit = std::stoull(argv[++i]);
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
+        else if(arg == "--chunked") use_chunked = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
             use_ramdisk = true;
             final_dir = output_dir;
@@ -1312,6 +1547,43 @@ int main(int argc, char** argv)
     plotter.init(ctx, dev);
     plotter.init_table_hash();
     
+    if(use_chunked) {
+        // Chunked pipeline: process one first-level bucket at a time
+        // Requires LOGBUCKETS=8 (256 buckets) for manageable chunk sizes
+        LOGBUCKETS = 8;
+        update_constants();
+        std::cout << "[Chunked] LOGBUCKETS=" << LOGBUCKETS << " (" << (1 << LOGBUCKETS) << " buckets)" << std::endl;
+        
+        const int num_buckets = 1 << LOGBUCKETS;
+        const int n_meta = MY_N_META;
+        const uint64_t entries_per_bucket = (uint64_t)1 << (KSIZE - LOGBUCKETS);
+        const int max_bucket_size = entries_per_bucket * 2 + 256;
+        
+        std::cout << "[Chunked] Entries per bucket: " << entries_per_bucket << std::endl;
+        std::cout << "[Chunked] Max bucket size: " << max_bucket_size << std::endl;
+        std::cout << "[Chunked] RAM per store: " << (double)num_buckets * max_bucket_size * n_meta * 4 / 1e9 << " GB" << std::endl;
+        std::cout << "[Chunked] Total RAM (2 stores): " << 2.0 * num_buckets * max_bucket_size * n_meta * 4 / 1e9 << " GB" << std::endl;
+        
+        MemBucketStore store(num_buckets, max_bucket_size, n_meta);
+        
+        // F1 → bucket store
+        compute_f1_chunked(plotter, plot_id, store, 1 << 18);
+        
+        // F2-F9 chunked
+        std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
+        compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta);
+        
+        // TODO: build PlotData from store and write plot file
+        // For now, just report the result
+        uint64_t total = 0;
+        for(int y = 0; y < num_buckets; y++) total += store.counts[y];
+        std::cout << "\n[Done] Final entries: " << total << std::endl;
+        std::cout << "[Done] (Chunked pipeline does not yet write plot files — WIP)" << std::endl;
+        
+        clReleaseContext(ctx);
+        return 0;
+    }
+    
     std::vector<uint32_t> Y_all, M_all;
     plotter.compute_all_f1(plot_id, Y_all, M_all, 1 << 20, test_mode, test_limit);
     
@@ -1362,3 +1634,5 @@ int main(int argc, char** argv)
     
     return 0;
 }
+
+
