@@ -30,6 +30,14 @@ Fail: 0 / 320, 0 %
 Bad plots: None
 ```
 
+## ⚠️ Limitations
+
+**This is a testing/experimental tool. Do not use for production farming.**
+
+- **Maximum k-size: k26.** Larger k-sizes (k29+) require a chunked per-bucket architecture to fit in RAM/VRAM. The current implementation loads all entries into memory simultaneously, which works for k26 (~67M entries, ~20 GB RAM) but will exhaust RAM and GPU memory for k29+ (536M entries, ~130 GB RAM).
+- k29 is the minimum for MMX mainnet farming. This tool cannot produce k29 plots yet.
+- The plotter is slower than the CUDA/HIP plotter (which does everything on GPU). It's useful for AMD GPUs where CUDA/HIP produce broken plots.
+
 ## Building
 
 Requires a standard [mmx-node](https://github.com/madMAx43v3r/mmx-node) build (any build, no special branch needed) for header files and libraries.
