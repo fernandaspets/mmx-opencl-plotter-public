@@ -205,8 +205,8 @@ __kernel void scatter_2(
         Y_i &= KMASK;
     }
 
-    // For all-at-once processing: use full (LOGBUCKETS + LOGBUCKETS2)-bit bucket index
-    const uint index = Y_i >> (KSIZE - LOGBUCKETS - LOGBUCKETS2);
+    // For chunked processing: use masked LOGBUCKETS2-bit sub-bucket index
+    const uint index = (Y_i >> (KSIZE - LOGBUCKETS - LOGBUCKETS2)) & ((1u << LOGBUCKETS2) - 1);
     const uint pos = atomic_add((__global volatile uint*)(bucket_size_out + index), 1);
     if (pos < max_bucket_size_2) {
         const uint j = index * max_bucket_size_2 + pos;

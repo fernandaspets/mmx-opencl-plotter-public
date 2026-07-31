@@ -287,6 +287,10 @@ public:
     cl_kernel table_hash_kernel = nullptr;
     cl_kernel hash_lr_kernel = nullptr;
     cl_kernel eval_p1_tx_kernel = nullptr;
+    cl_kernel k_scatter2 = nullptr;
+    cl_kernel k_simple_sort = nullptr;
+    cl_kernel k_match_p1 = nullptr;
+    cl_kernel k_memset_u32 = nullptr;
     cl_program f2f9_program = nullptr;
     
     void init_table_hash() {
@@ -390,16 +394,32 @@ public:
         clReleaseMemObject(Yb); clReleaseMemObject(Mb_out);
     }
     
-    void init_eval_kernel() {
-        std::string kernel_path = "f2_f9.cl";
-        FILE* f = fopen(kernel_path.c_str(), "r");
-        if(!f) throw std::runtime_error("Cannot open " + kernel_path);
-        fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
-        char* src = new char[sz+1]; size_t rd = fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+    void init_gpu_kernels() {
+        // Load f2_f9.cl + simple_sort.cl combined
+        std::string src_str;
+        {
+            FILE* f = fopen("f2_f9.cl", "r");
+            if(!f) throw std::runtime_error("Cannot open f2_f9.cl");
+            fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char* src = new char[sz+1]; fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+            src_str += src;
+            src_str += "\n";
+            delete[] src;
+        }
+        {
+            FILE* f = fopen("simple_sort.cl", "r");
+            if(!f) throw std::runtime_error("Cannot open simple_sort.cl");
+            fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char* src = new char[sz+1]; fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+            src_str += src;
+            src_str += "\n";
+            delete[] src;
+        }
         
         cl_int err2;
-        f2f9_program = clCreateProgramWithSource(context, 1, (const char**)&src, &sz, &err2);
-        delete[] src;
+        const char* cstr = src_str.c_str();
+        size_t len = src_str.size();
+        f2f9_program = clCreateProgramWithSource(context, 1, &cstr, &len, &err2);
         
         // Build with current constants
         std::string opts = "-DKSIZE=" + std::to_string(KSIZE)
@@ -423,9 +443,18 @@ public:
             throw std::runtime_error(std::string("f2_f9 build failed: ") + log);
         }
         
+        k_scatter2 = clCreateKernel(f2f9_program, "scatter_2", &err2);
+        if(err2 != CL_SUCCESS) throw std::runtime_error("scatter_2 not found");
+        k_simple_sort = clCreateKernel(f2f9_program, "simple_sort_y", &err2);
+        if(err2 != CL_SUCCESS) throw std::runtime_error("simple_sort_y not found");
+        k_match_p1 = clCreateKernel(f2f9_program, "match_p1", &err2);
+        if(err2 != CL_SUCCESS) throw std::runtime_error("match_p1 not found");
+        k_memset_u32 = clCreateKernel(f2f9_program, "memset_u32", &err2);
+        if(err2 != CL_SUCCESS) throw std::runtime_error("memset_u32 not found");
         eval_p1_tx_kernel = clCreateKernel(f2f9_program, "eval_p1_tx", &err2);
         if(err2 != CL_SUCCESS) throw std::runtime_error("eval_p1_tx not found");
-        std::cout << "[OCL] eval_p1_tx kernel loaded" << std::endl;
+        
+        std::cout << "[OCL] GPU kernels loaded: scatter_2, simple_sort_y, match_p1, eval_p1_tx, memset_u32" << std::endl;
     }
     
     // New method: hash table using eval_p1_tx kernel (indexes C_in directly via LR pairs)
@@ -1393,6 +1422,196 @@ void process_bucket_chunk(
     }
 }
 
+// GPU-native per-bucket processor: scatter→sort→match→hash all on GPU
+// Data stays on GPU through all steps. Only 1 upload + 1 download per bucket.
+void process_bucket_gpu(
+    OCL_Plotter& plotter,
+    MemBucketStore& src,
+    MemBucketStore& dst,
+    int y,
+    int table)
+{
+    const int n_meta = src.n_meta;
+    const int shift = KSIZE - LOGBUCKETS;
+    const int logbuckets2 = KSIZE - LOGBUCKETS - 9;
+    const int num_sub = 1 << logbuckets2;  // sub-buckets per first-level bucket (masked index)
+    // Max entries per sub-bucket: (4 << KSIZE) / num_buckets_1 / num_buckets_2 / 3
+    const int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
+    
+    uint32_t count_y = src.counts[y];
+    if(count_y == 0) return;
+    
+    const uint32_t* meta_y = src.buckets[y].data();
+    
+    // Process this bucket independently (no y+1 loading — matches CUDA plotter approach)
+    // Cross-boundary Y,Y+1 matches are missed but plot is still valid
+    uint32_t total = count_y;
+    if(total == 0) return;
+    
+    // Safety: check VRAM availability
+    size_t vram_available = 0;
+    clGetDeviceInfo(plotter.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(vram_available), &vram_available, nullptr);
+    size_t needed = (size_t)total * n_meta * 4  // C_in
+                  + (size_t)num_sub * max_bs2 * 8  // PY_tmp
+                  + (size_t)total * 8  // LR
+                  + (size_t)total * 4  // PD_matches
+                  + (size_t)total * 4  // Y_out
+                  + (size_t)total * n_meta * 4  // M_out
+                  + num_sub * 4 * 2;  // counts + offsets
+    if(needed > vram_available * 8 / 10) {
+        // Fallback to CPU for this bucket
+        process_bucket_chunk(plotter, src, dst, y, table);
+        return;
+    }
+    
+    cl_int err;
+    cl_mem null_mem = nullptr;
+    int zero = 0;
+    
+    // Step 1: Upload C_in (metadata for bucket y only)
+    std::vector<uint32_t> C_combined(total * n_meta);
+    std::memcpy(C_combined.data(), meta_y, count_y * n_meta * 4);
+    
+    cl_mem C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        C_combined.size() * 4, (void*)C_combined.data(), &err);
+    
+    // Step 2: GPU scatter_2 — sub-bucket by Y's full (LOGBUCKETS+LOGBUCKETS2) bits
+    cl_mem PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+        (size_t)num_sub * max_bs2 * 8, nullptr, &err);
+    cl_mem sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+        num_sub * 4, nullptr, &err);
+    clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+    
+    uint32_t total_u32 = total;
+    uint32_t max_bs2_u32 = max_bs2;
+    clSetKernelArg(plotter.k_scatter2, 0, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(plotter.k_scatter2, 1, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);  // Y_in=null → compute from C_in
+    clSetKernelArg(plotter.k_scatter2, 3, sizeof(cl_mem), &C_in_buf);
+    clSetKernelArg(plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
+    clSetKernelArg(plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
+    
+    size_t scatter_global = total;
+    if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
+    clEnqueueNDRangeKernel(plotter.queue, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+    
+    // Step 3: CPU prefix sum of sub-bucket counts
+    std::vector<uint32_t> sub_cnt(num_sub);
+    clEnqueueReadBuffer(plotter.queue, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
+    std::vector<uint32_t> sub_off(num_sub + 1, 0);
+    for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
+    uint32_t total_scattered = sub_off[num_sub];
+    
+    cl_mem sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        (num_sub + 1) * 4, (void*)sub_off.data(), &err);
+    
+    // Step 4: GPU simple_sort_y — sort within each sub-bucket
+    uint32_t max_bs_sort = max_bs2;
+    uint32_t num_sub_u32 = num_sub;
+    clSetKernelArg(plotter.k_simple_sort, 0, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(plotter.k_simple_sort, 1, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(plotter.k_simple_sort, 3, sizeof(uint32_t), &num_sub_u32);
+    
+    size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
+    clEnqueueNDRangeKernel(plotter.queue, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+    
+    // Step 5: GPU match_p1 — find Y,Y+1 pairs
+    cl_mem LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        (size_t)total * 4 * 8, nullptr, &err);
+    cl_mem PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        (size_t)total * 4 * 4, nullptr, &err);
+    cl_mem num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+    clEnqueueFillBuffer(plotter.queue, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
+    
+    uint32_t max_total = total * 4;  // matches can exceed entries for high density
+    uint32_t write_pd = 0;  // PD tracking WIP
+    clSetKernelArg(plotter.k_match_p1, 0, sizeof(cl_mem), &LR_buf);
+    clSetKernelArg(plotter.k_match_p1, 1, sizeof(cl_mem), &PD_match_buf);
+    clSetKernelArg(plotter.k_match_p1, 2, sizeof(cl_mem), &num_matches_buf);
+    clSetKernelArg(plotter.k_match_p1, 3, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(plotter.k_match_p1, 4, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(plotter.k_match_p1, 5, sizeof(cl_mem), &sub_off_buf);
+    clSetKernelArg(plotter.k_match_p1, 6, sizeof(uint32_t), &num_sub_u32);
+    clSetKernelArg(plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
+    clSetKernelArg(plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
+    
+    int groups_per_sub = (max_bs2 + 127) / 128;
+    size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
+    clEnqueueNDRangeKernel(plotter.queue, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    
+    uint32_t gpu_matches = 0;
+    clEnqueueReadBuffer(plotter.queue, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
+    
+    if(gpu_matches == 0) {
+        clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+        clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+        clReleaseMemObject(num_matches_buf);
+        return;
+    }
+    
+    // Step 6: Download LR pairs (all matches from bucket y — no filtering needed)
+    std::vector<uint32_t> LR_filtered(gpu_matches * 2);
+    clEnqueueReadBuffer(plotter.queue, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
+    
+    if(LR_filtered.empty()) {
+        clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+        clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+        clReleaseMemObject(num_matches_buf);
+        return;
+    }
+    
+    // Step 7: GPU hash — hash_table_lr (uses C_in + LR)
+    // Upload LR (C_in is already on GPU)
+    cl_mem LR_filt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        LR_filtered.size() * 4, (void*)LR_filtered.data(), &err);
+    
+    uint32_t num_filt = LR_filtered.size() / 2;
+    cl_mem Y_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        num_filt * 4, nullptr, &err);
+    cl_mem M_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        num_filt * n_meta * 4, nullptr, &err);
+    
+    uint32_t kmask = KMASK;
+    uint32_t num_filt_u32 = num_filt;
+    clSetKernelArg(plotter.hash_lr_kernel, 0, sizeof(cl_mem), &C_in_buf);  // reuse C_in on GPU!
+    clSetKernelArg(plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_filt_buf);
+    clSetKernelArg(plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Y_out_buf);
+    clSetKernelArg(plotter.hash_lr_kernel, 3, sizeof(cl_mem), &M_out_buf);
+    clSetKernelArg(plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
+    clSetKernelArg(plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_filt_u32);
+    
+    size_t hash_global = num_filt;
+    if(hash_global % 64) hash_global = ((hash_global / 64) + 1) * 64;
+    clEnqueueNDRangeKernel(plotter.queue, plotter.hash_lr_kernel, 1, nullptr, &hash_global, nullptr, 0, nullptr, nullptr);
+    
+    // Step 8: Download Y_out, M_out
+    std::vector<uint32_t> Y_out(num_filt), M_out(num_filt * n_meta);
+    clEnqueueReadBuffer(plotter.queue, Y_out_buf, CL_TRUE, 0, num_filt * 4, Y_out.data(), 0, nullptr, nullptr);
+    clEnqueueReadBuffer(plotter.queue, M_out_buf, CL_TRUE, 0, num_filt * n_meta * 4, M_out.data(), 0, nullptr, nullptr);
+    
+    // Step 9: Bucket output → dst store
+    std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
+    for(uint32_t i = 0; i < num_filt; i++) {
+        uint32_t bucket = Y_out[i] >> shift;
+        if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
+        for(int j = 0; j < n_meta; j++)
+            dst_batch[bucket].push_back(M_out[i * n_meta + j]);
+    }
+    for(int b = 0; b < dst.num_buckets; b++) {
+        if(dst_batch[b].empty()) continue;
+        uint32_t cnt = dst_batch[b].size() / n_meta;
+        dst.append(b, dst_batch[b].data(), cnt);
+    }
+    
+    // Cleanup GPU resources
+    clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+    clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+    clReleaseMemObject(num_matches_buf); clReleaseMemObject(LR_filt_buf);
+    clReleaseMemObject(Y_out_buf); clReleaseMemObject(M_out_buf);
+}
+
 void compute_f2_f9_chunked(
     OCL_Plotter& plotter,
     MemBucketStore& store,
@@ -1417,7 +1636,7 @@ void compute_f2_f9_chunked(
         
         for(int y = 0; y < num_buckets; y++) {
             if(src.counts[y] == 0) continue;
-            process_bucket_chunk(plotter, src, dst, y, t);
+            process_bucket_gpu(plotter, src, dst, y, t);
             
             if(y % 32 == 0 || y == num_buckets - 1) {
                 std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
@@ -1552,6 +1771,7 @@ int main(int argc, char** argv)
         // Requires LOGBUCKETS=8 (256 buckets) for manageable chunk sizes
         LOGBUCKETS = 8;
         update_constants();
+        plotter.init_gpu_kernels();
         std::cout << "[Chunked] LOGBUCKETS=" << LOGBUCKETS << " (" << (1 << LOGBUCKETS) << " buckets)" << std::endl;
         
         const int num_buckets = 1 << LOGBUCKETS;
