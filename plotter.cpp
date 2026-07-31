@@ -1744,6 +1744,8 @@ void build_plot_data_from_store(
     // PD and X_pairs are not yet tracked in chunked mode — WIP
     // For now, leave them empty. Plot file writing will need adaptation.
     plot.num_entries.resize(MY_N_TABLE + 1);
+plot.PD.resize(MY_N_TABLE + 1);  // empty PD vectors — WIP, no proof reconstruction yet
+    plot.X_pairs.clear();
     plot.num_entries[MY_N_TABLE] = unique_indices.size();
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
@@ -1880,7 +1882,35 @@ auto t0 = my_time_ms();
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
         compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield);
         
+        // Build PlotData from final bucket store
+        std::cout << "\n[Plot] Building plot data from bucket store..." << std::endl;
+        PlotData plot;
+        build_plot_data_from_store(store, plot);
         
+        // Write plot file
+        std::cout << "\n[Plot] Writing plot file..." << std::endl;
+        write_plot(plot_path, plot_id, farmer_key, plot, true);
+        
+        // If using ramdisk, copy plot to final destination
+        if(use_ramdisk && !final_dir.empty()) {
+            std::string final_path = final_dir;
+            if(!final_path.empty() && final_path.back() != '/') final_path += "/";
+            final_path += plot_name;
+            std::cout << "[Plot] Copying from RAM disk to " << final_path << "..." << std::endl;
+            std::ifstream src(plot_path, std::ios::binary);
+            std::ofstream dst(final_path, std::ios::binary);
+            if(!dst.good()) {
+                std::cerr << "ERROR: Cannot write to " << final_path << std::endl;
+                std::cerr << "Plot remains on RAM disk at: " << plot_path << std::endl;
+                clReleaseContext(ctx);
+                return 1;
+            }
+            dst << src.rdbuf();
+            dst.close();
+            src.close();
+            std::remove(plot_path.c_str());
+            plot_path = final_path;
+        }
         
         auto t2 = my_time_ms();
         std::cout << "\n[Done] Total time: " << (t2 - t0) / 1000.0 << " sec" << std::endl;
