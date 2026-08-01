@@ -1088,7 +1088,6 @@ void write_plot(
                 for(uint64_t i = 1; i < count; i++) {
                     uint32_t delta = plot.final_Y[start + i] - plot.final_Y[start + i - 1];
                     if(delta > 255) throw std::runtime_error("Y delta too large: " + std::to_string(delta));
-                    if(delta > 47) std::cerr << "[WARN] Y delta " << delta << " > 47 at park " << p << " entry " << i << std::endl;
                     auto sym = mmx::pos::encode_symbol((uint8_t)delta);
                     write_bits(park, sym.first, delta_bit_offset, sym.second);
                     delta_bit_offset += sym.second;
@@ -1514,10 +1513,6 @@ void cross_boundary_match(
 
     // All combinations of left × right are matches (Y, Y+1)
     size_t num_cross = left_indices.size() * right_indices.size();
-    static uint64_t total_cross = 0;
-    total_cross += num_cross;
-    std::cout << "[Cross] T" << table << " bucket " << y << ": " << num_cross
-              << " cross-boundary matches (total: " << total_cross << ")" << std::endl;
 
     // Build L_meta and R_meta for hashing
     std::vector<uint32_t> L_meta_flat(num_cross * n_meta);
@@ -1600,8 +1595,8 @@ void process_bucket_gpu(
     
     const uint32_t* meta_y = src.buckets[y].data();
     
-    // Process this bucket independently (no y+1 loading — matches CUDA plotter approach)
-    // Cross-boundary Y,Y+1 matches are missed but plot is still valid
+    // Process this bucket. Cross-boundary matching is handled separately
+    // by cross_boundary_match() called after this function.
     uint32_t total = count_y;
     if(total == 0) return;
     
@@ -2011,18 +2006,6 @@ void build_plot_data_from_store(
     // Build final_Y sorted by (Y, pd_all_index), deduped by (Y, metadata)
     std::vector<uint32_t> final_indices;  // pd_all[9] indices that survive dedup
     
-    // Count true (Y, metadata) duplicates
-    {
-        std::map<std::pair<uint32_t, std::array<uint32_t, 14>>, int> seen;
-        int total_dups = 0;
-        for(size_t i = 0; i < pd_all[9].size(); i++) {
-            auto key = std::make_pair(pd_all[9][i].Y, t9_meta[i]);
-            if(seen[key]++ > 0) total_dups++;
-        }
-        std::cout << "[Plot] True (Y, metadata) duplicates: " << total_dups
-                  << " out of " << pd_all[9].size() << std::endl;
-    }
-    
     for(size_t i = 0; i < sort_order[9].size(); i++) {
         uint32_t orig_idx = sort_order[9][i];
         // Check for duplicate (same Y and same metadata as previous)
@@ -2158,6 +2141,44 @@ void build_plot_data_from_store(
         plot.num_entries[t] = (t < (int)pd_all.size()) ? pd_all[t].size() : 0;
     }
     
+    // Pre-compaction verification: check Y[left]+1 == Y[right] for all PD entries
+    {
+        std::vector<std::vector<uint32_t>> Y_sorted(MY_N_TABLE + 1);
+        for(int t = 2; t <= MY_N_TABLE; t++) {
+            if(t >= (int)pd_all.size() || pd_all[t].empty()) continue;
+            if(t >= (int)sort_order.size() || sort_order[t].empty()) continue;
+            Y_sorted[t].resize(sort_order[t].size());
+            for(size_t j = 0; j < sort_order[t].size(); j++) {
+                uint32_t orig_idx = sort_order[t][j];
+                if(orig_idx < pd_all[t].size()) {
+                    Y_sorted[t][j] = pd_all[t][orig_idx].Y;
+                }
+            }
+        }
+        bool pd_ok = true;
+        for(int t = 3; t <= MY_N_TABLE; t++) {
+            if(t >= (int)plot.PD.size() || plot.PD[t].empty()) continue;
+            if(t-1 < 2 || t-1 >= (int)Y_sorted.size() || Y_sorted[t-1].empty()) continue;
+            size_t prev_size = Y_sorted[t-1].size();
+            size_t bounds_errors = 0, match_errors = 0;
+            for(size_t i = 0; i < plot.PD[t].size(); i++) {
+                uint32_t pos = plot.PD[t][i].first;
+                uint32_t delta = plot.PD[t][i].second;
+                uint32_t right = pos + delta;
+                if(pos >= prev_size || right >= prev_size) { bounds_errors++; continue; }
+                uint32_t YL = Y_sorted[t-1][pos];
+                uint32_t YR = Y_sorted[t-1][right];
+                if(YR != YL + 1) match_errors++;
+            }
+            if(bounds_errors > 0 || match_errors > 0) {
+                std::cerr << "[PD CHECK] PD[" << t << "]: " << bounds_errors << " bounds, "
+                          << match_errors << " match errors out of " << plot.PD[t].size() << std::endl;
+                pd_ok = false;
+            }
+        }
+        std::cout << "[PD CHECK] Pre-compaction: " << (pd_ok ? "PASS" : "FAIL") << std::endl;
+    }
+    
     // Step 3b: Phase 2 compaction — remove unreachable entries
     //          CUDA plotter does this in phase 2. We need to match.
     //          1. Start from T9 (all reachable — they're the roots)
@@ -2270,61 +2291,25 @@ void build_plot_data_from_store(
               << " X_pairs=" << plot.X_pairs.size() << std::endl;
     
 
-    // Verify PD chain before writing
+    // Post-compaction verification: check all PD positions are in bounds
     {
-        // Build Y-sorted arrays for each table: Y_sorted[t][j] = pd_all[t][sort_order[t][j]].Y
-        std::vector<std::vector<uint32_t>> Y_sorted(MY_N_TABLE + 1);
-        for(int t = 2; t <= MY_N_TABLE; t++) {
-            if(t >= (int)pd_all.size() || pd_all[t].empty()) continue;
-            if(t >= (int)sort_order.size() || sort_order[t].empty()) continue;
-            Y_sorted[t].resize(sort_order[t].size());
-            for(size_t j = 0; j < sort_order[t].size(); j++) {
-                uint32_t orig_idx = sort_order[t][j];
-                if(orig_idx < pd_all[t].size()) {
-                    Y_sorted[t][j] = pd_all[t][orig_idx].Y;
-                }
-            }
-        }
-
         bool pd_ok = true;
         for(int t = 3; t <= MY_N_TABLE; t++) {
             if(t >= (int)plot.PD.size() || plot.PD[t].empty()) continue;
-            if(t-1 < 2 || t-1 >= (int)Y_sorted.size() || Y_sorted[t-1].empty()) continue;
-            size_t prev_size = Y_sorted[t-1].size();
-            size_t bounds_errors = 0;
-            size_t match_errors = 0;
+            if(t-1 >= (int)plot.PD.size() || plot.PD[t-1].empty()) continue;
+            size_t prev_size = plot.PD[t-1].size();
+            size_t errors = 0;
             for(size_t i = 0; i < plot.PD[t].size(); i++) {
                 uint32_t pos = plot.PD[t][i].first;
                 uint32_t delta = plot.PD[t][i].second;
-                uint32_t right = pos + delta;
-                if(pos >= prev_size || right >= prev_size) {
-                    if(bounds_errors++ < 3) {
+                if(pos >= prev_size || (uint64_t)pos + delta >= prev_size) {
+                    if(errors++ < 3)
                         std::cerr << "[PD CHECK] PD[" << t << "][" << i << "]: pos=" << pos
                                   << " delta=" << delta << " prev_size=" << prev_size << std::endl;
-                    }
-                    continue;
-                }
-                // DEEP CHECK: verify Y[left] + 1 == Y[right] (valid match pair)
-                uint32_t YL = Y_sorted[t-1][pos];
-                uint32_t YR = Y_sorted[t-1][right];
-                if(YR != YL + 1) {
-                    if(match_errors++ < 5) {
-                        std::cerr << "[PD MATCH] PD[" << t << "][" << i << "]: Y[" << pos
-                                  << "]=" << YL << " Y[" << right << "]=" << YR
-                                  << " (expected " << YL << "," << (YL+1) << ")"
-                                  << " delta=" << delta << std::endl;
-                    }
                 }
             }
-            if(bounds_errors > 0) {
-                std::cerr << "[PD CHECK] PD[" << t << "]: " << bounds_errors << " bounds errors out of "
-                          << plot.PD[t].size() << std::endl;
-                pd_ok = false;
-            }
-            if(match_errors > 0) {
-                std::cerr << "[PD MATCH] PD[" << t << "]: " << match_errors << " match errors out of "
-                          << plot.PD[t].size() << " (" << (100*match_errors/plot.PD[t].size())
-                          << "%)" << std::endl;
+            if(errors > 0) {
+                std::cerr << "[PD CHECK] PD[" << t << "]: " << errors << " bounds errors" << std::endl;
                 pd_ok = false;
             }
         }
@@ -2332,17 +2317,12 @@ void build_plot_data_from_store(
         for(size_t i = 1; i < plot.final_Y.size(); i++) {
             if(plot.final_Y[i] < plot.final_Y[i-1]) {
                 std::cerr << "[PD CHECK] final_Y not sorted at [" << i << "]" << std::endl;
-                pd_ok = false;
-                break;
+                pd_ok = false; break;
             }
         }
-        std::cout << "[PD CHECK] " << (pd_ok ? "PASS" : "FAIL") << std::endl;
-        
-        // Full end-to-end chain verification: trace a few final_Y entries
-        // through the entire PD chain to verify they stay in bounds.
+        // Full end-to-end chain verification
         if(pd_ok) {
-            int chain_errors = 0;
-            int chains_checked = 0;
+            int chain_errors = 0, chains_checked = 0;
             int num_to_check = std::min((size_t)10, plot.final_Y.size());
             for(int idx = 0; idx < num_to_check; idx++) {
                 std::vector<uint64_t> pointers = {(uint64_t)idx};
@@ -2350,14 +2330,7 @@ void build_plot_data_from_store(
                 for(int t = MY_N_TABLE; t >= 3; t--) {
                     std::vector<uint64_t> new_pointers;
                     for(uint64_t p : pointers) {
-                        if(p >= plot.PD[t].size()) {
-                            if(chain_errors++ < 5)
-                                std::cerr << "[CHAIN] final_Y[" << idx << "] PD[" << t
-                                          << "] ptr=" << p << " out of bounds (size="
-                                          << plot.PD[t].size() << ")" << std::endl;
-                            ok = false;
-                            break;
-                        }
+                        if(p >= plot.PD[t].size()) { ok = false; chain_errors++; break; }
                         uint32_t pos = plot.PD[t][p].first;
                         uint32_t delta = plot.PD[t][p].second;
                         new_pointers.push_back(pos);
@@ -2367,27 +2340,17 @@ void build_plot_data_from_store(
                     pointers = new_pointers;
                 }
                 if(!ok) continue;
-                // Now pointers should be indices into X_pairs (table 2)
                 for(uint64_t p : pointers) {
-                    if(p >= plot.X_pairs.size()) {
-                        if(chain_errors++ < 5)
-                            std::cerr << "[CHAIN] final_Y[" << idx << "] X_pairs ptr="
-                                      << p << " out of bounds (size="
-                                      << plot.X_pairs.size() << ")" << std::endl;
-                        ok = false;
-                        break;
-                    }
+                    if(p >= plot.X_pairs.size()) { ok = false; chain_errors++; break; }
                 }
                 if(ok) chains_checked++;
             }
-            if(chain_errors > 0) {
-                std::cerr << "[CHAIN] " << chain_errors << " chain errors out of "
-                          << num_to_check << " checked" << std::endl;
-            } else {
-                std::cout << "[CHAIN] " << chains_checked << "/" << num_to_check
-                          << " full chains verified OK" << std::endl;
-            }
+            if(chain_errors > 0)
+                std::cerr << "[CHAIN] " << chain_errors << " chain errors out of " << num_to_check << std::endl;
+            else
+                std::cout << "[CHAIN] " << chains_checked << "/" << num_to_check << " full chains verified OK" << std::endl;
         }
+        std::cout << "[PD CHECK] Post-compaction: " << (pd_ok ? "PASS" : "FAIL") << std::endl;
     }
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
@@ -2442,8 +2405,7 @@ else if(arg == "--no-yield") gpu_yield = false;
     }
     
     update_constants();
-    std::cout << "[Config] KSIZE=" << KSIZE << " XBITS=" << XBITS << " LPX2SIZE=" << LPX2SIZE
-              << " PDSIZE=" << PDSIZE << " KMASK=" << KMASK << std::endl;
+
     
     if(pid_str.size() != 64) { std::cerr << "plot_id must be 64 hex chars" << std::endl; return 1; }
     if(fk_str.size() != 66) { std::cerr << "farmer_key must be 66 hex chars" << std::endl; return 1; }
