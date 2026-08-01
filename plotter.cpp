@@ -30,6 +30,7 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include "opt_config.h"
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1791,21 +1792,58 @@ void process_bucket_gpu(
         pd_data[i * 2 + 1] = bucket_offset + right_orig;
     }
     
-    // Step 7: GPU hash — old method (CPU meta extraction + gpu_hash_table)
-    // GPU hash — use old method (pre-extract L/R metadata, known working)
+    // Step 7: GPU hash
+    // Module B: If gpu_meta_extract is enabled, use hash_table_lr kernel directly.
+    // This skips: LR download for meta extraction, CPU L/R extraction, L/R re-upload.
+    // C_in_buf (metadata) and LR_buf (match pairs) are already on GPU.
+    // We still download LR_filtered for PD computation and X_pairs (table 2).
     size_t num_matches = LR_filtered.size() / 2;
-    std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
-    std::vector<uint32_t> R_meta_flat(num_matches * n_meta);
-    for(size_t i = 0; i < num_matches; i++) {
-        uint32_t P1 = LR_filtered[i * 2];
-        uint32_t P2 = LR_filtered[i * 2 + 1];
-        for(int j = 0; j < n_meta; j++) {
-            L_meta_flat[i * n_meta + j] = C_combined[P1 * n_meta + j];
-            R_meta_flat[i * n_meta + j] = C_combined[P2 * n_meta + j];
-        }
-    }
     std::vector<uint32_t> Y_out, M_out;
-    plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
+    
+    if(get_opt_config().gpu_meta_extract) {
+        // Module B: GPU metadata extraction — call hash_table_lr directly
+        cl_int err2;
+        cl_mem Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
+        CL_CHECK(err2, "Yb (meta-extract)");
+        cl_mem Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
+        CL_CHECK(err2, "Mb (meta-extract)");
+        
+        uint32_t kmask = KMASK;
+        uint32_t num_m = (uint32_t)num_matches;
+        uint32_t num_total = total;
+        clSetKernelArg(plotter.hash_lr_kernel, 0, sizeof(cl_mem), &C_in_buf);
+        clSetKernelArg(plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_buf);
+        clSetKernelArg(plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Yb);
+        clSetKernelArg(plotter.hash_lr_kernel, 3, sizeof(cl_mem), &Mb);
+        clSetKernelArg(plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_m);
+        clSetKernelArg(plotter.hash_lr_kernel, 6, sizeof(uint32_t), &num_total);
+        
+        size_t global = num_matches, local = 64;
+        if(global % local) global = ((global / local) + 1) * local;
+        clEnqueueNDRangeKernel(plotter.queue, plotter.hash_lr_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        
+        Y_out.resize(num_matches);
+        M_out.resize(num_matches * MY_N_META);
+        clEnqueueReadBuffer(plotter.queue, Yb, CL_TRUE, 0, num_matches * 4, Y_out.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(plotter.queue, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
+        
+        clReleaseMemObject(Yb);
+        clReleaseMemObject(Mb);
+    } else {
+        // Original path: CPU meta extraction + gpu_hash_table (re-upload)
+        std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
+        std::vector<uint32_t> R_meta_flat(num_matches * n_meta);
+        for(size_t i = 0; i < num_matches; i++) {
+            uint32_t P1 = LR_filtered[i * 2];
+            uint32_t P2 = LR_filtered[i * 2 + 1];
+            for(int j = 0; j < n_meta; j++) {
+                L_meta_flat[i * n_meta + j] = C_combined[P1 * n_meta + j];
+                R_meta_flat[i * n_meta + j] = C_combined[P2 * n_meta + j];
+            }
+        }
+        plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
+    }
     
     // Step 9: Bucket output → dst store (metadata + PD + X_pairs)
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
@@ -2434,6 +2472,10 @@ int device_id = 0;
         std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+, uses more total RAM but less per-chunk)" << std::endl;
 std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)" << std::endl;
 std::cerr << "  --device N      Select GPU device index (default: 0)" << std::endl;
+std::cerr << "  --opt-gpu-meta  Module B: GPU metadata extraction (skip CPU extract+reupload)" << std::endl;
+std::cerr << "  --opt-gpu-prefix Module A: GPU prefix sum (skip sub-count readback)" << std::endl;
+std::cerr << "  --opt-async     Module D: Async PCIe transfers" << std::endl;
+std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buckets)" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << std::endl;
@@ -2453,6 +2495,11 @@ std::cerr << "  --device N      Select GPU device index (default: 0)" << std::en
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
 else if(arg == "--no-yield") gpu_yield = false;
+else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
+else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
+else if(arg == "--opt-gpu-prefix") get_opt_config().gpu_prefix_sum = true;
+else if(arg == "--opt-async") get_opt_config().async_transfers = true;
+else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::stoi(argv[++i]);
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
@@ -2534,6 +2581,11 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
     OCL_Plotter plotter;
     plotter.init(ctx, dev);
     plotter.init_table_hash();
+    
+    // Print optimization config
+    if(get_opt_config().any_enabled()) {
+        get_opt_config().print();
+    }
     
     if(use_chunked) {
         // Chunked pipeline: process one first-level bucket at a time
