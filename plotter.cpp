@@ -415,11 +415,14 @@ public:
     cl_program f2f9_program = nullptr;
     
     void init_table_hash() {
-        std::string kernel_path = "table_hash.cl";
+        // Try optimized kernel first, fall back to original
+        std::string kernel_path = "sha512_opt.cl";
         FILE* f = fopen(kernel_path.c_str(), "r");
-        if(!f) throw std::runtime_error("Cannot open " + kernel_path);
+        if(!f) { kernel_path = "table_hash.cl"; f = fopen(kernel_path.c_str(), "r"); }
+        if(!f) throw std::runtime_error("Cannot open table_hash.cl or sha512_opt.cl");
         fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
         char* src = new char[sz+1]; size_t rd = fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+        std::cout << "[OCL] Loading hash kernel from " << kernel_path << std::endl;
         
         cl_int err;
         cl_program prog = clCreateProgramWithSource(context, 1, (const char**)&src, &sz, &err);
@@ -430,10 +433,17 @@ public:
             throw std::runtime_error(std::string("table_hash build failed: ") + log);
         }
         
-        table_hash_kernel = clCreateKernel(prog, "hash_table_entries", &err);
+        // Try optimized kernel name first, fall back to original
+        table_hash_kernel = clCreateKernel(prog, "hash_table_entries_opt", &err);
+        if(err != CL_SUCCESS) {
+            table_hash_kernel = clCreateKernel(prog, "hash_table_entries", &err);
+            if(err != CL_SUCCESS) throw std::runtime_error("hash_table_entries not found");
+            std::cout << "[OCL] Using original hash_table_entries kernel" << std::endl;
+        } else {
+            std::cout << "[OCL] Using optimized hash_table_entries_opt kernel (circular buffer w[16])" << std::endl;
+        }
         hash_lr_kernel = clCreateKernel(prog, "hash_table_lr", &err);
-        if(err != CL_SUCCESS) throw std::runtime_error("hash_table_lr not found");
-        if(err != CL_SUCCESS) throw std::runtime_error("hash_table_entries not found");
+        if(err != CL_SUCCESS) std::cout << "[OCL] hash_table_lr not found (optional)" << std::endl;
         
         // Load gather kernel (Module B variant 2)
         {
