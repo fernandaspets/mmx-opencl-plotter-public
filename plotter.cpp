@@ -1558,6 +1558,8 @@ void compute_f1_chunked_multi_gpu(
     for(int i = 0; i < num_buckets; i++) total += store.counts[i];
     std::cout << "[F1] Total entries: " << total << std::endl;
 }
+
+void process_bucket_chunk(
     OCL_Plotter& plotter,
     MemBucketStore& src,
     MemBucketStore& dst,
