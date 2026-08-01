@@ -2422,6 +2422,7 @@ int main(int argc, char** argv)
     bool use_ramdisk = false;
     bool use_chunked = false;
 bool gpu_yield = true;
+int device_id = 0;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
@@ -2432,6 +2433,7 @@ bool gpu_yield = true;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for plotting, then copy to output_dir" << std::endl;
         std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+, uses more total RAM but less per-chunk)" << std::endl;
 std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)" << std::endl;
+std::cerr << "  --device N      Select GPU device index (default: 0)" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << std::endl;
@@ -2451,6 +2453,7 @@ std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
 else if(arg == "--no-yield") gpu_yield = false;
+else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
             use_ramdisk = true;
@@ -2507,9 +2510,22 @@ else if(arg == "--no-yield") gpu_yield = false;
     cl_uint np; clGetPlatformIDs(0, nullptr, &np);
     cl_platform_id plat; clGetPlatformIDs(1, &plat, nullptr);
     cl_uint nd; clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd);
-    cl_device_id dev; clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, nullptr);
+    
+    // List all available GPUs
+    std::vector<cl_device_id> all_devs(nd);
+    clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, nd, all_devs.data(), nullptr);
+    std::cout << "[OCL] Found " << nd << " GPU device(s):" << std::endl;
+    for(cl_uint i = 0; i < nd; i++) {
+        char dn[256]; clGetDeviceInfo(all_devs[i], CL_DEVICE_NAME, sizeof(dn), dn, nullptr);
+        cl_ulong mem = 0; clGetDeviceInfo(all_devs[i], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem), &mem, nullptr);
+        std::cout << "  [" << i << "] " << dn << " (" << mem/1024/1024/1024 << " GB VRAM)" << std::endl;
+    }
+    
+    // Select device
+    cl_uint dev_idx = std::min((cl_uint)device_id, nd - 1);
+    cl_device_id dev = all_devs[dev_idx];
     char dn[256]; clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(dn), dn, nullptr);
-    std::cout << "[OCL] Device: " << dn << std::endl;
+    std::cout << "[OCL] Using device [" << dev_idx << "]: " << dn << std::endl;
     
     cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
     if(err != CL_SUCCESS) { std::cerr << "Failed to create OpenCL context" << std::endl; return 1; }
