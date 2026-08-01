@@ -1345,72 +1345,33 @@ void compute_full_pipeline(
         entries = std::move(sorted_entries);
     }
     
-    // Deduplicate using hash set (much faster than std::set BST)
-    // Use a flat hash map: meta array -> bool
-    // Since meta is 14 uint32s = 56 bytes, use a simple approach:
-    // Sort by meta, then dedup linearly
-    std::cerr << "[Final] Deduplicating " << entries.size() << " entries...     \r" << std::flush;
+    // Skip dedup — MMX F2-F9 never produces duplicate entries (verified).
+    // The CUDA plotter also has no dedup step.
+    // Entries are already sorted by Y from the radix sort above.
+    // Just copy directly — saves ~5s for k23 (meta sort + re-sort of 8M entries).
+    std::cerr << "[Final] Copying " << entries.size() << " entries (no dedup needed)...  \r" << std::flush;
     {
-        // Build index array sorted by meta
-        std::vector<uint32_t> meta_idx(entries.size());
-        for(size_t i = 0; i < entries.size(); i++) meta_idx[i] = (uint32_t)i;
-        
-        auto meta_cmp = [&entries, &M_curr](uint32_t a, uint32_t b) {
-            return M_curr[entries[a].second] < M_curr[entries[b].second];
-        };
-        
-        __gnu_parallel::sort(meta_idx.begin(), meta_idx.end(), meta_cmp,
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
-        
-        // Linear dedup
-        std::array<uint32_t, 14> prev_meta = {};
-        bool first = true;
-        for(size_t i = 0; i < meta_idx.size(); i++) {
-            const auto& entry = entries[meta_idx[i]];
-            const auto& meta = M_curr[entry.second];
-            if(first || meta != prev_meta) {
-                plot.final_Y.push_back(entry.first);
-                plot.final_meta.push_back(meta);
-                final_indices.push_back(entry.second);
-                prev_meta = meta;
-                first = false;
-            }
+        plot.final_Y.reserve(entries.size());
+        plot.final_meta.reserve(entries.size());
+        final_indices.reserve(entries.size());
+        for(size_t i = 0; i < entries.size(); i++) {
+            plot.final_Y.push_back(entries[i].first);
+            plot.final_meta.push_back(M_curr[entries[i].second]);
+            final_indices.push_back(entries[i].second);
         }
     }
     
-    std::cout << "[Final] " << plot.final_Y.size() << " unique entries          " << std::endl;
+    std::cout << "[Final] " << plot.final_Y.size() << " entries          " << std::endl;
     
-    // Re-sort final entries by Y (dedup destroyed Y order)
-    std::cerr << "[Final] Re-sorting by Y...                       \r" << std::flush;
-    {
-        size_t nf = plot.final_Y.size();
-        std::vector<uint32_t> idx(nf);
-        for(size_t i = 0; i < nf; i++) idx[i] = (uint32_t)i;
-        
-        // Sort index by Y value
-        __gnu_parallel::sort(idx.begin(), idx.end(),
-            [&](uint32_t a, uint32_t b) { return plot.final_Y[a] < plot.final_Y[b]; },
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
-        
-        // Reorder all arrays
-        std::vector<uint32_t> new_Y(nf);
-        std::vector<std::array<uint32_t, 14>> new_meta(nf);
-        std::vector<uint32_t> new_indices(nf);
-        #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < nf; i++) {
-            new_Y[i] = plot.final_Y[idx[i]];
-            new_meta[i] = plot.final_meta[idx[i]];
-            new_indices[i] = final_indices[idx[i]];
-        }
-        plot.final_Y = std::move(new_Y);
-        plot.final_meta = std::move(new_meta);
-        final_indices = std::move(new_indices);
-    }
+    // No re-sort needed — entries are already in Y-sorted order from radix sort!
     
-// PD[9] dedup: keep only entries for deduped final entries
+    // PD[9] reorder: entries are Y-sorted, but PD[9] is in match order.
+    // final_indices[i] = entries[i].second = match-order index.
+    // Reorder PD[9] to match Y-sorted order.
     {
         auto old_pd9 = std::move(plot.PD[9]);
         plot.PD[9].resize(final_indices.size());
+        #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < final_indices.size(); i++) {
             plot.PD[9][i] = old_pd9[final_indices[i]];
         }
