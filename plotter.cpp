@@ -174,6 +174,13 @@ public:
     cl_context context;
     cl_device_id device;
     cl_command_queue queue;
+    cl_command_queue queue2 = nullptr;
+    
+    cl_command_queue& get_queue(int bucket = 0) {
+        if(get_opt_config().num_queues > 1 && queue2 && bucket % 2 == 1)
+            return queue2;
+        return queue;
+    }
     cl_program program;
     cl_kernel f1_kernel;
     
@@ -183,6 +190,10 @@ public:
         cl_int err;
         queue = clCreateCommandQueue(context, device, 0, &err);
         if(err != CL_SUCCESS) throw std::runtime_error("Failed to create command queue");
+        
+        // Create second queue for multi-queue pipelining (Module E)
+        queue2 = clCreateCommandQueue(context, device, 0, &err);
+        if(err != CL_SUCCESS) throw std::runtime_error("Failed to create command queue 2");
         
         std::string kernel_path = "pos_recompute.cl";
         FILE* f = fopen(kernel_path.c_str(), "r");
@@ -1729,15 +1740,18 @@ void process_bucket_gpu(
     bool using_pool = (g_bufpool != nullptr && g_bufpool->initialized);
     bool pool_release_skip = false;  // if true, don't release at end (pool owns them)
     
+    // Module E: Use per-bucket queue for multi-queue pipelining
+    cl_command_queue& q = plotter.get_queue(y);
+    
     if(using_pool) {
         // Module C: Reuse pre-allocated buffers — just write data, no create/destroy
         C_in_buf = g_bufpool->C_in_buf;
-        clEnqueueWriteBuffer(plotter.queue, C_in_buf, CL_TRUE, 0,
+        clEnqueueWriteBuffer(q, C_in_buf, CL_TRUE, 0,
             count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
         
         PY_buf = g_bufpool->PY_buf;
         sub_cnt_buf = g_bufpool->sub_cnt_buf;
-        clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+        clEnqueueFillBuffer(q, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
         
         LR_buf = g_bufpool->LR_buf;
         PD_match_buf = g_bufpool->PD_match_buf;
@@ -1755,7 +1769,7 @@ void process_bucket_gpu(
         sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
             num_sub * 4, nullptr, &err);
         CL_CHECK(err, "sub_cnt_buf creation");
-        clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+        clEnqueueFillBuffer(q, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
     }
     print_step("upload_C_in");
     
@@ -1770,7 +1784,7 @@ void process_bucket_gpu(
     
     size_t scatter_global = total;
     if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
-    clEnqueueNDRangeKernel(plotter.queue, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
     print_step("scatter");
     
     // Step 3: Prefix sum of sub-bucket counts
@@ -1791,7 +1805,7 @@ void process_bucket_gpu(
         clSetKernelArg(plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &num_sub_u32);
         
         size_t ps_global = num_sub, ps_local = num_sub;
-        clEnqueueNDRangeKernel(plotter.queue, plotter.prefix_sum_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, plotter.prefix_sum_kernel, 1, nullptr,
             &ps_global, &ps_local, 0, nullptr, nullptr);
         print_step("gpu_prefix_sum");
         // No overflow check readback — saves ~500us of latency per bucket.
@@ -1799,7 +1813,7 @@ void process_bucket_gpu(
     } else {
         // Original: CPU prefix sum — download sub_cnt, compute on CPU, upload sub_off
         std::vector<uint32_t> sub_cnt(num_sub);
-        clEnqueueReadBuffer(plotter.queue, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
         print_step("download_sub_cnt");
         std::vector<uint32_t> sub_off(num_sub + 1, 0);
         for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
@@ -1816,7 +1830,7 @@ void process_bucket_gpu(
                 (num_sub + 1) * 4, (void*)sub_off.data(), &err);
             CL_CHECK(err, "sub_off_buf creation");
         } else {
-            clEnqueueWriteBuffer(plotter.queue, sub_off_buf, CL_TRUE, 0,
+            clEnqueueWriteBuffer(q, sub_off_buf, CL_TRUE, 0,
                 (num_sub + 1) * 4, sub_off.data(), 0, nullptr, nullptr);
         }
     }
@@ -1830,7 +1844,7 @@ void process_bucket_gpu(
     clSetKernelArg(plotter.k_simple_sort, 3, sizeof(uint32_t), &num_sub_u32);
     
     size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
-    clEnqueueNDRangeKernel(plotter.queue, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
     print_step("sort");
     
     // Step 5: GPU match_p1 — find Y,Y+1 pairs
@@ -1844,7 +1858,7 @@ void process_bucket_gpu(
         num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
         CL_CHECK(err, "num_matches_buf creation");
     }
-    clEnqueueFillBuffer(plotter.queue, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
+    clEnqueueFillBuffer(q, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
     
     uint32_t max_total = total * 4;  // matches can exceed entries for high density
     uint32_t write_pd = 0;  // PD tracking WIP
@@ -1861,30 +1875,23 @@ void process_bucket_gpu(
     
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
-    clEnqueueNDRangeKernel(plotter.queue, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
     print_step("match");
     
     uint32_t gpu_matches = 0;
-    clEnqueueReadBuffer(plotter.queue, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
+    std::vector<uint32_t> LR_filtered;
+    
+    // Match count + LR download (2 blocking reads — can't combine due to size dependency)
+    clEnqueueReadBuffer(q, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
     print_step("download_match_count");
     
-    if(gpu_matches == 0) {
-        if(!using_pool) {
-            clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
-            clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
-            clReleaseMemObject(num_matches_buf);
-        }
-        return;
+    if(gpu_matches > 0) {
+        LR_filtered.resize(gpu_matches * 2);
+        clEnqueueReadBuffer(q, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
+        print_step("download_LR");
     }
     
-    // Step 6: Download LR pairs (all matches from bucket y — no filtering needed)
-    std::vector<uint32_t> LR_filtered(gpu_matches * 2);
-    clEnqueueReadBuffer(plotter.queue, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
-    print_step("download_LR");
-    
-    // X pairs for table 2 are now saved into dst store alongside metadata and PD
-    
-    if(LR_filtered.empty()) {
+    if(gpu_matches == 0 || LR_filtered.empty()) {
         if(!using_pool) {
             clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
             clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
@@ -1958,7 +1965,7 @@ void process_bucket_gpu(
         
         size_t gather_global = num_matches, gather_local = 64;
         if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
-        clEnqueueNDRangeKernel(plotter.queue, plotter.gather_meta_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, plotter.gather_meta_kernel, 1, nullptr,
             &gather_global, &gather_local, 0, nullptr, nullptr);
         print_step("gather");
         
@@ -1973,13 +1980,22 @@ void process_bucket_gpu(
         
         size_t hash_global = num_matches, hash_local = 64;
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
-        clEnqueueNDRangeKernel(plotter.queue, plotter.table_hash_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, plotter.table_hash_kernel, 1, nullptr,
             &hash_global, &hash_local, 0, nullptr, nullptr);
         
         Y_out.resize(num_matches);
         M_out.resize(num_matches * MY_N_META);
-        clEnqueueReadBuffer(plotter.queue, Yb, CL_TRUE, 0, num_matches * 4, Y_out.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(plotter.queue, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
+        if(get_opt_config().async_transfers) {
+            // Module D: Non-blocking read Y + M, wait once
+            cl_event ev_y, ev_m;
+            clEnqueueReadBuffer(q, Yb, CL_FALSE, 0, num_matches * 4, Y_out.data(), 0, nullptr, &ev_y);
+            clEnqueueReadBuffer(q, Mb, CL_FALSE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, &ev_m);
+            clWaitForEvents(1, &ev_y);
+            clWaitForEvents(1, &ev_m);
+        } else {
+            clEnqueueReadBuffer(q, Yb, CL_TRUE, 0, num_matches * 4, Y_out.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(q, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
+        }
         print_step("hash+download");
         
         if(!using_pool) {
@@ -2111,6 +2127,7 @@ void compute_f2_f9_chunked(
             // Display yield
             if(gpu_yield) {
                 clFinish(plotter.queue);
+                if(plotter.queue2) clFinish(plotter.queue2);
                 usleep(500);
             }
             
