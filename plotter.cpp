@@ -80,6 +80,12 @@ static uint64_t cdiv(uint64_t a, uint64_t b) {
     return (a + b - 1) / b;
 }
 
+// OpenCL error checking helper
+#define CL_CHECK(err, msg) \
+    if(err != CL_SUCCESS) { \
+        throw std::runtime_error(std::string(msg) + ": OpenCL error " + std::to_string(err)); \
+    }
+
 static void update_constants() {
     KMASK = ((uint32_t(1) << KSIZE) - 1);
     DMASK = ((1u << DSIZE_) - 1);
@@ -102,6 +108,13 @@ static void write_bits(std::vector<uint8_t>& buf, uint64_t value, uint64_t bit_o
     if(num_bits == 0) return;
     uint64_t byte_pos = bit_offset / 8;
     uint32_t bit_pos = bit_offset % 8;
+    
+    // Bounds check: ensure we don't write past the buffer end
+    uint64_t end_byte = (bit_offset + num_bits + 7) / 8;
+    if(end_byte > buf.size()) {
+        throw std::runtime_error("write_bits overflow: need byte " + std::to_string(end_byte)
+            + " but buffer is " + std::to_string(buf.size()) + " bytes");
+    }
     
     // Handle first byte if not aligned
     if(bit_pos != 0) {
@@ -537,6 +550,15 @@ public:
         // Read back bucket counts
         std::vector<uint32_t> cnt(num_buckets);
         clEnqueueReadBuffer(queue, cnt_buf, CL_TRUE, 0, num_buckets * 4, cnt.data(), 0, nullptr, nullptr);
+        
+        // Check for bucket overflow (entries dropped by eval_p1_tx)
+        uint32_t total_out = 0;
+        for(int b = 0; b < num_buckets; b++) total_out += cnt[b];
+        if(total_out < num) {
+            std::cerr << "[WARN] eval_p1_tx dropped " << (num - total_out)
+                      << " entries (bucket overflow, max_bucket_size=" << max_bucket_size
+                      << ") at table " << table << std::endl;
+        }
         
         // Read back Y (only if write_y) and C
         std::vector<uint32_t> Y_gpu(write_y ? num_buckets * max_bucket_size : 0, 0);
@@ -1092,6 +1114,13 @@ void write_plot(
                     write_bits(park, sym.first, delta_bit_offset, sym.second);
                     delta_bit_offset += sym.second;
                 }
+                // Check for park overflow before truncating
+                uint64_t actual_park_bits = delta_bit_offset;
+                uint64_t actual_park_bytes = (actual_park_bits + 7) / 8;
+                if(actual_park_bytes > max_park_bytes_y) {
+                    throw std::runtime_error("Y park overflow: " + std::to_string(actual_park_bytes)
+                        + " > " + std::to_string(max_park_bytes_y) + " at park " + std::to_string(p));
+                }
                 park.resize(max_park_bytes_y, 0);
                 parks_buf[pi] = std::move(park);
             }
@@ -1188,6 +1217,14 @@ void write_plot(
                     write_bits(park, sym.first, delta_bit_offset, sym.second);
                     delta_bit_offset += sym.second;
                 }
+                // Check for park overflow before truncating
+                uint64_t actual_pd_bits = delta_bit_offset;
+                uint64_t actual_pd_bytes = (actual_pd_bits + 7) / 8;
+                if(actual_pd_bytes > max_park_bytes_pd) {
+                    throw std::runtime_error("PD park overflow: " + std::to_string(actual_pd_bytes)
+                        + " > " + std::to_string(max_park_bytes_pd) + " at park " + std::to_string(p)
+                        + " table " + std::to_string(pd_table));
+                }
                 park.resize(max_park_bytes_pd, 0);
                 parks_buf[pi] = std::move(park);
             }
@@ -1283,9 +1320,13 @@ struct MemBucketStore {
         std::fill(counts.begin(), counts.end(), 0);
     }
     
+    uint64_t total_dropped = 0;  // Track dropped entries
+    
     void append(int bucket, const uint32_t* meta, uint32_t count) {
         if(bucket < 0 || bucket >= num_buckets) return;
         if(counts[bucket] + count > (uint32_t)max_bucket_size) {
+            uint32_t dropped = count - (max_bucket_size - counts[bucket]);
+            total_dropped += dropped;
             count = max_bucket_size - counts[bucket];
         }
         if(count == 0) return;
@@ -1627,12 +1668,15 @@ void process_bucket_gpu(
     
     cl_mem C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         C_combined.size() * 4, (void*)C_combined.data(), &err);
+    CL_CHECK(err, "C_in_buf creation");
     
     // Step 2: GPU scatter_2 — sub-bucket by Y's full (LOGBUCKETS+LOGBUCKETS2) bits
     cl_mem PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
         (size_t)num_sub * max_bs2 * 8, nullptr, &err);
+    CL_CHECK(err, "PY_buf creation");
     cl_mem sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
         num_sub * 4, nullptr, &err);
+    CL_CHECK(err, "sub_cnt_buf creation");
     clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
     
     uint32_t total_u32 = total;
@@ -1649,14 +1693,23 @@ void process_bucket_gpu(
     clEnqueueNDRangeKernel(plotter.queue, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
     
     // Step 3: CPU prefix sum of sub-bucket counts
+    // Check for sub-bucket overflow (entries dropped by scatter_2)
     std::vector<uint32_t> sub_cnt(num_sub);
     clEnqueueReadBuffer(plotter.queue, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
     std::vector<uint32_t> sub_off(num_sub + 1, 0);
     for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
     uint32_t total_scattered = sub_off[num_sub];
     
+    // Check for sub-bucket overflow
+    if(total_scattered < total) {
+        std::cerr << "[WARN] scatter_2 dropped " << (total - total_scattered)
+                  << " entries (sub-bucket overflow, max_bs2=" << max_bs2 << ")"
+                  << " bucket " << y << " table " << table << std::endl;
+    }
+    
     cl_mem sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         (num_sub + 1) * 4, (void*)sub_off.data(), &err);
+    CL_CHECK(err, "sub_off_buf creation");
     
     // Step 4: GPU simple_sort_y — sort within each sub-bucket
     uint32_t max_bs_sort = max_bs2;
@@ -1672,9 +1725,12 @@ void process_bucket_gpu(
     // Step 5: GPU match_p1 — find Y,Y+1 pairs
     cl_mem LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
         (size_t)total * 4 * 8, nullptr, &err);
+    CL_CHECK(err, "LR_buf creation");
     cl_mem PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
         (size_t)total * 4 * 4, nullptr, &err);
+    CL_CHECK(err, "PD_match_buf creation");
     cl_mem num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+    CL_CHECK(err, "num_matches_buf creation");
     clEnqueueFillBuffer(plotter.queue, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
     
     uint32_t max_total = total * 4;  // matches can exceed entries for high density
