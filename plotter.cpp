@@ -2706,6 +2706,19 @@ BucketPending submit_bucket_svm(
     int zero = 0;
     p.q = active_plotter.queue;
     cl_command_queue& q = p.q;
+    
+    // Timing
+    bool do_timing = timing_detail && (y == 0);
+    auto ts = std::chrono::steady_clock::now();
+    auto te = ts;
+    auto ps = [&](const char* name) {
+        if(do_timing) {
+            te = std::chrono::steady_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(te - ts).count();
+            std::cerr << "    [SVM " << name << "] " << us << "us" << std::endl;
+            ts = te;
+        }
+    };
 
     // Copy metadata for CPU PD computation (only needed for non-gpu-meta path)
     if(!get_opt_config().gpu_meta_extract) {
@@ -2730,6 +2743,7 @@ BucketPending submit_bucket_svm(
         std::memset(p.svm_sub_cnt, 0, num_sub * 4);
         std::memset(p.svm_num_matches, 0, 4);
         std::atomic_thread_fence(std::memory_order_release);
+    ps("write_C_in");
     } else {
         // Coarse-grain: map, write, unmap
         svm->map(p.svm_C_in, p.count_y * n_meta * 4, CL_MAP_WRITE);
@@ -2756,6 +2770,7 @@ BucketPending submit_bucket_svm(
     size_t scatter_global = total;
     if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
     clEnqueueNDRangeKernel(q, active_plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+    ps("scatter");
 
     // Step 3: Prefix sum (Module A: GPU)
     p.num_sub_u32 = (uint32_t)num_sub;
@@ -2777,6 +2792,7 @@ BucketPending submit_bucket_svm(
     clSetKernelArg(active_plotter.k_simple_sort, 3, sizeof(uint32_t), &p.num_sub_u32);
     size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
     clEnqueueNDRangeKernel(q, active_plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+    ps("sort");
 
     // Step 5: Match
     uint32_t max_total = total * 4;
@@ -2793,7 +2809,8 @@ BucketPending submit_bucket_svm(
     clSetKernelArg(active_plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
-    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, &p.ev_match_done);
+    ps("match");
 
     // DO NOT read match count here — return immediately so GPU 1 can be submitted
     // Match count read happens in submit_hash_svm (after both GPUs are working)
@@ -2811,10 +2828,25 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
     const int n_meta = p.n_meta;
     int y = p.y, table = p.table;
     
-    // Read match count — clFinish ensures kernel done, then direct CPU read (fine-grain)
-    if(svm->fine_grain) {
-        clFinish(q);
+    bool do_timing = timing_detail && (y == 0);
+    auto ts = std::chrono::steady_clock::now();
+    auto te = ts;
+    auto ps = [&](const char* name) {
+        if(do_timing) {
+            te = std::chrono::steady_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(te - ts).count();
+            std::cerr << "    [SVM " << name << "] " << us << "us" << std::endl;
+            ts = te;
+        }
+    };
+    
+    // Read match count — use event wait (faster than clFinish which flushes entire queue)
+    if(svm->fine_grain && p.ev_match_done) {
+        clWaitForEvents(1, &p.ev_match_done);
+        clReleaseEvent(p.ev_match_done);
+        p.ev_match_done = nullptr;
         p.gpu_matches = *(volatile uint32_t*)p.svm_num_matches;
+        ps("event_wait+match_count");
     } else {
         uint32_t match_count = 0;
         clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
@@ -2838,6 +2870,7 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
         svm->unmap(p.svm_LR);
     }
+    ps("read_LR");
     
     // Compute PD
     p.bucket_offset = 0;
@@ -2886,6 +2919,7 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         size_t gather_global = p.num_matches, gather_local = 64;
         if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
         clEnqueueNDRangeKernel(q, active_plotter.gather_meta_kernel, 1, nullptr, &gather_global, &gather_local, 0, nullptr, nullptr);
+        ps("gather");
         
         // Hash kernel
         uint32_t kmask = KMASK;
@@ -2897,14 +2931,18 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         clSetKernelArg(active_plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
         size_t hash_global = p.num_matches, hash_local = 64;
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
-        clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
+        clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, &p.ev_hash_done);
+        ps("hash");
         
-        // Read Y + M from SVM — clEnqueueSVMMap(CL_TRUE) is the sync point
+        // Read Y + M from SVM — event wait (faster than clFinish)
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        // Read Y+M — fine-grain: clFinish + direct memcpy; coarse: map/unmap
-        if(svm->fine_grain) {
-            clFinish(q);
+        // Read Y+M — fine-grain: event wait + direct memcpy; coarse: map/unmap
+        if(svm->fine_grain && p.ev_hash_done) {
+            clWaitForEvents(1, &p.ev_hash_done);
+            clReleaseEvent(p.ev_hash_done);
+            p.ev_hash_done = nullptr;
+            ps("event_wait_hash");
             std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
             std::memcpy(p.M_out.data(), p.svm_M_hash, p.num_matches * MY_N_META * 4);
         } else {
