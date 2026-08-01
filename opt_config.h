@@ -37,9 +37,12 @@ struct OptConfig {
     // Module C: Pre-allocated buffer pool (reuse GPU buffers across buckets)
     bool bufpool = false;
     
+    // Module F: Zero-copy / pinned memory (CL_MEM_ALLOC_HOST_PTR + map/unmap)
+    bool zero_copy = false;
+    
     // Helper: any optimization enabled?
     bool any_enabled() const {
-        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool;
+        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool || zero_copy;
     }
     
     // Print current config
@@ -51,6 +54,7 @@ struct OptConfig {
         std::cout << "  num_queues:      " << num_queues << std::endl;
         std::cout << "  fuse_kernels:   " << (fuse_kernels ? "ON" : "off") << std::endl;
         std::cout << "  bufpool:        " << (bufpool ? "ON" : "off") << std::endl;
+        std::cout << "  zero_copy:     " << (zero_copy ? "ON" : "off") << std::endl;
     }
 };
 

@@ -31,6 +31,12 @@ struct BufferPool {
     
     bool initialized = false;
     
+    // Module F: Mapped host pointers for zero-copy access
+    void* mapped_C_in = nullptr;
+    void* mapped_LR = nullptr;
+    void* mapped_Y = nullptr;
+    void* mapped_M = nullptr;
+    
     void init(cl_context ctx, cl_command_queue q, 
               int max_bucket_size, int n_meta, int num_sub, int max_bs2) {
         context = ctx;

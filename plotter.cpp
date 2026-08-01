@@ -1760,11 +1760,30 @@ void process_bucket_gpu(
     // Module E: Use per-bucket queue for multi-queue pipelining
     cl_command_queue& q = active_plotter.get_queue(y);
     
+    // Module F: zero-copy read helper (map/unmap instead of clEnqueueReadBuffer)
+    auto zero_copy_read = [&](cl_mem buf, void* dst, size_t size) {
+        cl_int e;
+        void* mapped = clEnqueueMapBuffer(q, buf, CL_TRUE, CL_MAP_READ, 0, size, 0, nullptr, nullptr, &e);
+        if(e == CL_SUCCESS && mapped) {
+            std::memcpy(dst, mapped, size);
+            clEnqueueUnmapMemObject(q, buf, mapped, 0, nullptr, nullptr);
+        }
+    };
+    
     if(using_pool) {
         // Module C: Reuse pre-allocated buffers — just write data, no create/destroy
         C_in_buf = active_pool->C_in_buf;
-        clEnqueueWriteBuffer(q, C_in_buf, CL_TRUE, 0,
-            count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
+        if(get_opt_config().zero_copy) {
+            // Module F: Map buffer, write directly, unmap (zero-copy on shared memory, fast DMA on discrete)
+            void* mapped = clEnqueueMapBuffer(q, C_in_buf, CL_TRUE, CL_MAP_WRITE,
+                0, count_y * n_meta * 4, 0, nullptr, nullptr, &err);
+            CL_CHECK(err, "map C_in_buf");
+            std::memcpy(mapped, meta_y, count_y * n_meta * 4);
+            clEnqueueUnmapMemObject(q, C_in_buf, mapped, 0, nullptr, nullptr);
+        } else {
+            clEnqueueWriteBuffer(q, C_in_buf, CL_TRUE, 0,
+                count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
+        }
         
         PY_buf = active_pool->PY_buf;
         sub_cnt_buf = active_pool->sub_cnt_buf;
@@ -1898,14 +1917,23 @@ void process_bucket_gpu(
     uint32_t gpu_matches = 0;
     std::vector<uint32_t> LR_filtered;
     
-    // Match count + LR download (2 blocking reads — can't combine due to size dependency)
-    clEnqueueReadBuffer(q, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
-    print_step("download_match_count");
-    
-    if(gpu_matches > 0) {
-        LR_filtered.resize(gpu_matches * 2);
-        clEnqueueReadBuffer(q, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
-        print_step("download_LR");
+    // Match count + LR download
+    if(get_opt_config().zero_copy) {
+        zero_copy_read(num_matches_buf, &gpu_matches, 4);
+        print_step("download_match_count");
+        if(gpu_matches > 0) {
+            LR_filtered.resize(gpu_matches * 2);
+            zero_copy_read(LR_buf, LR_filtered.data(), gpu_matches * 8);
+            print_step("download_LR");
+        }
+    } else {
+        clEnqueueReadBuffer(q, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
+        print_step("download_match_count");
+        if(gpu_matches > 0) {
+            LR_filtered.resize(gpu_matches * 2);
+            clEnqueueReadBuffer(q, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
+            print_step("download_LR");
+        }
     }
     
     if(gpu_matches == 0 || LR_filtered.empty()) {
@@ -2002,7 +2030,11 @@ void process_bucket_gpu(
         
         Y_out.resize(num_matches);
         M_out.resize(num_matches * MY_N_META);
-        if(get_opt_config().async_transfers) {
+        if(get_opt_config().zero_copy) {
+            // Module F: zero-copy read via map/unmap
+            zero_copy_read(Yb, Y_out.data(), num_matches * 4);
+            zero_copy_read(Mb, M_out.data(), num_matches * MY_N_META * 4);
+        } else if(get_opt_config().async_transfers) {
             // Module D: Non-blocking read Y + M, wait once
             cl_event ev_y, ev_m;
             clEnqueueReadBuffer(q, Yb, CL_FALSE, 0, num_matches * 4, Y_out.data(), 0, nullptr, &ev_y);
@@ -2718,6 +2750,7 @@ std::cerr << "  --opt-gpu-prefix Module A: GPU prefix sum (skip sub-count readba
 std::cerr << "  --opt-async     Module D: Async PCIe transfers" << std::endl;
 std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buckets)" << std::endl;
 std::cerr << "  --opt-bufpool   Module C: Pre-allocated reusable GPU buffers" << std::endl;
+std::cerr << "  --opt-zero-copy Module F: Pinned memory + map/unmap (zero-copy)" << std::endl;
 std::cerr << "  --timing        Show per-step timing for first bucket of each table" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
@@ -2745,6 +2778,7 @@ else if(arg == "--opt-async") get_opt_config().async_transfers = true;
 else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::stoi(argv[++i]);
 else if(arg == "--timing") timing_detail = true;
 else if(arg == "--opt-bufpool") get_opt_config().bufpool = true;
+else if(arg == "--opt-zero-copy") get_opt_config().zero_copy = true;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
