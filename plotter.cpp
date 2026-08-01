@@ -731,23 +731,21 @@ void compute_full_pipeline(
             for(const auto& p : thread_lr[ti]) all_lr.push_back(p);
         }
         
-        // GPU hash: upload M_curr flat + LR pairs, kernel indexes directly
-        std::vector<uint32_t> M_curr_flat(M_curr.size() * MY_N_META);
-        #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < M_curr.size(); i++) {
-            for(int j = 0; j < MY_N_META; j++) {
-                M_curr_flat[i * MY_N_META + j] = M_curr[i][j];
-            }
-        }
-        std::vector<uint32_t> LR_flat(total_matches * 2);
+        // GPU hash — old method (pre-extract L/R metadata on CPU)
+        std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
+        std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < total_matches; i++) {
-            LR_flat[i * 2] = entries[all_lr[i].first].second;
-            LR_flat[i * 2 + 1] = entries[all_lr[i].second].second;
+            const auto& [sorted_L, sorted_R] = all_lr[i];
+            uint32_t orig_L = entries[sorted_L].second;
+            uint32_t orig_R = entries[sorted_R].second;
+            for(int j = 0; j < MY_N_META; j++) {
+                L_meta_flat[i * MY_N_META + j] = M_curr[orig_L][j];
+                R_meta_flat[i * MY_N_META + j] = M_curr[orig_R][j];
+            }
         }
-        
         std::vector<uint32_t> Y_results, M_results;
-        gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
+        gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
         
         // Convert to M_next format
         std::vector<std::array<uint32_t, 14>> M_next(total_matches);
@@ -973,6 +971,10 @@ void write_plot(
     header->park_bytes_meta = max_park_bytes_meta;
     header->entry_bits_x = LPX2SIZE;
     header->num_entries_y = plot.final_Y.size();
+    std::cerr << "[write_plot] final_Y=" << plot.final_Y.size() << " X_pairs=" << plot.X_pairs.size() << std::endl;
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        std::cerr << "[write_plot] PD[" << t << "]=" << plot.PD[t].size() << std::endl;
+    }
     std::cout << "[Debug] num_entries_y = " << plot.final_Y.size() << ", PD[9] = " << plot.PD[9].size() << std::endl;
     
     // Set ALL header fields before writing, so the header size is correct
@@ -1133,6 +1135,7 @@ void write_plot(
         }
     }
     
+    std::cerr << "[write_plot] Writing PD parks..." << std::endl;
     // Debug: check PD delta ranges
     for(int t = 2; t <= MY_N_TABLE; t++) std::cout << "[Debug] PD[" << t << " size = " << plot.PD[t].size() << std::endl;
     for(int t = 0; t < 7; t++) {
@@ -1195,6 +1198,7 @@ void write_plot(
         }
     }
     
+    std::cerr << "[write_plot] Writing X parks..." << std::endl;
     // Write X table (parallel chunk generation)
     {
         const uint64_t num_x_entries = plot.X_pairs.size();
@@ -1607,25 +1611,6 @@ void process_bucket_gpu(
         return;
     }
     
-    // Step 6b: Download sorted PY array to build position mapping for PD tracking
-    // PY[sub * max_bs2 + sorted_pos] = (Y << (64-KSIZE)) | original_pos
-    // We need: original_pos → (sub_bucket, sorted_pos_in_sub)
-    std::vector<uint64_t> PY_sorted(num_sub * max_bs2);
-    clEnqueueReadBuffer(plotter.queue, PY_buf, CL_TRUE, 0, (size_t)num_sub * max_bs2 * 8, PY_sorted.data(), 0, nullptr, nullptr);
-    
-    // Build mapping: original_pos → global_sorted_pos within this bucket
-    // global_sorted_pos_in_bucket = sub_offset[sub] + sorted_pos_in_sub
-    std::unordered_map<uint32_t, uint32_t> pos_map;
-    pos_map.reserve(total);
-    for(int s = 0; s < num_sub; s++) {
-        uint32_t cnt = sub_cnt[s];
-        uint32_t base = sub_off[s];  // offset within bucket
-        for(uint32_t i = 0; i < cnt; i++) {
-            uint64_t py = PY_sorted[s * max_bs2 + i];
-            uint32_t orig_pos = (uint32_t)py;  // lower bits = original position
-            pos_map[orig_pos] = base + i;     // sorted position within bucket
-        }
-    }
     
     // Compute PD for each match
     // Global sorted position = bucket_offset[y] + sorted_pos_in_bucket
@@ -1634,69 +1619,31 @@ void process_bucket_gpu(
     for(int b = 0; b < y; b++) bucket_offset += src.counts[b];
     
     uint32_t num_filt = LR_filtered.size() / 2;
-    std::vector<uint32_t> pd_data(num_filt * 2);  // (global_sorted_pos, delta) per match
-    
-    if(table == 2) {
-        std::cerr << "DEBUG B0 T2: pos_map size=" << pos_map.size() << " total=" << total << std::endl;
-        std::cerr << "DEBUG B0 T2: LR_filtered[0]=" << LR_filtered[0] << " LR_filtered[1]=" << LR_filtered[1] << std::endl;
-        std::cerr << "DEBUG B0 T2: num_filt=" << num_filt << std::endl;
-        int found = 0, not_found = 0;
-        for(uint32_t i = 0; i < std::min((uint32_t)100, num_filt); i++) {
-            if(pos_map.find(LR_filtered[i * 2]) != pos_map.end()) found++; else not_found++;
-        }
-        std::cerr << "DEBUG B0 T2: found=" << found << " not_found=" << not_found << std::endl;
-        int cnt = 0;
-        for(auto& [k, v] : pos_map) {
-            if(cnt++ < 5) std::cerr << "  pos_map[" << k << "] = " << v << std::endl;
-        }
-    }
+    std::vector<uint32_t> pd_data(num_filt * 2);  // (left_store_pos, right_store_pos)
     for(uint32_t i = 0; i < num_filt; i++) {
         uint32_t left_orig = LR_filtered[i * 2];
         uint32_t right_orig = LR_filtered[i * 2 + 1];
-        
-        auto it_l = pos_map.find(left_orig);
-        auto it_r = pos_map.find(right_orig);
-        if(it_l != pos_map.end() && it_r != pos_map.end()) {
-            uint32_t sorted_l = bucket_offset + it_l->second;
-            uint32_t sorted_r = bucket_offset + it_r->second;
-            uint32_t delta = sorted_r - sorted_l;
-            pd_data[i * 2] = sorted_l;
-            pd_data[i * 2 + 1] = delta;
-        } else {
-            pd_data[i * 2] = 0;
-            pd_data[i * 2 + 1] = 0;
-        }
+        // Store insertion-order position (= index into pd_all[t-1])
+        // bucket_offset + orig_pos = global store position = pd_all index
+        pd_data[i * 2] = bucket_offset + left_orig;
+        pd_data[i * 2 + 1] = bucket_offset + right_orig;
     }
     
-    // Step 7: GPU hash — hash_table_lr (uses C_in + LR)
-    // Upload LR (C_in is already on GPU)
-    cl_mem LR_filt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        LR_filtered.size() * 4, (void*)LR_filtered.data(), &err);
-    
-    cl_mem Y_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-        num_filt * 4, nullptr, &err);
-    cl_mem M_out_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-        num_filt * n_meta * 4, nullptr, &err);
-    
-    uint32_t kmask = KMASK;
-    uint32_t num_filt_u32 = num_filt;
-    uint32_t total_u32_hash = total;  // total entries in C_combined
-    clSetKernelArg(plotter.hash_lr_kernel, 0, sizeof(cl_mem), &C_in_buf);  // reuse C_in on GPU!
-    clSetKernelArg(plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_filt_buf);
-    clSetKernelArg(plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Y_out_buf);
-    clSetKernelArg(plotter.hash_lr_kernel, 3, sizeof(cl_mem), &M_out_buf);
-    clSetKernelArg(plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
-    clSetKernelArg(plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_filt_u32);
-    clSetKernelArg(plotter.hash_lr_kernel, 6, sizeof(uint32_t), &total_u32_hash);
-    
-    size_t hash_global = num_filt;
-    if(hash_global % 64) hash_global = ((hash_global / 64) + 1) * 64;
-    clEnqueueNDRangeKernel(plotter.queue, plotter.hash_lr_kernel, 1, nullptr, &hash_global, nullptr, 0, nullptr, nullptr);
-    
-    // Step 8: Download Y_out, M_out
-    std::vector<uint32_t> Y_out(num_filt), M_out(num_filt * n_meta);
-    clEnqueueReadBuffer(plotter.queue, Y_out_buf, CL_TRUE, 0, num_filt * 4, Y_out.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(plotter.queue, M_out_buf, CL_TRUE, 0, num_filt * n_meta * 4, M_out.data(), 0, nullptr, nullptr);
+    // Step 7: GPU hash — old method (CPU meta extraction + gpu_hash_table)
+    // GPU hash — use old method (pre-extract L/R metadata, known working)
+    size_t num_matches = LR_filtered.size() / 2;
+    std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
+    std::vector<uint32_t> R_meta_flat(num_matches * n_meta);
+    for(size_t i = 0; i < num_matches; i++) {
+        uint32_t P1 = LR_filtered[i * 2];
+        uint32_t P2 = LR_filtered[i * 2 + 1];
+        for(int j = 0; j < n_meta; j++) {
+            L_meta_flat[i * n_meta + j] = C_combined[P1 * n_meta + j];
+            R_meta_flat[i * n_meta + j] = C_combined[P2 * n_meta + j];
+        }
+    }
+    std::vector<uint32_t> Y_out, M_out;
+    plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
     
     // Step 9: Bucket output → dst store (metadata + PD)
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
@@ -1720,15 +1667,15 @@ void process_bucket_gpu(
     // Cleanup GPU resources
     clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
     clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
-    clReleaseMemObject(num_matches_buf); clReleaseMemObject(LR_filt_buf);
-    clReleaseMemObject(Y_out_buf); clReleaseMemObject(M_out_buf);
+    clReleaseMemObject(num_matches_buf);
+
 }
 
 // PD per table entry: Y value + (sorted_pos, delta)
 struct PDEntry {
     uint32_t Y;
-    uint32_t sorted_pos;
-    uint32_t delta;
+    uint32_t left_pos;   // store-order position of left entry in previous table
+    uint32_t right_pos;  // store-order position of right entry in previous table
 };
 void compute_f2_f9_chunked(
     OCL_Plotter& plotter,
@@ -1798,11 +1745,11 @@ void compute_f2_f9_chunked(
                 PDEntry entry;
                 entry.Y = Y;
                 if(has_pd) {
-                    entry.sorted_pos = pd[i * 2];
-                    entry.delta = pd[i * 2 + 1];
+                    entry.left_pos = pd[i * 2];
+                    entry.right_pos = pd[i * 2 + 1];
                 } else {
-                    entry.sorted_pos = 0;
-                    entry.delta = 0;
+                    entry.left_pos = 0;
+                    entry.right_pos = 0;
                 }
                 pd_all[t].push_back(entry);
             }
@@ -1846,86 +1793,99 @@ void build_plot_data_from_store(
 {
     const int n_meta = store.n_meta;
     
-    // Collect all entries from all buckets (with PD data)
-    std::vector<uint32_t> all_Y;
-    std::vector<std::array<uint32_t, 14>> all_meta;
-    std::vector<std::pair<uint32_t, uint32_t>> all_pd;  // (sorted_pos, delta) per entry
+    std::cout << "[Plot] Building plot data from pd_all..." << std::endl;
     
-    uint64_t total = 0;
-    for(int y = 0; y < store.num_buckets; y++) total += store.counts[y];
-    std::cout << "[Plot] Collecting " << total << " entries from " << store.num_buckets << " buckets..." << std::endl;
+    // ====================================================================
+    // Step 1: For each table t (2..9), sort pd_all[t] by (Y, left_pos)
+    //         to get the Y-sorted order. Build remap maps.
+    // ====================================================================
     
-    all_Y.reserve(total);
-    all_meta.reserve(total);
-    all_pd.reserve(total);
+    // sort_order[t] = permutation: Y-sorted index -> original pd_all index
+    // inv_remap[t]  = mapping: original pd_all index -> Y-sorted index
+    std::vector<std::vector<uint32_t>> sort_order(MY_N_TABLE + 1);
+    std::vector<std::vector<uint32_t>> inv_remap(MY_N_TABLE + 1);
     
-    for(int y = 0; y < store.num_buckets; y++) {
-        uint32_t cnt = store.counts[y];
-        if(cnt == 0) continue;
-        const uint32_t* meta = store.buckets[y].data();
-        const uint32_t* pd = store.pd_buckets[y].data();
-        for(uint32_t i = 0; i < cnt; i++) {
-            uint32_t Y = 0;
-            for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
-            Y &= KMASK;
-            all_Y.push_back(Y);
-            std::array<uint32_t, 14> m;
-            for(int j = 0; j < n_meta; j++) m[j] = meta[i * n_meta + j];
-            all_meta.push_back(m);
-            // PD data: (sorted_pos, delta) — if available
-            if(store.pd_buckets[y].size() >= (i + 1) * 2) {
-                all_pd.push_back({pd[i * 2], pd[i * 2 + 1]});
-            } else {
-                all_pd.push_back({0, 0});
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        if(t >= (int)pd_all.size() || pd_all[t].empty()) continue;
+        
+        size_t n = pd_all[t].size();
+        sort_order[t].resize(n);
+        for(size_t i = 0; i < n; i++) sort_order[t][i] = (uint32_t)i;
+        
+        // Sort by (Y, left_pos) — consistent tie-breaker matching store insertion order
+        auto pd_sort = [&pd_all, t](uint32_t a, uint32_t b) {
+            if(pd_all[t][a].Y == pd_all[t][b].Y)
+                return pd_all[t][a].left_pos < pd_all[t][b].left_pos;
+            return pd_all[t][a].Y < pd_all[t][b].Y;
+        };
+        std::sort(sort_order[t].begin(), sort_order[t].end(), pd_sort);
+        
+        // Build inverse: original index -> Y-sorted index
+        inv_remap[t].resize(n);
+        for(size_t i = 0; i < n; i++) {
+            inv_remap[t][sort_order[t][i]] = (uint32_t)i;
+        }
+        
+        std::cout << "[Plot] T" << t << ": " << n << " entries sorted" << std::endl;
+    }
+    
+    // ====================================================================
+    // Step 2: Build final_Y and final_meta from pd_all[9] (table 9 = final table)
+    //         Sort by (Y, left_pos), deduplicate by (Y, metadata)
+    // ====================================================================
+    
+    // Collect metadata from store for table 9 entries
+    // pd_all[9] entries correspond to store entries (same order)
+    // Store entries: bucket by bucket, insertion order within bucket
+    // pd_all[9] was collected in the same order
+    std::vector<std::array<uint32_t, 14>> t9_meta(pd_all[9].size());
+    {
+        size_t idx = 0;
+        for(int y = 0; y < store.num_buckets && idx < pd_all[9].size(); y++) {
+            uint32_t cnt = store.counts[y];
+            const uint32_t* meta = store.buckets[y].data();
+            for(uint32_t i = 0; i < cnt && idx < pd_all[9].size(); i++, idx++) {
+                for(int j = 0; j < n_meta; j++)
+                    t9_meta[idx][j] = meta[i * n_meta + j];
             }
         }
     }
     
-    // Sort by Y (with metadata tie-break for stable ordering)
-    std::vector<uint32_t> indices(all_Y.size());
-    for(size_t i = 0; i < indices.size(); i++) indices[i] = i;
+    // Build final_Y sorted by (Y, left_pos), deduped by (Y, metadata)
+    std::vector<uint32_t> final_indices;  // pd_all[9] indices that survive dedup
     
-    auto sort_func = [&all_Y, &all_meta](uint32_t a, uint32_t b) {
-        if(all_Y[a] == all_Y[b]) return all_meta[a] < all_meta[b];
-        return all_Y[a] < all_Y[b];
-    };
-    std::sort(indices.begin(), indices.end(), sort_func);
-    
-    // Deduplicate (entries with same Y and metadata are duplicates)
-    std::vector<uint32_t> unique_indices;
-    for(size_t i = 0; i < indices.size(); i++) {
-        if(i > 0 && all_Y[indices[i]] == all_Y[indices[i-1]] && all_meta[indices[i]] == all_meta[indices[i-1]]) {
-            continue;  // skip duplicate
+    for(size_t i = 0; i < sort_order[9].size(); i++) {
+        uint32_t orig_idx = sort_order[9][i];
+        // Check for duplicate (same Y and same metadata as previous)
+        if(!final_indices.empty()) {
+            uint32_t prev_idx = final_indices.back();
+            if(pd_all[9][orig_idx].Y == pd_all[9][prev_idx].Y &&
+               t9_meta[orig_idx] == t9_meta[prev_idx]) {
+                continue;  // skip duplicate
+            }
         }
-        unique_indices.push_back(indices[i]);
+        final_indices.push_back(orig_idx);
     }
     
-    std::cout << "[Plot] " << unique_indices.size() << " unique entries (was " << indices.size() << ")" << std::endl;
+    std::cout << "[Plot] " << final_indices.size() << " unique entries (was " 
+              << pd_all[9].size() << ")" << std::endl;
     
-    // Build final arrays (sorted by Y, deduplicated)
-    plot.final_Y.resize(unique_indices.size());
-    plot.final_meta.resize(unique_indices.size());
-    for(size_t i = 0; i < unique_indices.size(); i++) {
-        plot.final_Y[i] = all_Y[unique_indices[i]];
-        plot.final_meta[i] = all_meta[unique_indices[i]];
+    plot.final_Y.resize(final_indices.size());
+    plot.final_meta.resize(final_indices.size());
+    for(size_t i = 0; i < final_indices.size(); i++) {
+        uint32_t idx = final_indices[i];
+        plot.final_Y[i] = pd_all[9][idx].Y;
+        plot.final_meta[i] = t9_meta[idx];
     }
     
-    // Build PD for ALL tables (2..9) from pd_all
-    // Each pd_all[t] has entries with (Y, sorted_pos, delta)
-    // where sorted_pos is the STORE-ORDER position in table t-1.
-    // 
-    // The Prover indexes PD[t] by the Y-sorted position in table t.
-    // And PD[t]'s position field must be the Y-sorted position in table t-1.
-    // 
-    // So we need to:
-    // 1. Sort pd_all[t] by (Y, sorted_pos) to get Y-sorted order for table t
-    // 2. Build a remap: store_pos -> Y_sorted_pos for table t-1
-    // 3. Apply remap to PD[t]'s position values
+    // ====================================================================
+    // Step 3: Build PD[t] for t=2..9
+    //         PD[t] is indexed by Y-sorted position in table t.
+    //         PD[t][i] = (Y_sorted_pos_in_table_{t-1}, delta)
+    //         where delta = right_Y_sorted_pos - left_Y_sorted_pos
+    // ====================================================================
+    
     plot.PD.resize(MY_N_TABLE + 1);
-    
-    // First, compute the Y-sorted order for ALL tables and build remap maps.
-    // remap[t-1][store_pos] = Y_sorted_index in table t-1
-    std::vector<std::unordered_map<uint32_t, uint32_t>> pos_remap(MY_N_TABLE + 1);
     
     for(int t = 2; t <= MY_N_TABLE; t++) {
         if(t >= (int)pd_all.size() || pd_all[t].empty()) {
@@ -1933,52 +1893,54 @@ void build_plot_data_from_store(
             continue;
         }
         
-        // Sort pd_all[t] by (Y, sorted_pos) — same key as final_Y and PD[9]
-        std::vector<uint32_t> pd_indices(pd_all[t].size());
-        for(size_t i = 0; i < pd_indices.size(); i++) pd_indices[i] = i;
+        size_t n = sort_order[t].size();
+        plot.PD[t].resize(n);
         
-        auto pd_sort = [&pd_all, t](uint32_t a, uint32_t b) {
-            if(pd_all[t][a].Y == pd_all[t][b].Y)
-                return pd_all[t][a].sorted_pos < pd_all[t][b].sorted_pos;
-            return pd_all[t][a].Y < pd_all[t][b].Y;
-        };
-        std::sort(pd_indices.begin(), pd_indices.end(), pd_sort);
-        
-        // Build remap for THIS table: store_pos -> Y_sorted_index
-        // pd_all[t][pd_indices[i]].sorted_pos is the store position
-        // i is the Y-sorted index
-        // NOTE: for duplicate Y+sorted_pos, keep the first occurrence
-        for(size_t i = 0; i < pd_indices.size(); i++) {
-            uint32_t store_pos = pd_all[t][pd_indices[i]].sorted_pos;
-            if(pos_remap[t].find(store_pos) == pos_remap[t].end()) {
-                pos_remap[t][store_pos] = (uint32_t)i;
-            }
-        }
-        
-        // Build PD[t] sorted by Y, with remapped positions
-        plot.PD[t].resize(pd_indices.size());
-        for(size_t i = 0; i < pd_indices.size(); i++) {
-            auto& pe = pd_all[t][pd_indices[i]];
-            uint32_t remapped_pos = pe.sorted_pos;
-            // Remap position from store-order to Y-sorted order in table t-1
-            if(t > 2 && pos_remap[t-1].size() > 0) {
-                auto it = pos_remap[t-1].find(pe.sorted_pos);
-                if(it != pos_remap[t-1].end()) {
-                    remapped_pos = it->second;
+        for(size_t i = 0; i < n; i++) {
+            uint32_t orig_idx = sort_order[t][i];  // original pd_all index
+            auto& pe = pd_all[t][orig_idx];
+            
+            // pe.left_pos and pe.right_pos are indices into pd_all[t-1]
+            // Remap to Y-sorted indices using inv_remap[t-1]
+            uint32_t left_ysorted, right_ysorted;
+            
+            if(t == 2) {
+                // For table 2, positions index into table 1 (F1/X table)
+                // Table 1 is the F1 output, indexed by x value
+                // No remap needed — F1 entries are indexed by position
+                left_ysorted = pe.left_pos;
+                right_ysorted = pe.right_pos;
+            } else {
+                // Remap from pd_all[t-1] index to Y-sorted index
+                if(pe.left_pos < inv_remap[t-1].size()) {
+                    left_ysorted = inv_remap[t-1][pe.left_pos];
+                } else {
+                    left_ysorted = pe.left_pos;  // fallback
+                }
+                if(pe.right_pos < inv_remap[t-1].size()) {
+                    right_ysorted = inv_remap[t-1][pe.right_pos];
+                } else {
+                    right_ysorted = pe.right_pos;  // fallback
                 }
             }
-            plot.PD[t][i] = {remapped_pos, pe.delta};
+            
+            uint32_t delta = right_ysorted - left_ysorted;
+            plot.PD[t][i] = {left_ysorted, delta};
         }
         
         std::cout << "[Plot] PD[" << t << "]: " << plot.PD[t].size() << " entries" << std::endl;
     }
-    // Build X_pairs from x_pairs_all (table 2 LR pairs = F1 indices)
-    // Sort by Y to match PD[2] ordering
+    
+    // ====================================================================
+    // Step 4: Build X_pairs from x_pairs_all
+    //         Sort by Y to match PD[2] ordering
+    // ====================================================================
+    
     if(!x_pairs_all.empty() && pd_all.size() > 2 && !pd_all[2].empty()) {
-        // Sort x_pairs by the Y values from pd_all[2]
         std::vector<uint32_t> x_indices(x_pairs_all.size());
-        for(size_t i = 0; i < x_indices.size(); i++) x_indices[i] = i;
+        for(size_t i = 0; i < x_indices.size(); i++) x_indices[i] = (uint32_t)i;
         
+        // Sort x_pairs by the Y values from pd_all[2]
         auto x_sort = [&pd_all](uint32_t a, uint32_t b) {
             if(a < pd_all[2].size() && b < pd_all[2].size())
                 return pd_all[2][a].Y < pd_all[2][b].Y;
@@ -1990,16 +1952,50 @@ void build_plot_data_from_store(
         for(size_t i = 0; i < x_indices.size(); i++) {
             plot.X_pairs[i] = x_pairs_all[x_indices[i]];
         }
+        
+        // Deduplicate X_pairs to match final_Y dedup
+        // (For now, keep all — dedup only matters for final_Y)
+        
         std::cout << "[Plot] X_pairs: " << plot.X_pairs.size() << " entries" << std::endl;
-    } else {
-        plot.X_pairs.clear();
     }
+    
+    // ====================================================================
+    // Step 5: Deduplicate PD[9] to match final_Y
+    //         final_indices has the surviving pd_all[9] indices
+    //         PD[9] currently has all pd_all[9] entries (sorted by Y)
+    //         Need to keep only the ones in final_indices
+    // ====================================================================
+    
+    {
+        auto old_pd9 = std::move(plot.PD[9]);
+        plot.PD[9].resize(final_indices.size());
+        
+        // final_indices[i] = original pd_all[9] index
+        // We need Y-sorted index for each final entry
+        // sort_order[9][i] = original index of i-th Y-sorted entry
+        // inv_remap[9][orig_idx] = Y-sorted index
+        
+        for(size_t i = 0; i < final_indices.size(); i++) {
+            uint32_t orig_idx = final_indices[i];
+            uint32_t ysorted_idx = inv_remap[9][orig_idx];
+            if(ysorted_idx < old_pd9.size()) {
+                plot.PD[9][i] = old_pd9[ysorted_idx];
+            }
+        }
+        
+        std::cout << "[Plot] PD[9] deduped: " << plot.PD[9].size() << " entries" << std::endl;
+    }
+    
+    // Set num_entries for write_plot (X table uses num_entries[2])
     plot.num_entries.resize(MY_N_TABLE + 1);
-    plot.num_entries[MY_N_TABLE] = unique_indices.size();
-    plot.num_entries[MY_N_TABLE] = unique_indices.size();
+    plot.num_entries[1] = 1ULL << KSIZE;  // F1 entries
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        plot.num_entries[t] = (t < (int)pd_all.size()) ? pd_all[t].size() : 0;
+    }
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
 }
+
 
 int main(int argc, char** argv)
 {
@@ -2152,8 +2148,8 @@ std::vector<std::vector<PDEntry>> pd_all;
                 size_t lim = std::min((size_t)50, pd_all[t].size());
                 for(size_t i = 0; i < lim; i++) {
                     f << "  pd_all[" << t << "][" << i << "] = (Y=" << pd_all[t][i].Y 
-                      << ", sorted_pos=" << pd_all[t][i].sorted_pos 
-                      << ", delta=" << pd_all[t][i].delta << ")\n";
+                      << ", left_pos=" << pd_all[t][i].left_pos 
+                      << ", right_pos=" << pd_all[t][i].right_pos << ")\n";
                 }
             }
             f << "\nplot.PD[" << t << "] entries: " << plot.PD[t].size() << "\n";
