@@ -2310,6 +2310,9 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
     clWaitForEvents(1, &p.ev_match_done);
     clReleaseEvent(p.ev_match_done);
     p.ev_match_done = nullptr;
+    
+    if(timing_detail && (p.y == 0 || p.y == 1))
+        std::cerr << "    [debug] bucket " << p.y << " gpu_matches=" << p.gpu_matches << std::endl;
 
     if(p.gpu_matches == 0) {
         p.zero_matches = true;
