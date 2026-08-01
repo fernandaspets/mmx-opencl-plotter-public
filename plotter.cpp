@@ -1262,6 +1262,8 @@ struct MemBucketStore {
     std::vector<std::vector<uint32_t>> pd_buckets;
     // X values (F1 indices): x_values[y] = [count] flat array of F1 indices
     std::vector<std::vector<uint32_t>> x_values;
+    // X pairs for table 2: x_pairs_buckets[y] = [count * 2] flat array of (left_x, right_x)
+    std::vector<std::vector<uint32_t>> x_pairs_buckets;
     
     MemBucketStore(int nb, int mbs, int nm)
         : num_buckets(nb), max_bucket_size(mbs), n_meta(nm)
@@ -1270,12 +1272,14 @@ struct MemBucketStore {
         counts.resize(nb, 0);
         pd_buckets.resize(nb);
         x_values.resize(nb);
+        x_pairs_buckets.resize(nb);
     }
     
     void clear() {
         for(auto& b : buckets) b.clear();
         for(auto& p : pd_buckets) p.clear();
         for(auto& x : x_values) x.clear();
+        for(auto& xp : x_pairs_buckets) xp.clear();
         std::fill(counts.begin(), counts.end(), 0);
     }
     
@@ -1294,6 +1298,12 @@ struct MemBucketStore {
         if(bucket < 0 || bucket >= num_buckets) return;
         auto& p = pd_buckets[bucket];
         p.insert(p.end(), pd, pd + count * 2);  // 2 uint32s per entry: (sorted_pos, delta)
+    }
+    
+    void append_x_pairs(int bucket, const uint32_t* xp, uint32_t count) {
+        if(bucket < 0 || bucket >= num_buckets) return;
+        auto& p = x_pairs_buckets[bucket];
+        p.insert(p.end(), xp, xp + count * 2);  // 2 uint32s per entry: (left_x, right_x)
     }
     
     void append_x(int bucket, const uint32_t* x, uint32_t count) {
@@ -1456,6 +1466,113 @@ void process_bucket_chunk(
     }
 }
 
+// Cross-boundary matching: find Y,Y+1 pairs where Y is at the end of bucket y
+// and Y+1 is at the start of bucket y+1. These matches are missed by
+// process_bucket_gpu which only matches within a single first-level bucket.
+void cross_boundary_match(
+    OCL_Plotter& plotter,
+    MemBucketStore& src,
+    MemBucketStore& dst,
+    int y,
+    int table,
+    std::vector<std::pair<uint32_t, uint32_t>>* x_pairs_out = nullptr)
+{
+    const int n_meta = src.n_meta;
+    const uint32_t kmask = KMASK;
+    const uint32_t shift = KSIZE - LOGBUCKETS;
+    const uint32_t boundary = (uint32_t)(y + 1) << shift;  // first Y in bucket y+1
+    const uint32_t Y_target = boundary - 1;  // last Y that can match across
+
+    if(y + 1 >= src.num_buckets) return;
+    if(src.counts[y] == 0 || src.counts[y + 1] == 0) return;
+
+    // Find entries in bucket y with Y = Y_target (= boundary - 1)
+    // Find entries in bucket y+1 with Y = boundary
+    std::vector<uint32_t> left_indices;   // indices into bucket y
+    std::vector<uint32_t> right_indices;  // indices into bucket y+1
+
+    const uint32_t* meta_y = src.buckets[y].data();
+    uint32_t cnt_y = src.counts[y];
+    for(uint32_t i = 0; i < cnt_y; i++) {
+        uint32_t Y = 0;
+        for(int j = 0; j < n_meta; j++) Y ^= meta_y[i * n_meta + j];
+        Y &= kmask;
+        if(Y == Y_target) left_indices.push_back(i);
+    }
+
+    const uint32_t* meta_ynext = src.buckets[y + 1].data();
+    uint32_t cnt_ynext = src.counts[y + 1];
+    for(uint32_t i = 0; i < cnt_ynext; i++) {
+        uint32_t Y = 0;
+        for(int j = 0; j < n_meta; j++) Y ^= meta_ynext[i * n_meta + j];
+        Y &= kmask;
+        if(Y == boundary) right_indices.push_back(i);
+    }
+
+    if(left_indices.empty() || right_indices.empty()) return;
+
+    // All combinations of left × right are matches (Y, Y+1)
+    size_t num_cross = left_indices.size() * right_indices.size();
+
+    // Build L_meta and R_meta for hashing
+    std::vector<uint32_t> L_meta_flat(num_cross * n_meta);
+    std::vector<uint32_t> R_meta_flat(num_cross * n_meta);
+    for(size_t li = 0; li < left_indices.size(); li++) {
+        uint32_t left_idx = left_indices[li];
+        for(size_t ri = 0; ri < right_indices.size(); ri++) {
+            uint32_t right_idx = right_indices[ri];
+            size_t k = li * right_indices.size() + ri;
+            for(int j = 0; j < n_meta; j++) {
+                L_meta_flat[k * n_meta + j] = meta_y[left_idx * n_meta + j];
+                R_meta_flat[k * n_meta + j] = meta_ynext[right_idx * n_meta + j];
+            }
+        }
+    }
+
+    // GPU hash to get new Y and metadata
+    std::vector<uint32_t> Y_out, M_out;
+    plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, kmask);
+
+    if(Y_out.empty()) return;
+
+    // Compute bucket_offset for PD
+    uint32_t bucket_offset_y = 0;
+    for(int b = 0; b < y; b++) bucket_offset_y += src.counts[b];
+    uint32_t bucket_offset_ynext = bucket_offset_y + cnt_y;
+
+    // For each cross-boundary match, add to dst store
+    for(size_t k = 0; k < Y_out.size(); k++) {
+        uint32_t Y_new = Y_out[k] & kmask;
+        uint32_t dst_bucket = Y_new >> shift;
+        if(dst_bucket >= (uint32_t)dst.num_buckets) continue;
+
+        // Metadata for new entry
+        std::vector<uint32_t> new_meta(n_meta);
+        for(int j = 0; j < n_meta; j++) {
+            new_meta[j] = M_out[k * n_meta + j];
+        }
+        dst.append(dst_bucket, new_meta.data(), 1);
+
+        // PD: store global positions (bucket_offset + orig_pos) in previous table
+        size_t li = k / right_indices.size();
+        size_t ri = k % right_indices.size();
+        uint32_t left_global = bucket_offset_y + left_indices[li];
+        uint32_t right_global = bucket_offset_ynext + right_indices[ri];
+        uint32_t pd_data[2] = {left_global, right_global};
+        dst.append_pd(dst_bucket, pd_data, 1);
+
+        // For table 2: save X pairs into dst store (F1 indices)
+        if(table == 2) {
+            const std::vector<uint32_t>& x_vals_y = src.x_values[y];
+            const std::vector<uint32_t>& x_vals_ynext = src.x_values[y + 1];
+            uint32_t left_x = (left_indices[li] < x_vals_y.size()) ? x_vals_y[left_indices[li]] : 0;
+            uint32_t right_x = (right_indices[ri] < x_vals_ynext.size()) ? x_vals_ynext[right_indices[ri]] : 0;
+            uint32_t xp_data[2] = {left_x, right_x};
+            dst.append_x_pairs(dst_bucket, xp_data, 1);
+        }
+    }
+}
+
 // GPU-native per-bucket processor: scatter→sort→match→hash all on GPU
 // Data stays on GPU through all steps. Only 1 upload + 1 download per bucket.
 void process_bucket_gpu(
@@ -1591,18 +1708,7 @@ void process_bucket_gpu(
     std::vector<uint32_t> LR_filtered(gpu_matches * 2);
     clEnqueueReadBuffer(plotter.queue, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
     
-    // For table 2: save LR pairs as X_pairs (lookup F1 indices from store)
-    if(x_pairs_out && table == 2) {
-        const std::vector<uint32_t>& x_vals = src.x_values[y];
-        for(uint32_t i = 0; i < gpu_matches; i++) {
-            uint32_t left_local = LR_filtered[i * 2];
-            uint32_t right_local = LR_filtered[i * 2 + 1];
-            // Look up global F1 indices
-            uint32_t left_x = (left_local < x_vals.size()) ? x_vals[left_local] : 0;
-            uint32_t right_x = (right_local < x_vals.size()) ? x_vals[right_local] : 0;
-            x_pairs_out->push_back({left_x, right_x});
-        }
-    }
+    // X pairs for table 2 are now saved into dst store alongside metadata and PD
     
     if(LR_filtered.empty()) {
         clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
@@ -1645,9 +1751,25 @@ void process_bucket_gpu(
     std::vector<uint32_t> Y_out, M_out;
     plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
     
-    // Step 9: Bucket output → dst store (metadata + PD)
+    // Step 9: Bucket output → dst store (metadata + PD + X_pairs)
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
     std::vector<std::vector<uint32_t>> dst_pd_batch(dst.num_buckets);
+    std::vector<std::vector<uint32_t>> dst_xp_batch(dst.num_buckets);
+    
+    // For table 2: prepare X pairs (F1 indices) for each match
+    std::vector<uint32_t> xp_flat;
+    if(table == 2) {
+        const std::vector<uint32_t>& x_vals = src.x_values[y];
+        for(uint32_t i = 0; i < num_filt; i++) {
+            uint32_t left_local = LR_filtered[i * 2];
+            uint32_t right_local = LR_filtered[i * 2 + 1];
+            uint32_t left_x = (left_local < x_vals.size()) ? x_vals[left_local] : 0;
+            uint32_t right_x = (right_local < x_vals.size()) ? x_vals[right_local] : 0;
+            xp_flat.push_back(left_x);
+            xp_flat.push_back(right_x);
+        }
+    }
+    
     for(uint32_t i = 0; i < num_filt; i++) {
         uint32_t bucket = Y_out[i] >> shift;
         if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
@@ -1656,12 +1778,20 @@ void process_bucket_gpu(
         // Store PD alongside: (sorted_pos, delta)
         dst_pd_batch[bucket].push_back(pd_data[i * 2]);
         dst_pd_batch[bucket].push_back(pd_data[i * 2 + 1]);
+        // Store X pairs for table 2
+        if(table == 2 && i * 2 + 1 < xp_flat.size()) {
+            dst_xp_batch[bucket].push_back(xp_flat[i * 2]);
+            dst_xp_batch[bucket].push_back(xp_flat[i * 2 + 1]);
+        }
     }
     for(int b = 0; b < dst.num_buckets; b++) {
         if(dst_batch[b].empty()) continue;
         uint32_t cnt = dst_batch[b].size() / n_meta;
         dst.append(b, dst_batch[b].data(), cnt);
         dst.append_pd(b, dst_pd_batch[b].data(), cnt);
+        if(table == 2 && !dst_xp_batch[b].empty()) {
+            dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
+        }
     }
     
     // Cleanup GPU resources
@@ -1708,7 +1838,10 @@ void compute_f2_f9_chunked(
         
         for(int y = 0; y < num_buckets; y++) {
             if(src.counts[y] == 0) continue;
-            process_bucket_gpu(plotter, src, dst, y, t, (t == 2) ? &x_pairs_all : nullptr);
+            process_bucket_gpu(plotter, src, dst, y, t);
+            
+            // Cross-boundary matching: find Y,Y+1 pairs across bucket y/y+1 boundary
+            cross_boundary_match(plotter, src, dst, y, t);
             
             // Display yield
             if(gpu_yield) {
@@ -1732,12 +1865,18 @@ void compute_f2_f9_chunked(
         auto tpd0 = my_time_ms();
         pd_all[t].clear();
         pd_all[t].reserve(total);
+        if(t == 2) {
+            x_pairs_all.clear();
+            x_pairs_all.reserve(total);
+        }
         for(int y = 0; y < num_buckets; y++) {
             uint32_t cnt = dst.counts[y];
             if(cnt == 0) continue;
             const uint32_t* meta = dst.buckets[y].data();
             const uint32_t* pd = dst.pd_buckets[y].data();
             bool has_pd = (dst.pd_buckets[y].size() >= (size_t)cnt * 2);
+            const uint32_t* xp = (t == 2 && y < (int)dst.x_pairs_buckets.size()) ? dst.x_pairs_buckets[y].data() : nullptr;
+            bool has_xp = (t == 2 && y < (int)dst.x_pairs_buckets.size() && dst.x_pairs_buckets[y].size() >= (size_t)cnt * 2);
             for(uint32_t i = 0; i < cnt; i++) {
                 uint32_t Y = 0;
                 for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
@@ -1752,13 +1891,15 @@ void compute_f2_f9_chunked(
                     entry.right_pos = 0;
                 }
                 pd_all[t].push_back(entry);
+                if(t == 2 && has_xp) {
+                    x_pairs_all.push_back({xp[i * 2], xp[i * 2 + 1]});
+                }
             }
         }
         std::cout << "[T" << t << "] PD saved: " << pd_all[t].size() << " entries ("
                   << (my_time_ms() - tpd0) / 1000.0 << " sec)" << std::endl;
         
-        // For table 2, X_pairs were saved during process_bucket_gpu
-        // x_pairs_all now has all LR pairs (F1 indices) for table 2
+        // For table 2, X_pairs are now collected from dst store alongside pd_all
         if(t == 2) {
             std::cout << "[T2] X_pairs saved: " << x_pairs_all.size() << " entries" << std::endl;
         }
@@ -1813,9 +1954,14 @@ void build_plot_data_from_store(
         for(size_t i = 0; i < n; i++) sort_order[t][i] = (uint32_t)i;
         
         // Sort by (Y, left_pos) — consistent tie-breaker matching store insertion order
+        // Sort by (Y, pd_all_index) — NOT (Y, left_pos).
+        // CUDA sorts by PY = (Y, local_pos) where local_pos = insertion order within bucket.
+        // pd_all_index = bucket_offset + insertion_order = CUDA's local_pos (globally).
+        // Using left_pos as tie-breaker is WRONG because left_pos is the parent's
+        // position in the PREVIOUS table, not this entry's own position.
         auto pd_sort = [&pd_all, t](uint32_t a, uint32_t b) {
             if(pd_all[t][a].Y == pd_all[t][b].Y)
-                return pd_all[t][a].left_pos < pd_all[t][b].left_pos;
+                return a < b;  // a, b are pd_all indices = insertion order = local_pos
             return pd_all[t][a].Y < pd_all[t][b].Y;
         };
         std::sort(sort_order[t].begin(), sort_order[t].end(), pd_sort);
@@ -1937,23 +2083,15 @@ void build_plot_data_from_store(
     // ====================================================================
     
     if(!x_pairs_all.empty() && pd_all.size() > 2 && !pd_all[2].empty()) {
-        std::vector<uint32_t> x_indices(x_pairs_all.size());
-        for(size_t i = 0; i < x_indices.size(); i++) x_indices[i] = (uint32_t)i;
-        
-        // Sort x_pairs by (Y, left_pos) to match PD[2] ordering
-        auto x_sort = [&pd_all](uint32_t a, uint32_t b) {
-            if(a < pd_all[2].size() && b < pd_all[2].size()) {
-                if(pd_all[2][a].Y == pd_all[2][b].Y)
-                    return pd_all[2][a].left_pos < pd_all[2][b].left_pos;
-                return pd_all[2][a].Y < pd_all[2][b].Y;
+        // Use the SAME sort_order[2] as PD[2] to guarantee X_pairs[i] corresponds
+        // exactly to PD[2][i]. x_pairs_all[j] corresponds to pd_all[2][j] (same
+        // insertion order), so reordering by sort_order[2] keeps them in sync.
+        plot.X_pairs.resize(sort_order[2].size());
+        for(size_t i = 0; i < sort_order[2].size(); i++) {
+            uint32_t orig_idx = sort_order[2][i];
+            if(orig_idx < x_pairs_all.size()) {
+                plot.X_pairs[i] = x_pairs_all[orig_idx];
             }
-            return a < b;
-        };
-        std::sort(x_indices.begin(), x_indices.end(), x_sort);
-        
-        plot.X_pairs.resize(x_indices.size());
-        for(size_t i = 0; i < x_indices.size(); i++) {
-            plot.X_pairs[i] = x_pairs_all[x_indices[i]];
         }
         
         // Deduplicate X_pairs to match final_Y dedup
@@ -1998,25 +2136,59 @@ void build_plot_data_from_store(
     
     // Verify PD chain before writing
     {
+        // Build Y-sorted arrays for each table: Y_sorted[t][j] = pd_all[t][sort_order[t][j]].Y
+        std::vector<std::vector<uint32_t>> Y_sorted(MY_N_TABLE + 1);
+        for(int t = 2; t <= MY_N_TABLE; t++) {
+            if(t >= (int)pd_all.size() || pd_all[t].empty()) continue;
+            if(t >= (int)sort_order.size() || sort_order[t].empty()) continue;
+            Y_sorted[t].resize(sort_order[t].size());
+            for(size_t j = 0; j < sort_order[t].size(); j++) {
+                uint32_t orig_idx = sort_order[t][j];
+                if(orig_idx < pd_all[t].size()) {
+                    Y_sorted[t][j] = pd_all[t][orig_idx].Y;
+                }
+            }
+        }
+
         bool pd_ok = true;
         for(int t = 3; t <= MY_N_TABLE; t++) {
             if(t >= (int)plot.PD.size() || plot.PD[t].empty()) continue;
-            if(t-1 >= (int)plot.PD.size() || plot.PD[t-1].empty()) continue;
-            size_t prev_size = plot.PD[t-1].size();
-            size_t errors = 0;
+            if(t-1 < 2 || t-1 >= (int)Y_sorted.size() || Y_sorted[t-1].empty()) continue;
+            size_t prev_size = Y_sorted[t-1].size();
+            size_t bounds_errors = 0;
+            size_t match_errors = 0;
             for(size_t i = 0; i < plot.PD[t].size(); i++) {
                 uint32_t pos = plot.PD[t][i].first;
                 uint32_t delta = plot.PD[t][i].second;
-                if(pos >= prev_size || (uint64_t)pos + delta >= prev_size) {
-                    if(errors++ < 3) {
+                uint32_t right = pos + delta;
+                if(pos >= prev_size || right >= prev_size) {
+                    if(bounds_errors++ < 3) {
                         std::cerr << "[PD CHECK] PD[" << t << "][" << i << "]: pos=" << pos
                                   << " delta=" << delta << " prev_size=" << prev_size << std::endl;
                     }
+                    continue;
+                }
+                // DEEP CHECK: verify Y[left] + 1 == Y[right] (valid match pair)
+                uint32_t YL = Y_sorted[t-1][pos];
+                uint32_t YR = Y_sorted[t-1][right];
+                if(YR != YL + 1) {
+                    if(match_errors++ < 5) {
+                        std::cerr << "[PD MATCH] PD[" << t << "][" << i << "]: Y[" << pos
+                                  << "]=" << YL << " Y[" << right << "]=" << YR
+                                  << " (expected " << YL << "," << (YL+1) << ")"
+                                  << " delta=" << delta << std::endl;
+                    }
                 }
             }
-            if(errors > 0) {
-                std::cerr << "[PD CHECK] PD[" << t << "]: " << errors << " chain errors out of "
+            if(bounds_errors > 0) {
+                std::cerr << "[PD CHECK] PD[" << t << "]: " << bounds_errors << " bounds errors out of "
                           << plot.PD[t].size() << std::endl;
+                pd_ok = false;
+            }
+            if(match_errors > 0) {
+                std::cerr << "[PD MATCH] PD[" << t << "]: " << match_errors << " match errors out of "
+                          << plot.PD[t].size() << " (" << (100*match_errors/plot.PD[t].size())
+                          << "%)" << std::endl;
                 pd_ok = false;
             }
         }
@@ -2029,6 +2201,57 @@ void build_plot_data_from_store(
             }
         }
         std::cout << "[PD CHECK] " << (pd_ok ? "PASS" : "FAIL") << std::endl;
+        
+        // Full end-to-end chain verification: trace a few final_Y entries
+        // through the entire PD chain to verify they stay in bounds.
+        if(pd_ok) {
+            int chain_errors = 0;
+            int chains_checked = 0;
+            int num_to_check = std::min((size_t)10, plot.final_Y.size());
+            for(int idx = 0; idx < num_to_check; idx++) {
+                std::vector<uint64_t> pointers = {(uint64_t)idx};
+                bool ok = true;
+                for(int t = MY_N_TABLE; t >= 3; t--) {
+                    std::vector<uint64_t> new_pointers;
+                    for(uint64_t p : pointers) {
+                        if(p >= plot.PD[t].size()) {
+                            if(chain_errors++ < 5)
+                                std::cerr << "[CHAIN] final_Y[" << idx << "] PD[" << t
+                                          << "] ptr=" << p << " out of bounds (size="
+                                          << plot.PD[t].size() << ")" << std::endl;
+                            ok = false;
+                            break;
+                        }
+                        uint32_t pos = plot.PD[t][p].first;
+                        uint32_t delta = plot.PD[t][p].second;
+                        new_pointers.push_back(pos);
+                        new_pointers.push_back(pos + delta);
+                    }
+                    if(!ok) break;
+                    pointers = new_pointers;
+                }
+                if(!ok) continue;
+                // Now pointers should be indices into X_pairs (table 2)
+                for(uint64_t p : pointers) {
+                    if(p >= plot.X_pairs.size()) {
+                        if(chain_errors++ < 5)
+                            std::cerr << "[CHAIN] final_Y[" << idx << "] X_pairs ptr="
+                                      << p << " out of bounds (size="
+                                      << plot.X_pairs.size() << ")" << std::endl;
+                        ok = false;
+                        break;
+                    }
+                }
+                if(ok) chains_checked++;
+            }
+            if(chain_errors > 0) {
+                std::cerr << "[CHAIN] " << chain_errors << " chain errors out of "
+                          << num_to_check << " checked" << std::endl;
+            } else {
+                std::cout << "[CHAIN] " << chains_checked << "/" << num_to_check
+                          << " full chains verified OK" << std::endl;
+            }
+        }
     }
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
@@ -2083,6 +2306,8 @@ else if(arg == "--no-yield") gpu_yield = false;
     }
     
     update_constants();
+    std::cout << "[Config] KSIZE=" << KSIZE << " XBITS=" << XBITS << " LPX2SIZE=" << LPX2SIZE
+              << " PDSIZE=" << PDSIZE << " KMASK=" << KMASK << std::endl;
     
     if(pid_str.size() != 64) { std::cerr << "plot_id must be 64 hex chars" << std::endl; return 1; }
     if(fk_str.size() != 66) { std::cerr << "farmer_key must be 66 hex chars" << std::endl; return 1; }
@@ -2201,12 +2426,12 @@ std::vector<std::vector<PDEntry>> pd_all;
         }
         std::ofstream fy("/tmp/pd_chunked_finalY.txt");
         fy << "final_Y entries: " << plot.final_Y.size() << "\n";
-        size_t lim = std::min((size_t)50, plot.final_Y.size());
+        size_t lim = plot.final_Y.size();
         for(size_t i = 0; i < lim; i++) fy << "  Y[" << i << "] = " << plot.final_Y[i] << "\n";
         fy.close();
         std::ofstream fx("/tmp/pd_chunked_Xpairs.txt");
         fx << "X_pairs entries: " << plot.X_pairs.size() << "\n";
-        lim = std::min((size_t)50, plot.X_pairs.size());
+        lim = plot.X_pairs.size();
         for(size_t i = 0; i < lim; i++) fx << "  X[" << i << "] = (" << plot.X_pairs[i].first << ", " << plot.X_pairs[i].second << ")\n";
         fx.close();
     }
@@ -2272,12 +2497,12 @@ std::vector<std::vector<PDEntry>> pd_all;
         }
         std::ofstream fy("/tmp/pd_flat_finalY.txt");
         fy << "final_Y entries: " << plot.final_Y.size() << "\n";
-        size_t lim = std::min((size_t)50, plot.final_Y.size());
+        size_t lim = plot.final_Y.size();
         for(size_t i = 0; i < lim; i++) fy << "  Y[" << i << "] = " << plot.final_Y[i] << "\n";
         fy.close();
         std::ofstream fx("/tmp/pd_flat_Xpairs.txt");
         fx << "X_pairs entries: " << plot.X_pairs.size() << "\n";
-        lim = std::min((size_t)50, plot.X_pairs.size());
+        lim = plot.X_pairs.size();
         for(size_t i = 0; i < lim; i++) fx << "  X[" << i << "] = (" << plot.X_pairs[i].first << ", " << plot.X_pairs[i].second << ")\n";
         fx.close();
     }
