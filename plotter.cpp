@@ -2643,11 +2643,8 @@ BucketPending submit_bucket_svm(
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
     clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
 
-    // Read match count — clEnqueueSVMMap(CL_TRUE) blocks until all prior queue commands complete
-    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
-    p.gpu_matches = *(uint32_t*)p.svm_num_matches;
-    clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
-
+    // DO NOT read match count here — return immediately so GPU 1 can be submitted
+    // Match count read happens in submit_hash_svm (after both GPUs are working)
     p.skip = false;
     return p;
 }
@@ -2661,6 +2658,11 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
     cl_command_queue& q = p.q;
     const int n_meta = p.n_meta;
     int y = p.y, table = p.table;
+    
+    // Read match count — THIS is the sync point (blocks until match kernel done)
+    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
+    p.gpu_matches = *(uint32_t*)p.svm_num_matches;
+    clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
     
     if(p.gpu_matches == 0) {
         p.zero_matches = true;
