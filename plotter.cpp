@@ -30,6 +30,9 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <future>
+#include <thread>
+#include <mutex>
 #include "opt_config.h"
 #include "buffer_pool.h"
 
@@ -2145,10 +2148,21 @@ void compute_f2_f9_chunked(
         
         for(int y = 0; y < num_buckets; y++) {
             if(src.counts[y] == 0) continue;
-            process_bucket_gpu(plotter, src, dst, y, t);
             
-            // Cross-boundary matching: find Y,Y+1 pairs across bucket y/y+1 boundary
-            cross_boundary_match(plotter, src, dst, y, t);
+            if(g_num_gpus > 1 && g_plotters.size() > 1 && y + 1 < num_buckets && src.counts[y+1] > 0) {
+                // Multi-GPU: process bucket y (GPU0) and y+1 (GPU1) concurrently
+                auto fut = std::async(std::launch::async, [&]() {
+                    process_bucket_gpu(plotter, src, dst, y, t);
+                });
+                process_bucket_gpu(plotter, src, dst, y + 1, t);
+                fut.wait();
+                // Cross-boundary match for the pair boundary
+                cross_boundary_match(plotter, src, dst, y, t);
+                y++;  // skip y+1 (already processed)
+            } else {
+                process_bucket_gpu(plotter, src, dst, y, t);
+                cross_boundary_match(plotter, src, dst, y, t);
+            }
             
             // Display yield
             if(gpu_yield) {
