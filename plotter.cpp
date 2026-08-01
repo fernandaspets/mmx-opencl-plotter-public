@@ -2828,10 +2828,10 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         return;
     }
     
-    // Read LR pairs — fine-grain: clFinish + direct memcpy; coarse: map/unmap
+    // Read LR pairs — fine-grain: already synced (clFinish above), direct memcpy
     p.LR_filtered.resize(p.gpu_matches * 2);
     if(svm->fine_grain) {
-        clFinish(q);
+        // No clFinish needed — already synced at match count read
         std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
     } else {
         svm->map(p.svm_LR, p.gpu_matches * 8, CL_MAP_READ);
