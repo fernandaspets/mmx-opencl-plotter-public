@@ -1049,12 +1049,20 @@ void compute_full_pipeline(
 {
     const uint32_t kmask = KMASK;
     
-    std::vector<std::array<uint32_t, 14>> M_curr(Y_in.size());
-    for(size_t i = 0; i < Y_in.size(); i++) {
+    // Keep M_curr as flat array for direct GPU upload (avoids 300ms/table flattening)
+    const size_t num_entries_init = Y_in.size();
+    std::vector<uint32_t> M_curr_flat(num_entries_init * MY_N_META);
+    std::memcpy(M_curr_flat.data(), M_in.data(), num_entries_init * MY_N_META * sizeof(uint32_t));
+    
+    // Helper to compare metadata at indices a, b in flat array
+    auto meta_less = [&M_curr_flat](uint32_t a, uint32_t b) {
+        const uint32_t* pa = &M_curr_flat[a * MY_N_META];
+        const uint32_t* pb = &M_curr_flat[b * MY_N_META];
         for(int j = 0; j < MY_N_META; j++) {
-            M_curr[i][j] = M_in[i * MY_N_META + j];
+            if(pa[j] != pb[j]) return pa[j] < pb[j];
         }
-    }
+        return false;
+    };
     
     std::vector<std::pair<uint32_t, uint32_t>> entries;
     entries.reserve(Y_in.size());
@@ -1066,8 +1074,8 @@ void compute_full_pipeline(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> entries_map(MY_N_TABLE + 1);  // entries_map[t] = sorted->original mapping for table t
     
-    auto sort_func = [&M_curr](const auto& L, const auto& R) {
-        if(L.first == R.first) return M_curr[L.second] < M_curr[R.second];
+    auto sort_func = [&meta_less](const auto& L, const auto& R) {
+        if(L.first == R.first) return meta_less(L.second, R.second);
         return L < R;
     };
     
@@ -1182,21 +1190,14 @@ void compute_full_pipeline(
         for(int ti = 0; ti < nthreads; ti++) {
             for(const auto& p : thread_lr[ti]) all_lr.push_back(p);
         }
+        auto t_flatten_lr = my_time_ms();
         
         // GPU hash — direct approach: upload M_curr + LR pairs, GPU reads metadata directly
-        // Eliminates CPU meta extraction (saves ~0.5s per table for k23)
+        // M_curr_flat is already flat (no conversion needed!)
         std::vector<uint32_t> Y_results, M_results;
         if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
-            // Flatten M_curr to uint32 array
-            size_t num_total = M_curr.size();
-            std::vector<uint32_t> M_curr_flat(num_total * MY_N_META);
-            #pragma omp parallel for schedule(static)
-            for(size_t i = 0; i < num_total; i++) {
-                for(int j = 0; j < MY_N_META; j++) {
-                    M_curr_flat[i * MY_N_META + j] = M_curr[i][j];
-                }
-            }
             // Build LR pairs (P1, P2 = original indices into M_curr)
+            // M_curr_flat is already in the right format — no flattening needed!
             std::vector<uint32_t> LR_flat(total_matches * 2);
             #pragma omp parallel for schedule(static)
             for(size_t i = 0; i < total_matches; i++) {
@@ -1204,8 +1205,12 @@ void compute_full_pipeline(
                 LR_flat[i * 2] = entries[sorted_L].second;
                 LR_flat[i * 2 + 1] = entries[sorted_R].second;
             }
+            auto t_gpu_start = my_time_ms();
             // Hash directly on GPU (reads M_curr[P1], M_curr[P2])
+            // M_curr_flat already contains the current table's metadata
             gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
+            auto t_gpu_end = my_time_ms();
+            if(t >= 2 && t <= 3) std::cerr << "[T" << t << "] GPU hash: " << (t_gpu_end - t_gpu_start) << "ms    \r" << std::flush;
         } else {
             // Fallback: old method (pre-extract L/R metadata on CPU)
             std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
@@ -1216,8 +1221,8 @@ void compute_full_pipeline(
                 uint32_t orig_L = entries[sorted_L].second;
                 uint32_t orig_R = entries[sorted_R].second;
                 for(int j = 0; j < MY_N_META; j++) {
-                    L_meta_flat[i * MY_N_META + j] = M_curr[orig_L][j];
-                    R_meta_flat[i * MY_N_META + j] = M_curr[orig_R][j];
+                    L_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_L * MY_N_META + j];
+                    R_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_R * MY_N_META + j];
                 }
             }
             if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
@@ -1230,13 +1235,9 @@ void compute_full_pipeline(
             }
         }
         
-        // Convert to M_next format
-        std::vector<std::array<uint32_t, 14>> M_next(total_matches);
-        for(size_t i = 0; i < total_matches; i++) {
-            for(int j = 0; j < MY_N_META; j++) {
-                M_next[i][j] = M_results[i * MY_N_META + j];
-            }
-        }
+        // Convert to M_next format — keep as flat array (M_results is already flat!)
+        // M_results is [total_matches * MY_N_META] uint32 — just move it
+        std::vector<uint32_t> M_next_flat = std::move(M_results);
         
         // Build matches vector (Y, index into M_next)
         std::vector<std::pair<uint32_t, uint32_t>> matches;
@@ -1268,7 +1269,7 @@ void compute_full_pipeline(
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
         }
         std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries" << std::flush;
-        M_curr = std::move(M_next);
+        M_curr_flat = std::move(M_next_flat);
         entries = std::move(matches);
         plot.num_entries[t] = entries.size();
         
@@ -1339,7 +1340,7 @@ void compute_full_pipeline(
         final_indices.reserve(entries.size());
         for(size_t i = 0; i < entries.size(); i++) {
             plot.final_Y.push_back(entries[i].first);
-            plot.final_meta.push_back(M_curr[entries[i].second]);
+            { std::array<uint32_t,14> meta; std::memcpy(meta.data(), &M_curr_flat[entries[i].second * MY_N_META], 14 * sizeof(uint32_t)); plot.final_meta.push_back(meta); }
             final_indices.push_back(entries[i].second);
         }
     }
