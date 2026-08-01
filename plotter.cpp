@@ -2192,6 +2192,13 @@ void compute_f2_f9_chunked(
             if(src.counts[y] == 0) continue;
             process_bucket_gpu(plotter, src, dst, y, t);
             
+            // Multi-GPU: flush the active plotter's queue before switching to next GPU
+            if(g_num_gpus > 1) {
+                OCL_Plotter& ap = *g_plotters[y % g_num_gpus];
+                clFinish(ap.queue);
+                if(ap.queue2) clFinish(ap.queue2);
+            }
+            
             // Cross-boundary matching: find Y,Y+1 pairs across bucket y/y+1 boundary
             cross_boundary_match(plotter, src, dst, y, t);
             
