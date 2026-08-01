@@ -22,7 +22,7 @@
 
 // Constants (must match plotter)
 static const int N_META = 14;
-static const int MEM_HASH_ITER = 11337;  // from mmx-node pos config
+static const int MEM_HASH_ITER = 256;  // from mmx-node pos config
 static const int MEM_SIZE = 32 * 32;     // 1024
 
 // ============================================================================
@@ -95,7 +95,7 @@ bool gpu_compute_f1_batch(const std::vector<uint32_t>& X_values,
     size_t len = src.size();
     cl_program program = clCreateProgramWithSource(context, 1, &cstr, &len, nullptr);
     
-    std::string opts = "-cl-std=CL1.2 -DN_META=14 -DMEM_HASH_ITER=11337";
+    std::string opts = "-cl-std=CL1.2 -DN_META=14 -DMEM_HASH_ITER=256";
     cl_int err = clBuildProgram(program, 1, &device, opts.c_str(), nullptr, nullptr);
     if(err != CL_SUCCESS) {
         char log[4096];
