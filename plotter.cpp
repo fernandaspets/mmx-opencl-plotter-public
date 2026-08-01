@@ -2631,9 +2631,11 @@ BucketPending submit_bucket_svm(
     p.q = active_plotter.queue;
     cl_command_queue& q = p.q;
 
-    // Copy metadata for later CPU PD computation
-    p.C_combined.resize(total * n_meta);
-    std::memcpy(p.C_combined.data(), meta_y, p.count_y * n_meta * 4);
+    // Copy metadata for CPU PD computation (only needed for non-gpu-meta path)
+    if(!get_opt_config().gpu_meta_extract) {
+        p.C_combined.resize(total * n_meta);
+        std::memcpy(p.C_combined.data(), meta_y, p.count_y * n_meta * 4);
+    }
 
     // Assign SVM pointers
     p.svm_C_in = svm->svm_C_in;
@@ -3781,9 +3783,9 @@ auto t0 = my_time_ms();
 std::vector<std::vector<PDEntry>> pd_all;
         // F1 → bucket store
         if(g_num_gpus > 1 && g_plotters.size() > 1)
-            compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 18);
+            compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 20);
         else
-            compute_f1_chunked(plotter, plot_id, store, 1 << 18);
+            compute_f1_chunked(plotter, plot_id, store, 1 << 20);
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
