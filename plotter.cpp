@@ -1940,10 +1940,13 @@ void build_plot_data_from_store(
         std::vector<uint32_t> x_indices(x_pairs_all.size());
         for(size_t i = 0; i < x_indices.size(); i++) x_indices[i] = (uint32_t)i;
         
-        // Sort x_pairs by the Y values from pd_all[2]
+        // Sort x_pairs by (Y, left_pos) to match PD[2] ordering
         auto x_sort = [&pd_all](uint32_t a, uint32_t b) {
-            if(a < pd_all[2].size() && b < pd_all[2].size())
+            if(a < pd_all[2].size() && b < pd_all[2].size()) {
+                if(pd_all[2][a].Y == pd_all[2][b].Y)
+                    return pd_all[2][a].left_pos < pd_all[2][b].left_pos;
                 return pd_all[2][a].Y < pd_all[2][b].Y;
+            }
             return a < b;
         };
         std::sort(x_indices.begin(), x_indices.end(), x_sort);
@@ -1991,6 +1994,41 @@ void build_plot_data_from_store(
     plot.num_entries[1] = 1ULL << KSIZE;  // F1 entries
     for(int t = 2; t <= MY_N_TABLE; t++) {
         plot.num_entries[t] = (t < (int)pd_all.size()) ? pd_all[t].size() : 0;
+    }
+    
+    // Verify PD chain before writing
+    {
+        bool pd_ok = true;
+        for(int t = 3; t <= MY_N_TABLE; t++) {
+            if(t >= (int)plot.PD.size() || plot.PD[t].empty()) continue;
+            if(t-1 >= (int)plot.PD.size() || plot.PD[t-1].empty()) continue;
+            size_t prev_size = plot.PD[t-1].size();
+            size_t errors = 0;
+            for(size_t i = 0; i < plot.PD[t].size(); i++) {
+                uint32_t pos = plot.PD[t][i].first;
+                uint32_t delta = plot.PD[t][i].second;
+                if(pos >= prev_size || (uint64_t)pos + delta >= prev_size) {
+                    if(errors++ < 3) {
+                        std::cerr << "[PD CHECK] PD[" << t << "][" << i << "]: pos=" << pos
+                                  << " delta=" << delta << " prev_size=" << prev_size << std::endl;
+                    }
+                }
+            }
+            if(errors > 0) {
+                std::cerr << "[PD CHECK] PD[" << t << "]: " << errors << " chain errors out of "
+                          << plot.PD[t].size() << std::endl;
+                pd_ok = false;
+            }
+        }
+        // Check final_Y sorted
+        for(size_t i = 1; i < plot.final_Y.size(); i++) {
+            if(plot.final_Y[i] < plot.final_Y[i-1]) {
+                std::cerr << "[PD CHECK] final_Y not sorted at [" << i << "]" << std::endl;
+                pd_ok = false;
+                break;
+            }
+        }
+        std::cout << "[PD CHECK] " << (pd_ok ? "PASS" : "FAIL") << std::endl;
     }
     
     std::cout << "[Plot] Built PlotData: " << plot.final_Y.size() << " entries" << std::endl;
