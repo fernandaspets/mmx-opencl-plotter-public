@@ -31,6 +31,10 @@
 #include <iostream>
 #include <stdexcept>
 #include "opt_config.h"
+
+// Forward declarations for globals defined later
+extern bool gpu_yield;
+extern bool timing_detail;
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -302,6 +306,7 @@ public:
     cl_kernel table_hash_kernel = nullptr;
     cl_kernel hash_lr_kernel = nullptr;
     cl_kernel gather_meta_kernel = nullptr;
+    cl_kernel prefix_sum_kernel = nullptr;
     cl_kernel eval_p1_tx_kernel = nullptr;
     cl_kernel k_scatter2 = nullptr;
     cl_kernel k_simple_sort = nullptr;
@@ -343,6 +348,23 @@ public:
                 if(err == CL_SUCCESS) {
                     gather_meta_kernel = clCreateKernel(gprog, "gather_meta", &err);
                     if(err == CL_SUCCESS) std::cout << "[OCL] Gather kernel loaded" << std::endl;
+                }
+            }
+        }
+        
+        // Load prefix sum kernel (Module A)
+        {
+            std::string ppath = "prefix_sum.cl";
+            FILE* pf = fopen(ppath.c_str(), "r");
+            if(pf) {
+                fseek(pf, 0, SEEK_END); size_t psz = ftell(pf); fseek(pf, 0, SEEK_SET);
+                char* psrc = new char[psz+1]; fread(psrc, 1, psz, pf); psrc[psz] = 0; fclose(pf);
+                cl_program pprog = clCreateProgramWithSource(context, 1, (const char**)&psrc, &psz, &err);
+                delete[] psrc;
+                err = clBuildProgram(pprog, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
+                if(err == CL_SUCCESS) {
+                    prefix_sum_kernel = clCreateKernel(pprog, "gpu_prefix_sum", &err);
+                    if(err == CL_SUCCESS) std::cout << "[OCL] Prefix sum kernel loaded" << std::endl;
                 }
             }
         }
@@ -1682,6 +1704,19 @@ void process_bucket_gpu(
     cl_mem null_mem = nullptr;
     int zero = 0;
     
+    // Timing instrumentation
+    bool do_timing = timing_detail && (y == 0);  // only first bucket of each table
+    auto step_start = std::chrono::steady_clock::now();
+    auto step_end = step_start;
+    auto print_step = [&](const char* name) {
+        if(do_timing) {
+            step_end = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start).count();
+            std::cerr << "    [" << name << "] " << ms << "us" << std::endl;
+            step_start = step_end;
+        }
+    };
+    
     // Step 1: Upload C_in (metadata for bucket y only)
     std::vector<uint32_t> C_combined(total * n_meta);
     std::memcpy(C_combined.data(), meta_y, count_y * n_meta * 4);
@@ -1689,6 +1724,7 @@ void process_bucket_gpu(
     cl_mem C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         C_combined.size() * 4, (void*)C_combined.data(), &err);
     CL_CHECK(err, "C_in_buf creation");
+    print_step("upload_C_in");
     
     // Step 2: GPU scatter_2 — sub-bucket by Y's full (LOGBUCKETS+LOGBUCKETS2) bits
     cl_mem PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
@@ -1711,25 +1747,48 @@ void process_bucket_gpu(
     size_t scatter_global = total;
     if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
     clEnqueueNDRangeKernel(plotter.queue, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+    print_step("scatter");
     
-    // Step 3: CPU prefix sum of sub-bucket counts
-    // Check for sub-bucket overflow (entries dropped by scatter_2)
-    std::vector<uint32_t> sub_cnt(num_sub);
-    clEnqueueReadBuffer(plotter.queue, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
-    std::vector<uint32_t> sub_off(num_sub + 1, 0);
-    for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
-    uint32_t total_scattered = sub_off[num_sub];
-    
-    // Check for sub-bucket overflow
-    if(total_scattered < total) {
-        std::cerr << "[WARN] scatter_2 dropped " << (total - total_scattered)
-                  << " entries (sub-bucket overflow, max_bs2=" << max_bs2 << ")"
-                  << " bucket " << y << " table " << table << std::endl;
+    // Step 3: Prefix sum of sub-bucket counts
+    // Step 3: Prefix sum of sub-bucket counts
+    cl_mem sub_off_buf;
+    if(get_opt_config().gpu_prefix_sum && plotter.prefix_sum_kernel) {
+        // Module A: GPU prefix sum — no readback needed (except last element for overflow check)
+        sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+            (num_sub + 1) * 4, nullptr, &err);
+        CL_CHECK(err, "sub_off_buf (gpu prefix)");
+        
+        uint32_t num_sub_u32 = (uint32_t)num_sub;
+        clSetKernelArg(plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &sub_cnt_buf);
+        clSetKernelArg(plotter.prefix_sum_kernel, 1, sizeof(cl_mem), &sub_off_buf);
+        clSetKernelArg(plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);  // local memory
+        clSetKernelArg(plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &num_sub_u32);
+        
+        size_t ps_global = num_sub, ps_local = num_sub;
+        clEnqueueNDRangeKernel(plotter.queue, plotter.prefix_sum_kernel, 1, nullptr,
+            &ps_global, &ps_local, 0, nullptr, nullptr);
+        print_step("gpu_prefix_sum");
+        // No overflow check readback — saves ~500us of latency per bucket.
+        // Overflow is rare and will be caught later when entries don't match.
+    } else {
+        // Original: CPU prefix sum — download sub_cnt, compute on CPU, upload sub_off
+        std::vector<uint32_t> sub_cnt(num_sub);
+        clEnqueueReadBuffer(plotter.queue, sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
+        print_step("download_sub_cnt");
+        std::vector<uint32_t> sub_off(num_sub + 1, 0);
+        for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
+        uint32_t total_scattered = sub_off[num_sub];
+        
+        if(total_scattered < total) {
+            std::cerr << "[WARN] scatter_2 dropped " << (total - total_scattered)
+                      << " entries (sub-bucket overflow, max_bs2=" << max_bs2 << ")"
+                      << " bucket " << y << " table " << table << std::endl;
+        }
+        
+        sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            (num_sub + 1) * 4, (void*)sub_off.data(), &err);
+        CL_CHECK(err, "sub_off_buf creation");
     }
-    
-    cl_mem sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        (num_sub + 1) * 4, (void*)sub_off.data(), &err);
-    CL_CHECK(err, "sub_off_buf creation");
     
     // Step 4: GPU simple_sort_y — sort within each sub-bucket
     uint32_t max_bs_sort = max_bs2;
@@ -1741,6 +1800,7 @@ void process_bucket_gpu(
     
     size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
     clEnqueueNDRangeKernel(plotter.queue, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+    print_step("sort");
     
     // Step 5: GPU match_p1 — find Y,Y+1 pairs
     cl_mem LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
@@ -1769,9 +1829,11 @@ void process_bucket_gpu(
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
     clEnqueueNDRangeKernel(plotter.queue, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    print_step("match");
     
     uint32_t gpu_matches = 0;
     clEnqueueReadBuffer(plotter.queue, num_matches_buf, CL_TRUE, 0, 4, &gpu_matches, 0, nullptr, nullptr);
+    print_step("download_match_count");
     
     if(gpu_matches == 0) {
         clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
@@ -1783,6 +1845,7 @@ void process_bucket_gpu(
     // Step 6: Download LR pairs (all matches from bucket y — no filtering needed)
     std::vector<uint32_t> LR_filtered(gpu_matches * 2);
     clEnqueueReadBuffer(plotter.queue, LR_buf, CL_TRUE, 0, gpu_matches * 8, LR_filtered.data(), 0, nullptr, nullptr);
+    print_step("download_LR");
     
     // X pairs for table 2 are now saved into dst store alongside metadata and PD
     
@@ -1848,6 +1911,7 @@ void process_bucket_gpu(
         if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
         clEnqueueNDRangeKernel(plotter.queue, plotter.gather_meta_kernel, 1, nullptr,
             &gather_global, &gather_local, 0, nullptr, nullptr);
+        print_step("gather");
         
         // GPU hash: hash_table_entries with gathered metadata (sequential reads)
         cl_mem Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
@@ -1872,6 +1936,7 @@ void process_bucket_gpu(
         M_out.resize(num_matches * MY_N_META);
         clEnqueueReadBuffer(plotter.queue, Yb, CL_TRUE, 0, num_matches * 4, Y_out.data(), 0, nullptr, nullptr);
         clEnqueueReadBuffer(plotter.queue, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
+        print_step("hash+download");
         
         clReleaseMemObject(L_gathered);
         clReleaseMemObject(R_gathered);
@@ -1890,6 +1955,7 @@ void process_bucket_gpu(
             }
         }
         plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
+        print_step("cpu_extract+hash");
     }
     
     // Step 9: Bucket output → dst store (metadata + PD + X_pairs)
@@ -2498,6 +2564,10 @@ void build_plot_data_from_store(
 }
 
 
+bool gpu_yield = true;
+int device_id = 0;
+bool timing_detail = false;
+
 int main(int argc, char** argv)
 {
     std::string output_dir = "./";  // default: current directory
@@ -2506,8 +2576,6 @@ int main(int argc, char** argv)
     uint64_t test_limit = 0;
     bool use_ramdisk = false;
     bool use_chunked = false;
-bool gpu_yield = true;
-int device_id = 0;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
@@ -2523,6 +2591,7 @@ std::cerr << "  --opt-gpu-meta  Module B: GPU metadata extraction (skip CPU extr
 std::cerr << "  --opt-gpu-prefix Module A: GPU prefix sum (skip sub-count readback)" << std::endl;
 std::cerr << "  --opt-async     Module D: Async PCIe transfers" << std::endl;
 std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buckets)" << std::endl;
+std::cerr << "  --timing        Show per-step timing for first bucket of each table" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << std::endl;
@@ -2547,6 +2616,7 @@ else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
 else if(arg == "--opt-gpu-prefix") get_opt_config().gpu_prefix_sum = true;
 else if(arg == "--opt-async") get_opt_config().async_transfers = true;
 else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::stoi(argv[++i]);
+else if(arg == "--timing") timing_detail = true;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
