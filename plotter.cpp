@@ -202,6 +202,13 @@ public:
     cl_program program;
     cl_kernel f1_kernel;
     
+    // Warp-parallel F1 kernels
+    cl_program f1_warp_program = nullptr;
+    cl_kernel gen_mem_kernel = nullptr;
+    cl_kernel calc_memhash_kernel = nullptr;
+    cl_kernel scatter_f1_kernel = nullptr;
+    bool f1_warp_loaded = false;
+    
     void init(cl_context ctx, cl_device_id dev) {
         context = ctx;
         device = dev;
@@ -231,6 +238,33 @@ public:
         if(err != CL_SUCCESS) throw std::runtime_error("compute_f1_kernel not found");
         
         std::cout << "[OCL] F1 kernel loaded" << std::endl;
+        
+        // Try loading warp-parallel F1 kernels
+        std::string warp_path = "f1_warp.cl";
+        FILE* fw = fopen(warp_path.c_str(), "r");
+        if(fw) {
+            fseek(fw, 0, SEEK_END); size_t wsz = ftell(fw); fseek(fw, 0, SEEK_SET);
+            char* wsrc = new char[wsz+1]; fread(wsrc, 1, wsz, fw); wsrc[wsz] = 0; fclose(fw);
+            cl_int werr;
+            f1_warp_program = clCreateProgramWithSource(context, 1, (const char**)&wsrc, &wsz, &werr);
+            delete[] wsrc;
+            werr = clBuildProgram(f1_warp_program, 1, &device, "-cl-std=CL2.0", nullptr, nullptr);
+            if(werr != CL_SUCCESS) {
+                char log[8192]; clGetProgramBuildInfo(f1_warp_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+                std::cerr << "[OCL] f1_warp.cl build failed (warp F1 disabled): " << log << std::endl;
+                clReleaseProgram(f1_warp_program); f1_warp_program = nullptr;
+            } else {
+                gen_mem_kernel = clCreateKernel(f1_warp_program, "gen_mem_array_kernel", &werr);
+                calc_memhash_kernel = clCreateKernel(f1_warp_program, "calc_mem_hash_kernel", &werr);
+                scatter_f1_kernel = clCreateKernel(f1_warp_program, "scatter_f1_kernel", &werr);
+                if(gen_mem_kernel && calc_memhash_kernel && scatter_f1_kernel) {
+                    f1_warp_loaded = true;
+                    std::cout << "[OCL] Warp-parallel F1 kernels loaded (3-kernel pipeline)" << std::endl;
+                } else {
+                    std::cerr << "[OCL] Some warp F1 kernels missing" << std::endl;
+                }
+            }
+        }
     }
     
     // Table hash is initialized separately via init_table_hash()
@@ -283,6 +317,121 @@ public:
         
         clReleaseMemObject(X_buf);
         clReleaseMemObject(ID_buf);
+        clReleaseMemObject(Y_buf);
+        clReleaseMemObject(M_buf);
+    }
+    
+    // Warp-parallel F1: 3-kernel pipeline (gen_mem → calc_mem_hash → scatter)
+    // Uses device memory for mem_buf, shared memory for warp-parallel hash.
+    // SAFETY: Uses fixed SUB_BATCH = 16384 to keep VRAM < 72MB per sub-batch
+    // and prevent Windows TDR (kernel finishes in < 0.01s per sub-batch).
+    // Loops over the input in sub-batches, writing results incrementally.
+    static constexpr uint32_t WARP_SUB_BATCH = 16384;  // 16384 entries = 72MB VRAM
+    
+    void compute_f1_warp_batch(
+        const std::vector<uint32_t>& X_values,
+        const hash_t& plot_id,
+        std::vector<uint32_t>& Y_out,
+        std::vector<uint32_t>& M_out)
+    {
+        const size_t num_x = X_values.size();
+        if(num_x == 0) return;
+        
+        Y_out.resize(num_x);
+        M_out.resize(num_x * MY_N_META);
+        
+        std::vector<uint32_t> id_u32(8);
+        std::memcpy(id_u32.data(), plot_id.data(), 32);
+        
+        cl_int err;
+        cl_mem id_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       8 * sizeof(uint32_t), (void*)id_u32.data(), &err);
+        
+        // Allocate device buffers for ONE sub-batch (fixed size = safe VRAM)
+        const uint32_t sub = WARP_SUB_BATCH;
+        // VRAM: mem=72MB, key=1MB, hash=2MB, Y_out=64KB, M_out=0.9MB ≈ 76MB total
+        cl_mem mem_buf = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            (size_t)sub * 1024 * sizeof(uint32_t), nullptr, &err);
+        cl_mem key_buf = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            (size_t)sub * 16 * sizeof(uint32_t), nullptr, &err);
+        cl_mem hash_buf = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            (size_t)sub * 32 * sizeof(uint32_t), nullptr, &err);
+        cl_mem Y_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
+            (size_t)sub * sizeof(uint32_t), nullptr, &err);
+        cl_mem M_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
+            (size_t)sub * MY_N_META * sizeof(uint32_t), nullptr, &err);
+        
+        if(err != CL_SUCCESS) {
+            std::cerr << "[F1 Warp] Failed to allocate device buffers: " << err << std::endl;
+            clReleaseMemObject(id_buf);
+            return;
+        }
+        
+        uint32_t kmask = KMASK;
+        uint32_t total = (uint32_t)(1 << KSIZE);
+        uint32_t x_base = X_values[0];
+        
+        // Process in sub-batches
+        const uint32_t num_sub_batches = (num_x + sub - 1) / sub;
+        for(uint32_t sb = 0; sb < num_sub_batches; sb++) {
+            uint32_t offset = sb * sub;
+            uint32_t count = std::min(sub, (uint32_t)num_x - offset);
+            uint32_t sub_x_base = x_base + offset;
+            
+            // Kernel 1: gen_mem_array (1 work-item per entry)
+            {
+                size_t global = count, local = 256;
+                if(global % local) global = ((global / local) + 1) * local;
+                clSetKernelArg(gen_mem_kernel, 0, sizeof(cl_mem), &mem_buf);
+                clSetKernelArg(gen_mem_kernel, 1, sizeof(cl_mem), &key_buf);
+                clSetKernelArg(gen_mem_kernel, 2, sizeof(cl_mem), &id_buf);
+                clSetKernelArg(gen_mem_kernel, 3, sizeof(uint32_t), &count);
+                clSetKernelArg(gen_mem_kernel, 4, sizeof(uint32_t), &sub_x_base);
+                clEnqueueNDRangeKernel(queue, gen_mem_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+                clFinish(queue);  // Finish before next kernel to prevent TDR
+            }
+            
+            // Kernel 2: calc_mem_hash (32 work-items per entry = 1 subgroup)
+            // 4 subgroups per work-group = 128 work-items
+            {
+                size_t global = count * 32, local = 128;
+                if(global % local) global = ((global / local) + 1) * local;
+                uint32_t num_iter = 256;
+                clSetKernelArg(calc_memhash_kernel, 0, sizeof(cl_mem), &mem_buf);
+                clSetKernelArg(calc_memhash_kernel, 1, sizeof(cl_mem), &hash_buf);
+                clSetKernelArg(calc_memhash_kernel, 2, sizeof(uint32_t), &count);
+                clSetKernelArg(calc_memhash_kernel, 3, sizeof(uint32_t), &num_iter);
+                clEnqueueNDRangeKernel(queue, calc_memhash_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+                clFinish(queue);
+            }
+            
+            // Kernel 3: scatter_f1 (1 work-item per entry)
+            {
+                size_t global = count, local = 256;
+                if(global % local) global = ((global / local) + 1) * local;
+                clSetKernelArg(scatter_f1_kernel, 0, sizeof(cl_mem), &key_buf);
+                clSetKernelArg(scatter_f1_kernel, 1, sizeof(cl_mem), &hash_buf);
+                clSetKernelArg(scatter_f1_kernel, 2, sizeof(cl_mem), &Y_buf);
+                clSetKernelArg(scatter_f1_kernel, 3, sizeof(cl_mem), &M_buf);
+                clSetKernelArg(scatter_f1_kernel, 4, sizeof(uint32_t), &kmask);
+                clSetKernelArg(scatter_f1_kernel, 5, sizeof(uint32_t), &count);
+                clSetKernelArg(scatter_f1_kernel, 6, sizeof(uint32_t), &sub_x_base);
+                clSetKernelArg(scatter_f1_kernel, 7, sizeof(uint32_t), &total);
+                clEnqueueNDRangeKernel(queue, scatter_f1_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+                clFinish(queue);
+            }
+            
+            // Read results for this sub-batch
+            clEnqueueReadBuffer(queue, Y_buf, CL_TRUE, 0,
+                count * sizeof(uint32_t), Y_out.data() + offset, 0, nullptr, nullptr);
+            clEnqueueReadBuffer(queue, M_buf, CL_TRUE, 0,
+                count * MY_N_META * sizeof(uint32_t), M_out.data() + offset * MY_N_META, 0, nullptr, nullptr);
+        }
+        
+        clReleaseMemObject(id_buf);
+        clReleaseMemObject(mem_buf);
+        clReleaseMemObject(key_buf);
+        clReleaseMemObject(hash_buf);
         clReleaseMemObject(Y_buf);
         clReleaseMemObject(M_buf);
     }
@@ -422,31 +571,61 @@ public:
             std::vector<uint32_t> X_batch(batch_size);
             std::vector<uint32_t> Y_batch, M_batch;
             
-            for(uint64_t b = 0; b < num_batches; b++) {
-                uint64_t start = b * batch_size;
-                uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
-                
-                for(uint32_t i = 0; i < count; i++) {
-                    X_batch[i] = (uint32_t)(start + i);
+            // Check if warp-parallel F1 is available
+            bool use_warp = f1_warp_loaded;
+            // Warp batch size: 65536 (like CUDA). Adjust if total < batch_size.
+            uint32_t warp_batch = 65536;
+            
+            if(use_warp) {
+                std::cout << "[F1] Using warp-parallel pipeline (3-kernel, 32 threads/entry)" << std::endl;
+                for(uint64_t b = 0; b < num_batches; b++) {
+                    uint64_t start = b * batch_size;
+                    uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
+                    
+                    for(uint32_t i = 0; i < count; i++) {
+                        X_batch[i] = (uint32_t)(start + i);
+                    }
+                    X_batch.resize(count);
+                    
+                    compute_f1_warp_batch(X_batch, plot_id, Y_batch, M_batch);
+                    
+                    std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
+                    std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
+                    
+                    if((b + 1) % 16 == 0 || b == num_batches - 1) {
+                        auto elapsed = my_time_ms() - t0;
+                        auto pct = (b + 1) * 100.0 / num_batches;
+                        std::cout << "[F1] Batch " << (b+1) << "/" << num_batches << " (" << pct << "%) "
+                                  << elapsed / 1000.0 << "s" << std::endl;
+                    }
                 }
-                X_batch.resize(count);
-                
-                bool use_svm = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
-                if(use_svm) {
-                    compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
-                        g_svmpools[0]->svm_F1_X, g_svmpools[0]->svm_F1_Y, g_svmpools[0]->svm_F1_M, (size_t)-1);
-                } else {
-                    compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
-                }
-                
-                std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
-                std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
-                
-                if((b + 1) % 16 == 0 || b == num_batches - 1) {
-                    auto elapsed = my_time_ms() - t0;
-                    auto pct = (b + 1) * 100.0 / num_batches;
-                    std::cout << "[F1] Batch " << (b+1) << "/" << num_batches << " (" << pct << "%) "
-                              << elapsed / 1000.0 << "s" << std::endl;
+            } else {
+                for(uint64_t b = 0; b < num_batches; b++) {
+                    uint64_t start = b * batch_size;
+                    uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
+                    
+                    for(uint32_t i = 0; i < count; i++) {
+                        X_batch[i] = (uint32_t)(start + i);
+                    }
+                    X_batch.resize(count);
+                    
+                    bool use_svm = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
+                    if(use_svm) {
+                        compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
+                            g_svmpools[0]->svm_F1_X, g_svmpools[0]->svm_F1_Y, g_svmpools[0]->svm_F1_M, (size_t)-1);
+                    } else {
+                        compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+                    }
+                    
+                    std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
+                    std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
+                    
+                    if((b + 1) % 16 == 0 || b == num_batches - 1) {
+                        auto elapsed = my_time_ms() - t0;
+                        auto pct = (b + 1) * 100.0 / num_batches;
+                        std::cout << "[F1] Batch " << (b+1) << "/" << num_batches << " (" << pct << "%) "
+                                  << elapsed / 1000.0 << "s" << std::endl;
+                    }
                 }
             }
         }
