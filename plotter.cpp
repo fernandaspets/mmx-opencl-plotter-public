@@ -1183,68 +1183,51 @@ void compute_full_pipeline(
             for(const auto& p : thread_lr[ti]) all_lr.push_back(p);
         }
         
-        // GPU hash — old method (pre-extract L/R metadata on CPU)
-        std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
-        std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
-        #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < total_matches; i++) {
-            const auto& [sorted_L, sorted_R] = all_lr[i];
-            uint32_t orig_L = entries[sorted_L].second;
-            uint32_t orig_R = entries[sorted_R].second;
-            for(int j = 0; j < MY_N_META; j++) {
-                L_meta_flat[i * MY_N_META + j] = M_curr[orig_L][j];
-                R_meta_flat[i * MY_N_META + j] = M_curr[orig_R][j];
-            }
-        }
+        // GPU hash — direct approach: upload M_curr + LR pairs, GPU reads metadata directly
+        // Eliminates CPU meta extraction (saves ~0.5s per table for k23)
         std::vector<uint32_t> Y_results, M_results;
-        const int ngpus = std::max(1, std::min(g_num_gpus, (int)g_plotters.size()));
-        if(ngpus > 1 && total_matches > 100000) {
-            // Multi-GPU: split matches across GPUs
-            Y_results.resize(total_matches);
-            M_results.resize(total_matches * MY_N_META);
-            std::vector<std::future<void>> futs;
-            size_t per_gpu = (total_matches + ngpus - 1) / ngpus;
-            for(int g = 0; g < ngpus; g++) {
-                size_t start = g * per_gpu;
-                size_t count = std::min(per_gpu, total_matches - start);
-                if(count == 0) break;
-                // Use shared_ptr to keep slices alive across async boundary
-                auto L_slice = std::make_shared<std::vector<uint32_t>>(
-                    L_meta_flat.begin() + start * MY_N_META,
-                    L_meta_flat.begin() + (start + count) * MY_N_META);
-                auto R_slice = std::make_shared<std::vector<uint32_t>>(
-                    R_meta_flat.begin() + start * MY_N_META,
-                    R_meta_flat.begin() + (start + count) * MY_N_META);
-                auto Y_slice = std::make_shared<std::vector<uint32_t>>();
-                auto M_slice = std::make_shared<std::vector<uint32_t>>();
-                futs.push_back(std::async(std::launch::async, [&, g, start, count, L_slice, R_slice, Y_slice, M_slice]() {
-                    try {
-                        bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_L_gathered;
-                        if(use_svm_g) {
-                            g_plotters[g]->gpu_hash_table_svm(*L_slice, *R_slice, *Y_slice, *M_slice, KMASK,
-                                g_svmpools[g]->svm_L_gathered, g_svmpools[g]->svm_R_gathered,
-                                g_svmpools[g]->svm_Y_hash, g_svmpools[g]->svm_M_hash,
-                                g_svmpools[g]->fine_grain);
-                        } else {
-                            g_plotters[g]->gpu_hash_table(*L_slice, *R_slice, *Y_slice, *M_slice, KMASK);
-                        }
-                        std::memcpy(Y_results.data() + start, Y_slice->data(), count * sizeof(uint32_t));
-                        std::memcpy(M_results.data() + start * MY_N_META, M_slice->data(), count * MY_N_META * sizeof(uint32_t));
-                    } catch(const std::exception& e) {
-                        std::cerr << "[Hash] GPU " << g << " error: " << e.what() << std::endl;
-                        throw;
-                    }
-                }));
+        if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
+            // Flatten M_curr to uint32 array
+            size_t num_total = M_curr.size();
+            std::vector<uint32_t> M_curr_flat(num_total * MY_N_META);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < num_total; i++) {
+                for(int j = 0; j < MY_N_META; j++) {
+                    M_curr_flat[i * MY_N_META + j] = M_curr[i][j];
+                }
             }
-            for(auto& f : futs) f.wait();
-        } else if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
-            // SVM hash — no cl_mem, direct shared memory
-            gpu_plotter.gpu_hash_table_svm(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK,
-                g_svmpools[0]->svm_L_gathered, g_svmpools[0]->svm_R_gathered,
-                g_svmpools[0]->svm_Y_hash, g_svmpools[0]->svm_M_hash,
-                g_svmpools[0]->fine_grain);
+            // Build LR pairs (P1, P2 = original indices into M_curr)
+            std::vector<uint32_t> LR_flat(total_matches * 2);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < total_matches; i++) {
+                const auto& [sorted_L, sorted_R] = all_lr[i];
+                LR_flat[i * 2] = entries[sorted_L].second;
+                LR_flat[i * 2 + 1] = entries[sorted_R].second;
+            }
+            // Hash directly on GPU (reads M_curr[P1], M_curr[P2])
+            gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
         } else {
-            gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
+            // Fallback: old method (pre-extract L/R metadata on CPU)
+            std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
+            std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < total_matches; i++) {
+                const auto& [sorted_L, sorted_R] = all_lr[i];
+                uint32_t orig_L = entries[sorted_L].second;
+                uint32_t orig_R = entries[sorted_R].second;
+                for(int j = 0; j < MY_N_META; j++) {
+                    L_meta_flat[i * MY_N_META + j] = M_curr[orig_L][j];
+                    R_meta_flat[i * MY_N_META + j] = M_curr[orig_R][j];
+                }
+            }
+            if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
+                gpu_plotter.gpu_hash_table_svm(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK,
+                    g_svmpools[0]->svm_L_gathered, g_svmpools[0]->svm_R_gathered,
+                    g_svmpools[0]->svm_Y_hash, g_svmpools[0]->svm_M_hash,
+                    g_svmpools[0]->fine_grain);
+            } else {
+                gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
+            }
         }
         
         // Convert to M_next format

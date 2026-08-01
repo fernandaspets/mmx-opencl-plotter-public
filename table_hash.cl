@@ -42,6 +42,7 @@ void sha512_block(__private ulong* msg, __private ulong* state)
 {
 	__private ulong w[80];
 	for(int i = 0; i < 16; i++) w[i] = msg[i];
+	#pragma unroll 1
 	for(int i = 16; i < 80; i++) {
 		ulong s0 = rotr64(w[i-15], 1) ^ rotr64(w[i-15], 8) ^ (w[i-15] >> 7);
 		ulong s1 = rotr64(w[i-2], 19) ^ rotr64(w[i-2], 61) ^ (w[i-2] >> 6);
@@ -49,6 +50,7 @@ void sha512_block(__private ulong* msg, __private ulong* state)
 	}
 	ulong a=state[0], b=state[1], c=state[2], d=state[3];
 	ulong e=state[4], f=state[5], g=state[6], h=state[7];
+	#pragma unroll 1
 	for(int i = 0; i < 80; i++) {
 		ulong S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
 		ulong ch = (e & f) ^ ((~e) & g);
