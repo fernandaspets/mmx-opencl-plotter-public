@@ -363,39 +363,85 @@ public:
         Y_all.resize(total);
         M_all.resize(total * MY_N_META);
         
-        std::cout << "[F1] Computing " << total << " entries in " << num_batches << " batches..." << std::endl;
+        const int ngpus = std::max(1, std::min(g_num_gpus, (int)g_plotters.size()));
+        std::cout << "[F1] Computing " << total << " entries in " << num_batches << " batches on " << ngpus << " GPU" << (ngpus > 1 ? "s" : "") << "..." << std::endl;
         auto t0 = my_time_ms();
         
-        std::vector<uint32_t> X_batch(batch_size);
-        std::vector<uint32_t> Y_batch, M_batch;
-        
-        for(uint64_t b = 0; b < num_batches; b++) {
-            uint64_t start = b * batch_size;
-            uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
-            
-            for(uint32_t i = 0; i < count; i++) {
-                X_batch[i] = (uint32_t)(start + i);
-            }
-            X_batch.resize(count);
-            
-            // Use SVM F1 if available
-            bool use_svm = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
-            if(use_svm) {
-                compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
-                    g_svmpools[0]->svm_F1_X, g_svmpools[0]->svm_F1_Y, g_svmpools[0]->svm_F1_M,
-                    g_svmpools[0]->svm_F1_X ? (size_t)-1 : 0);  // capacity check disabled
-            } else {
-                compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+        if(ngpus > 1) {
+            // Multi-GPU: split batches across GPUs concurrently
+            std::vector<std::vector<uint32_t>> X_bufs(ngpus), Y_bufs(ngpus), M_bufs(ngpus);
+            for(int g = 0; g < ngpus; g++) {
+                X_bufs[g].resize(batch_size);
+                Y_bufs[g].resize(batch_size);
+                M_bufs[g].resize(batch_size * MY_N_META);
             }
             
-            std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
-            std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
-            
-            if((b + 1) % 16 == 0 || b == num_batches - 1) {
+            for(uint64_t b = 0; b < num_batches; b += ngpus) {
+                std::vector<std::future<void>> futs;
+                for(int g = 0; g < ngpus && b + g < num_batches; g++) {
+                    OCL_Plotter& active_pl = *g_plotters[g];
+                    const uint64_t start = (b + g) * batch_size;
+                    const uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
+                    for(uint32_t i = 0; i < count; i++) X_bufs[g][i] = (uint32_t)(start + i);
+                    X_bufs[g].resize(count);
+                    Y_bufs[g].resize(count);
+                    M_bufs[g].resize(count * MY_N_META);
+                    
+                    bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_F1_X;
+                    futs.push_back(std::async(std::launch::async, [&, g, start, count]() {
+                        if(use_svm_g) {
+                            active_pl.compute_f1_batch_svm(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g],
+                                g_svmpools[g]->svm_F1_X, g_svmpools[g]->svm_F1_Y, g_svmpools[g]->svm_F1_M, (size_t)-1);
+                        } else {
+                            active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+                        }
+                    }));
+                }
+                for(auto& f : futs) f.wait();
+                
+                for(int g = 0; g < ngpus && b + g < num_batches; g++) {
+                    const uint64_t start = (b + g) * batch_size;
+                    const uint32_t count = X_bufs[g].size();
+                    std::memcpy(Y_all.data() + start, Y_bufs[g].data(), count * sizeof(uint32_t));
+                    std::memcpy(M_all.data() + start * MY_N_META, M_bufs[g].data(), count * MY_N_META * sizeof(uint32_t));
+                }
+                
+                uint64_t done = std::min(b + ngpus, num_batches);
                 auto elapsed = my_time_ms() - t0;
-                auto pct = (b + 1) * 100.0 / num_batches;
-                std::cout << "[F1] Batch " << (b+1) << "/" << num_batches << " (" << pct << "%) "
+                std::cout << "[F1] Batch " << done << "/" << num_batches << " (" << done * 100 / num_batches << "%) "
                           << elapsed / 1000.0 << "s" << std::endl;
+            }
+        } else {
+            // Single GPU
+            std::vector<uint32_t> X_batch(batch_size);
+            std::vector<uint32_t> Y_batch, M_batch;
+            
+            for(uint64_t b = 0; b < num_batches; b++) {
+                uint64_t start = b * batch_size;
+                uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
+                
+                for(uint32_t i = 0; i < count; i++) {
+                    X_batch[i] = (uint32_t)(start + i);
+                }
+                X_batch.resize(count);
+                
+                bool use_svm = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
+                if(use_svm) {
+                    compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
+                        g_svmpools[0]->svm_F1_X, g_svmpools[0]->svm_F1_Y, g_svmpools[0]->svm_F1_M, (size_t)-1);
+                } else {
+                    compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+                }
+                
+                std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
+                std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
+                
+                if((b + 1) % 16 == 0 || b == num_batches - 1) {
+                    auto elapsed = my_time_ms() - t0;
+                    auto pct = (b + 1) * 100.0 / num_batches;
+                    std::cout << "[F1] Batch " << (b+1) << "/" << num_batches << " (" << pct << "%) "
+                              << elapsed / 1000.0 << "s" << std::endl;
+                }
             }
         }
         
@@ -974,7 +1020,41 @@ void compute_full_pipeline(
             }
         }
         std::vector<uint32_t> Y_results, M_results;
-        if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
+        const int ngpus = std::max(1, std::min(g_num_gpus, (int)g_plotters.size()));
+        if(ngpus > 1 && total_matches > 100000) {
+            // Multi-GPU: split matches across GPUs
+            Y_results.resize(total_matches);
+            M_results.resize(total_matches * MY_N_META);
+            std::vector<std::future<void>> futs;
+            size_t per_gpu = (total_matches + ngpus - 1) / ngpus;
+            for(int g = 0; g < ngpus; g++) {
+                size_t start = g * per_gpu;
+                size_t count = std::min(per_gpu, total_matches - start);
+                if(count == 0) break;
+                OCL_Plotter& active_pl = *g_plotters[g];
+                // Slice L_meta/R_meta for this GPU
+                std::vector<uint32_t> L_slice(L_meta_flat.begin() + start * MY_N_META,
+                                              L_meta_flat.begin() + (start + count) * MY_N_META);
+                std::vector<uint32_t> R_slice(R_meta_flat.begin() + start * MY_N_META,
+                                              R_meta_flat.begin() + (start + count) * MY_N_META);
+                std::vector<uint32_t> Y_slice, M_slice;
+                futs.push_back(std::async(std::launch::async, [&, g, start, count, &L_slice, &R_slice, &Y_slice, &M_slice]() {
+                    bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_L_gathered;
+                    if(use_svm_g) {
+                        active_pl.gpu_hash_table_svm(L_slice, R_slice, Y_slice, M_slice, KMASK,
+                            g_svmpools[g]->svm_L_gathered, g_svmpools[g]->svm_R_gathered,
+                            g_svmpools[g]->svm_Y_hash, g_svmpools[g]->svm_M_hash,
+                            g_svmpools[g]->fine_grain);
+                    } else {
+                        active_pl.gpu_hash_table(L_slice, R_slice, Y_slice, M_slice, KMASK);
+                    }
+                    // Copy results into the right position
+                    std::memcpy(Y_results.data() + start, Y_slice.data(), count * sizeof(uint32_t));
+                    std::memcpy(M_results.data() + start * MY_N_META, M_slice.data(), count * MY_N_META * sizeof(uint32_t));
+                }));
+            }
+            for(auto& f : futs) f.wait();
+        } else if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
             // SVM hash — no cl_mem, direct shared memory
             gpu_plotter.gpu_hash_table_svm(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK,
                 g_svmpools[0]->svm_L_gathered, g_svmpools[0]->svm_R_gathered,
@@ -4075,13 +4155,25 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     // SVM F1 for flat path (if --opt-svm)
     SVMPool flat_svm_pool;
+    std::vector<SVMPool> flat_multi_svm;
     if(get_opt_config().svm) {
         int f1_batch = std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE));
         // For flat path: hash buffers need to hold all matches (~2^K entries)
-        int flat_max_entries = (1 << KSIZE) * 3 / 2 + 256;  // same as chunked max_bucket_size
+        // Per-GPU: each GPU handles 1/ngpus of entries
+        int ngpus = std::max(1, g_num_gpus);
+        int per_gpu_entries = ((1 << KSIZE) * 3 / 2 + 256 + ngpus - 1) / ngpus;
+        // GPU 0 pool
         flat_svm_pool.init(plotter.context, plotter.queue, plotter.device,
-                          flat_max_entries, MY_N_META, 64, 4096, f1_batch);
+                          per_gpu_entries, MY_N_META, 64, 4096, f1_batch);
         g_svmpools.push_back(&flat_svm_pool);
+        // Additional GPU pools
+        for(int g = 1; g < ngpus && g < (int)g_plotters.size(); g++) {
+            SVMPool sp;
+            sp.init(g_plotters[g]->context, g_plotters[g]->queue, g_plotters[g]->device,
+                   per_gpu_entries, MY_N_META, 64, 4096, f1_batch);
+            flat_multi_svm.push_back(std::move(sp));
+            g_svmpools.push_back(&flat_multi_svm.back());
+        }
     }
     
     plotter.compute_all_f1(plot_id, Y_all, M_all, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)), test_mode, test_limit);
