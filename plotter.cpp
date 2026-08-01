@@ -2144,6 +2144,14 @@ struct PDEntry {
 
 // Phase 1: Submit scatter→sort→match kernels (all non-blocking)
 // Returns immediately. GPU starts crunching. CPU can submit next bucket.
+// ============================================================================
+// Module E v2: 3-phase pipeline (submit → submit_hash → collect)
+// All GPU enqueues are non-blocking (CL_FALSE) with events.
+// CPU only blocks when it needs data. No threads needed.
+// ============================================================================
+
+// Phase 1: Submit scatter→sort→match kernels (ALL non-blocking)
+// Returns immediately. GPU starts crunching. CPU submits next bucket.
 BucketPending submit_bucket_pipeline(
     OCL_Plotter& plotter,
     MemBucketStore& src,
@@ -2151,278 +2159,294 @@ BucketPending submit_bucket_pipeline(
     int table,
     BufferPool* pool)
 {
-    BucketPending pend;
-    pend.y = y;
-    pend.table = table;
-    pend.plotter = &plotter;
-    pend.pool = pool;
-    pend.queue = plotter.queue;  // each plotter has its own queue
-    
-    pend.count_y = src.counts[y];
-    pend.total = pend.count_y;
-    if(pend.count_y == 0) { pend.skip = true; return pend; }
-    
-    const int n_meta = src.n_meta;
-    const int shift = KSIZE - LOGBUCKETS;
+    BucketPending p;
+    p.skip = true;
+    p.y = y;
+    p.table = table;
+    p.n_meta = src.n_meta;
+    p.shift = KSIZE - LOGBUCKETS;
     const int logbuckets2 = KSIZE - LOGBUCKETS - 9;
-    const int num_sub = 1 << logbuckets2;
-    const int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
+    p.num_sub = 1 << logbuckets2;
+    p.max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / p.num_sub));
+
+    p.count_y = src.counts[y];
+    if(p.count_y == 0) return p;
+
+    p.active_plotter = &plotter;
+    p.active_pool = pool;
     const uint32_t* meta_y = src.buckets[y].data();
-    
+    p.total = p.count_y;
+
+    OCL_Plotter& active_plotter = *p.active_plotter;
+    BufferPool* active_pool = p.active_pool;
+    const int n_meta = p.n_meta;
+    const int num_sub = p.num_sub;
+    const int max_bs2 = p.max_bs2;
+    uint32_t total = p.total;
+
     cl_int err;
     cl_mem null_mem = nullptr;
     int zero = 0;
-    bool using_pool = (pool != nullptr && pool->initialized);
-    pend.owns_buffers = !using_pool;
-    
-    // Step 1: Upload C_in (blocking write — small, fast)
-    pend.C_combined.resize(pend.total * n_meta);
-    std::memcpy(pend.C_combined.data(), meta_y, pend.count_y * n_meta * 4);
-    
-    if(using_pool) {
-        pend.C_in_buf = pool->C_in_buf;
-        pend.PY_buf = pool->PY_buf;
-        pend.sub_cnt_buf = pool->sub_cnt_buf;
-        pend.sub_off_buf = pool->sub_off_buf;
-        pend.LR_buf = pool->LR_buf;
-        pend.PD_match_buf = pool->PD_match_buf;
-        pend.num_matches_buf = pool->num_matches_buf;
+
+    p.using_pool = (active_pool != nullptr && active_pool->initialized);
+    p.q = active_plotter.queue;
+    cl_command_queue& q = p.q;
+
+    // Copy metadata to host buffer (for later CPU PD computation)
+    p.C_combined.resize(total * n_meta);
+    std::memcpy(p.C_combined.data(), meta_y, p.count_y * n_meta * 4);
+
+    // Step 1: Allocate/assign buffers + upload C_in
+    if(p.using_pool) {
+        p.C_in_buf = active_pool->C_in_buf;
+        p.PY_buf = active_pool->PY_buf;
+        p.sub_cnt_buf = active_pool->sub_cnt_buf;
+        p.sub_off_buf = active_pool->sub_off_buf;
+        p.LR_buf = active_pool->LR_buf;
+        p.PD_match_buf = active_pool->PD_match_buf;
+        p.num_matches_buf = active_pool->num_matches_buf;
+        // Non-blocking write — scatter kernel will wait for it via in-order queue
+        clEnqueueWriteBuffer(q, p.C_in_buf, CL_FALSE, 0,
+            p.count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
     } else {
-        pend.C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            pend.C_combined.size() * 4, (void*)pend.C_combined.data(), &err);
-        pend.PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+        p.C_in_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            p.C_combined.size() * 4, (void*)p.C_combined.data(), &err);
+        CL_CHECK(err, "C_in_buf creation");
+        p.PY_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE,
             (size_t)num_sub * max_bs2 * 8, nullptr, &err);
-        pend.sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, num_sub * 4, nullptr, &err);
-        pend.sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, (num_sub + 1) * 4, nullptr, &err);
-        pend.LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, (size_t)pend.total * 4 * 8, nullptr, &err);
-        pend.PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, (size_t)pend.total * 4 * 4, nullptr, &err);
-        pend.num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+        CL_CHECK(err, "PY_buf creation");
+        p.sub_cnt_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE, num_sub * 4, nullptr, &err);
+        CL_CHECK(err, "sub_cnt_buf creation");
+        p.sub_off_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE, (num_sub + 1) * 4, nullptr, &err);
+        CL_CHECK(err, "sub_off_buf creation");
+        p.LR_buf = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, (size_t)total * 4 * 8, nullptr, &err);
+        CL_CHECK(err, "LR_buf creation");
+        p.PD_match_buf = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, (size_t)total * 4 * 4, nullptr, &err);
+        CL_CHECK(err, "PD_match_buf creation");
+        p.num_matches_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+        CL_CHECK(err, "num_matches_buf creation");
     }
-    
-    // Upload C_in (blocking — must complete before scatter reads it)
-    if(using_pool) {
-        clEnqueueWriteBuffer(pend.queue, pend.C_in_buf, CL_TRUE, 0,
-            pend.count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
-    }
-    clEnqueueFillBuffer(pend.queue, pend.sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
-    clEnqueueFillBuffer(pend.queue, pend.num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
-    
-    // Step 2: Scatter (non-blocking)
-    uint32_t total_u32 = pend.total;
+    clEnqueueFillBuffer(q, p.sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+    clEnqueueFillBuffer(q, p.num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
+
+    // Step 2: Scatter (non-blocking — in-order queue ensures C_in write completes first)
+    uint32_t total_u32 = total;
     uint32_t max_bs2_u32 = max_bs2;
-    clSetKernelArg(plotter.k_scatter2, 0, sizeof(cl_mem), &pend.PY_buf);
-    clSetKernelArg(plotter.k_scatter2, 1, sizeof(cl_mem), &pend.sub_cnt_buf);
-    clSetKernelArg(plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);
-    clSetKernelArg(plotter.k_scatter2, 3, sizeof(cl_mem), &pend.C_in_buf);
-    clSetKernelArg(plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
-    clSetKernelArg(plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
-    size_t scatter_global = pend.total;
+    clSetKernelArg(active_plotter.k_scatter2, 0, sizeof(cl_mem), &p.PY_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 1, sizeof(cl_mem), &p.sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);
+    clSetKernelArg(active_plotter.k_scatter2, 3, sizeof(cl_mem), &p.C_in_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
+    clSetKernelArg(active_plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
+    size_t scatter_global = total;
     if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
-    clEnqueueNDRangeKernel(pend.queue, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
-    
-    // Step 3: Prefix sum (Module A: GPU, or CPU fallback)
-    uint32_t num_sub_u32 = num_sub;
-    if(get_opt_config().gpu_prefix_sum && plotter.prefix_sum_kernel) {
-        clSetKernelArg(plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &pend.sub_cnt_buf);
-        clSetKernelArg(plotter.prefix_sum_kernel, 1, sizeof(cl_mem), &pend.sub_off_buf);
-        clSetKernelArg(plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);
-        clSetKernelArg(plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &num_sub_u32);
+    clEnqueueNDRangeKernel(q, active_plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+
+    // Step 3: Prefix sum (Module A: GPU, non-blocking)
+    p.num_sub_u32 = (uint32_t)num_sub;
+    if(get_opt_config().gpu_prefix_sum && active_plotter.prefix_sum_kernel) {
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &p.sub_cnt_buf);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 1, sizeof(cl_mem), &p.sub_off_buf);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &p.num_sub_u32);
         size_t ps_global = num_sub, ps_local = num_sub;
-        clEnqueueNDRangeKernel(pend.queue, plotter.prefix_sum_kernel, 1, nullptr, &ps_global, &ps_local, 0, nullptr, nullptr);
+        clEnqueueNDRangeKernel(q, active_plotter.prefix_sum_kernel, 1, nullptr, &ps_global, &ps_local, 0, nullptr, nullptr);
     } else {
-        // CPU prefix sum — requires blocking read of sub_cnt
+        // CPU prefix sum requires blocking read — but only when Module A is off
         std::vector<uint32_t> sub_cnt(num_sub);
-        clEnqueueReadBuffer(pend.queue, pend.sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, p.sub_cnt_buf, CL_TRUE, 0, num_sub * 4, sub_cnt.data(), 0, nullptr, nullptr);
         std::vector<uint32_t> sub_off(num_sub + 1, 0);
         for(int i = 0; i < num_sub; i++) sub_off[i + 1] = sub_off[i] + sub_cnt[i];
-        clEnqueueWriteBuffer(pend.queue, pend.sub_off_buf, CL_TRUE, 0, (num_sub + 1) * 4, sub_off.data(), 0, nullptr, nullptr);
+        clEnqueueWriteBuffer(q, p.sub_off_buf, CL_FALSE, 0, (num_sub + 1) * 4, sub_off.data(), 0, nullptr, nullptr);
     }
-    
+
     // Step 4: Sort (non-blocking)
-    uint32_t max_bs_sort = max_bs2;
-    clSetKernelArg(plotter.k_simple_sort, 0, sizeof(cl_mem), &pend.PY_buf);
-    clSetKernelArg(plotter.k_simple_sort, 1, sizeof(cl_mem), &pend.sub_cnt_buf);
-    clSetKernelArg(plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
-    clSetKernelArg(plotter.k_simple_sort, 3, sizeof(uint32_t), &num_sub_u32);
+    p.max_bs_sort = max_bs2;
+    uint32_t max_bs_sort = p.max_bs_sort;
+    clSetKernelArg(active_plotter.k_simple_sort, 0, sizeof(cl_mem), &p.PY_buf);
+    clSetKernelArg(active_plotter.k_simple_sort, 1, sizeof(cl_mem), &p.sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_simple_sort, 3, sizeof(uint32_t), &p.num_sub_u32);
     size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
-    clEnqueueNDRangeKernel(pend.queue, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
-    
+    clEnqueueNDRangeKernel(q, active_plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+
     // Step 5: Match (non-blocking, record event for later sync)
-    uint32_t max_total = pend.total * 4;
+    uint32_t max_total = total * 4;
     uint32_t write_pd = 0;
-    clSetKernelArg(plotter.k_match_p1, 0, sizeof(cl_mem), &pend.LR_buf);
-    clSetKernelArg(plotter.k_match_p1, 1, sizeof(cl_mem), &pend.PD_match_buf);
-    clSetKernelArg(plotter.k_match_p1, 2, sizeof(cl_mem), &pend.num_matches_buf);
-    clSetKernelArg(plotter.k_match_p1, 3, sizeof(cl_mem), &pend.PY_buf);
-    clSetKernelArg(plotter.k_match_p1, 4, sizeof(cl_mem), &pend.sub_cnt_buf);
-    clSetKernelArg(plotter.k_match_p1, 5, sizeof(cl_mem), &pend.sub_off_buf);
-    clSetKernelArg(plotter.k_match_p1, 6, sizeof(uint32_t), &num_sub_u32);
-    clSetKernelArg(plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
-    clSetKernelArg(plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
-    clSetKernelArg(plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
+    clSetKernelArg(active_plotter.k_match_p1, 0, sizeof(cl_mem), &p.LR_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 1, sizeof(cl_mem), &p.PD_match_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 2, sizeof(cl_mem), &p.num_matches_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 3, sizeof(cl_mem), &p.PY_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 4, sizeof(cl_mem), &p.sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 5, sizeof(cl_mem), &p.sub_off_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 6, sizeof(uint32_t), &p.num_sub_u32);
+    clSetKernelArg(active_plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
+    clSetKernelArg(active_plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
-    clEnqueueNDRangeKernel(pend.queue, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, &pend.ev_match_done);
-    
-    return pend;
+    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, &p.ev_match_done);
+
+    // Non-blocking read of match count — will be ready when we sync on ev_match_done
+    clEnqueueReadBuffer(q, p.num_matches_buf, CL_FALSE, 0, 4, &p.gpu_matches, 0, nullptr, nullptr);
+
+    p.skip = false;
+    return p;
 }
 
-// Phase 2: Wait for match, read results, submit gather+hash (non-blocking)
-void submit_hash_pipeline(BucketPending& pend, MemBucketStore& src)
+// Phase 2: Wait for match, read LR, submit gather+hash (non-blocking hash reads)
+void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
 {
-    if(pend.skip) return;
-    
-    const int n_meta = src.n_meta;
-    OCL_Plotter& plotter = *pend.plotter;
-    
-    // Wait for match kernel to complete
-    clWaitForEvents(1, &pend.ev_match_done);
-    clReleaseEvent(pend.ev_match_done);
-    pend.ev_match_done = nullptr;
-    
-    // Read match count + LR (blocking — we need the data to proceed)
-    clEnqueueReadBuffer(pend.queue, pend.num_matches_buf, CL_TRUE, 0, 4, &pend.gpu_matches, 0, nullptr, nullptr);
-    if(pend.gpu_matches == 0) return;
-    
-    pend.LR_filtered.resize(pend.gpu_matches * 2);
-    clEnqueueReadBuffer(pend.queue, pend.LR_buf, CL_TRUE, 0, pend.gpu_matches * 8, pend.LR_filtered.data(), 0, nullptr, nullptr);
-    
-    // Submit gather + hash kernels (non-blocking)
-    size_t num_matches = pend.gpu_matches;
-    uint32_t num_m = (uint32_t)num_matches;
-    uint32_t num_total = pend.total;
-    uint32_t n_meta_u32 = (uint32_t)n_meta;
-    cl_int err;
-    
-    if(get_opt_config().gpu_meta_extract) {
-        // Module B: gather + hash on GPU
-        if(pend.pool && pend.pool->initialized) {
-            pend.L_gathered = pend.pool->L_gathered;
-            pend.R_gathered = pend.pool->R_gathered;
-            pend.Yb = pend.pool->Y_hash_buf;
-            pend.Mb = pend.pool->M_hash_buf;
-        } else {
-            pend.L_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * n_meta * 4, nullptr, &err);
-            pend.R_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * n_meta * 4, nullptr, &err);
-            pend.Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err);
-            pend.Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err);
-        }
-        
-        clSetKernelArg(plotter.gather_meta_kernel, 0, sizeof(cl_mem), &pend.C_in_buf);
-        clSetKernelArg(plotter.gather_meta_kernel, 1, sizeof(cl_mem), &pend.LR_buf);
-        clSetKernelArg(plotter.gather_meta_kernel, 2, sizeof(cl_mem), &pend.L_gathered);
-        clSetKernelArg(plotter.gather_meta_kernel, 3, sizeof(cl_mem), &pend.R_gathered);
-        clSetKernelArg(plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
-        clSetKernelArg(plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
-        clSetKernelArg(plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
-        size_t gather_global = num_matches, gather_local = 64;
-        if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
-        clEnqueueNDRangeKernel(pend.queue, plotter.gather_meta_kernel, 1, nullptr, &gather_global, &gather_local, 0, nullptr, nullptr);
-        
-        uint32_t kmask = KMASK;
-        clSetKernelArg(plotter.table_hash_kernel, 0, sizeof(cl_mem), &pend.L_gathered);
-        clSetKernelArg(plotter.table_hash_kernel, 1, sizeof(cl_mem), &pend.R_gathered);
-        clSetKernelArg(plotter.table_hash_kernel, 2, sizeof(cl_mem), &pend.Yb);
-        clSetKernelArg(plotter.table_hash_kernel, 3, sizeof(cl_mem), &pend.Mb);
-        clSetKernelArg(plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
-        clSetKernelArg(plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
-        size_t hash_global = num_matches, hash_local = 64;
-        if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
-        clEnqueueNDRangeKernel(pend.queue, plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, &pend.ev_hash_done);
-    } else {
-        // Original path: CPU meta extraction + gpu_hash_table
-        std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
-        std::vector<uint32_t> R_meta_flat(num_matches * n_meta);
-        for(size_t i = 0; i < num_matches; i++) {
-            uint32_t P1 = pend.LR_filtered[i * 2];
-            uint32_t P2 = pend.LR_filtered[i * 2 + 1];
-            for(int j = 0; j < n_meta; j++) {
-                L_meta_flat[i * n_meta + j] = pend.C_combined[P1 * n_meta + j];
-                R_meta_flat[i * n_meta + j] = pend.C_combined[P2 * n_meta + j];
-            }
-        }
-        plotter.gpu_hash_table(L_meta_flat, R_meta_flat, pend.Y_out, pend.M_out, KMASK);
-        // No event needed — data is already on CPU
-    }
-}
+    if(p.skip) return;
 
-// Phase 3: Wait for hash, read results, write to dst store
-void collect_bucket_pipeline(BucketPending& pend, MemBucketStore& src, MemBucketStore& dst)
-{
-    if(pend.skip) return;
-    if(pend.gpu_matches == 0) {
-        if(pend.owns_buffers) {
-            clReleaseMemObject(pend.C_in_buf); clReleaseMemObject(pend.PY_buf); clReleaseMemObject(pend.sub_cnt_buf);
-            clReleaseMemObject(pend.sub_off_buf); clReleaseMemObject(pend.LR_buf); clReleaseMemObject(pend.PD_match_buf);
-            clReleaseMemObject(pend.num_matches_buf);
+    OCL_Plotter& active_plotter = *p.active_plotter;
+    BufferPool* active_pool = p.active_pool;
+    cl_command_queue& q = p.q;
+    const int n_meta = p.n_meta;
+    int y = p.y, table = p.table;
+
+    // Wait for match kernel + match count read to complete
+    clWaitForEvents(1, &p.ev_match_done);
+    clReleaseEvent(p.ev_match_done);
+    p.ev_match_done = nullptr;
+
+    if(p.gpu_matches == 0) {
+        p.zero_matches = true;
+        if(!p.using_pool) {
+            clReleaseMemObject(p.C_in_buf); clReleaseMemObject(p.PY_buf); clReleaseMemObject(p.sub_cnt_buf);
+            clReleaseMemObject(p.sub_off_buf); clReleaseMemObject(p.LR_buf); clReleaseMemObject(p.PD_match_buf);
+            clReleaseMemObject(p.num_matches_buf);
         }
         return;
     }
-    
-    const int n_meta = src.n_meta;
-    const int shift = KSIZE - LOGBUCKETS;
-    OCL_Plotter& plotter = *pend.plotter;
-    
-    // If using Module B, wait for hash results and read them
-    if(get_opt_config().gpu_meta_extract && pend.ev_hash_done) {
-        clWaitForEvents(1, &pend.ev_hash_done);
-        clReleaseEvent(pend.ev_hash_done);
-        pend.ev_hash_done = nullptr;
-        
-        size_t num_matches = pend.gpu_matches;
-        pend.Y_out.resize(num_matches);
-        pend.M_out.resize(num_matches * MY_N_META);
-        clEnqueueReadBuffer(pend.queue, pend.Yb, CL_TRUE, 0, num_matches * 4, pend.Y_out.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(pend.queue, pend.Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, pend.M_out.data(), 0, nullptr, nullptr);
-        
-        if(pend.owns_buffers) {
-            clReleaseMemObject(pend.L_gathered);
-            clReleaseMemObject(pend.R_gathered);
-            clReleaseMemObject(pend.Yb);
-            clReleaseMemObject(pend.Mb);
-        }
+
+    // Read LR pairs (blocking — need size-dependent data for PD computation)
+    p.LR_filtered.resize(p.gpu_matches * 2);
+    clEnqueueReadBuffer(q, p.LR_buf, CL_TRUE, 0, p.gpu_matches * 8, p.LR_filtered.data(), 0, nullptr, nullptr);
+
+    // Compute PD (CPU work)
+    p.bucket_offset = 0;
+    for(int b = 0; b < y; b++) p.bucket_offset += src.counts[b];
+    p.num_filt = p.LR_filtered.size() / 2;
+    p.pd_data.resize(p.num_filt * 2);
+    for(uint32_t i = 0; i < p.num_filt; i++) {
+        p.pd_data[i * 2] = p.bucket_offset + p.LR_filtered[i * 2];
+        p.pd_data[i * 2 + 1] = p.bucket_offset + p.LR_filtered[i * 2 + 1];
     }
-    
-    // CPU work: compute PD, distribute to dst store
-    uint32_t bucket_offset = 0;
-    for(int b = 0; b < pend.y; b++) bucket_offset += src.counts[b];
-    
-    uint32_t num_filt = pend.LR_filtered.size() / 2;
-    std::vector<uint32_t> pd_data(num_filt * 2);
-    for(uint32_t i = 0; i < num_filt; i++) {
-        pd_data[i * 2] = bucket_offset + pend.LR_filtered[i * 2];
-        pd_data[i * 2 + 1] = bucket_offset + pend.LR_filtered[i * 2 + 1];
-    }
-    
+
     // X pairs for table 2
-    std::vector<uint32_t> xp_flat;
-    if(pend.table == 2) {
-        const std::vector<uint32_t>& x_vals = src.x_values[pend.y];
-        for(uint32_t i = 0; i < num_filt; i++) {
-            uint32_t left_local = pend.LR_filtered[i * 2];
-            uint32_t right_local = pend.LR_filtered[i * 2 + 1];
+    if(table == 2) {
+        const std::vector<uint32_t>& x_vals = src.x_values[y];
+        for(uint32_t i = 0; i < p.num_filt; i++) {
+            uint32_t left_local = p.LR_filtered[i * 2];
+            uint32_t right_local = p.LR_filtered[i * 2 + 1];
             uint32_t left_x = (left_local < x_vals.size()) ? x_vals[left_local] : 0;
             uint32_t right_x = (right_local < x_vals.size()) ? x_vals[right_local] : 0;
-            xp_flat.push_back(left_x);
-            xp_flat.push_back(right_x);
+            p.xp_flat.push_back(left_x);
+            p.xp_flat.push_back(right_x);
         }
     }
-    
-    // Distribute to dst store
+
+    p.num_matches = p.gpu_matches;
+
+    if(get_opt_config().gpu_meta_extract) {
+        cl_int err2;
+        uint32_t num_m = (uint32_t)p.num_matches;
+        uint32_t num_total = p.total;
+        uint32_t n_meta_u32 = (uint32_t)n_meta;
+
+        if(p.using_pool) {
+            p.L_gathered = active_pool->L_gathered;
+            p.R_gathered = active_pool->R_gathered;
+            p.Yb = active_pool->Y_hash_buf;
+            p.Mb = active_pool->M_hash_buf;
+        } else {
+            p.L_gathered = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, p.num_matches * n_meta * 4, nullptr, &err2);
+            CL_CHECK(err2, "L_gathered");
+            p.R_gathered = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, p.num_matches * n_meta * 4, nullptr, &err2);
+            CL_CHECK(err2, "R_gathered");
+            p.Yb = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, p.num_matches * 4, nullptr, &err2);
+            CL_CHECK(err2, "Yb");
+            p.Mb = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, p.num_matches * MY_N_META * 4, nullptr, &err2);
+            CL_CHECK(err2, "Mb");
+        }
+
+        // Gather kernel (non-blocking)
+        clSetKernelArg(active_plotter.gather_meta_kernel, 0, sizeof(cl_mem), &p.C_in_buf);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 1, sizeof(cl_mem), &p.LR_buf);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 2, sizeof(cl_mem), &p.L_gathered);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 3, sizeof(cl_mem), &p.R_gathered);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
+        size_t gather_global = p.num_matches, gather_local = 64;
+        if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
+        clEnqueueNDRangeKernel(q, active_plotter.gather_meta_kernel, 1, nullptr, &gather_global, &gather_local, 0, nullptr, nullptr);
+
+        // Hash kernel (non-blocking)
+        uint32_t kmask = KMASK;
+        clSetKernelArg(active_plotter.table_hash_kernel, 0, sizeof(cl_mem), &p.L_gathered);
+        clSetKernelArg(active_plotter.table_hash_kernel, 1, sizeof(cl_mem), &p.R_gathered);
+        clSetKernelArg(active_plotter.table_hash_kernel, 2, sizeof(cl_mem), &p.Yb);
+        clSetKernelArg(active_plotter.table_hash_kernel, 3, sizeof(cl_mem), &p.Mb);
+        clSetKernelArg(active_plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(active_plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
+        size_t hash_global = p.num_matches, hash_local = 64;
+        if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
+        clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
+
+        // Non-blocking reads of Y + M results — ev_hash_done guards both (in-order queue)
+        p.Y_out.resize(p.num_matches);
+        p.M_out.resize(p.num_matches * MY_N_META);
+        clEnqueueReadBuffer(q, p.Yb, CL_FALSE, 0, p.num_matches * 4, p.Y_out.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, p.Mb, CL_FALSE, 0, p.num_matches * MY_N_META * 4, p.M_out.data(), 0, nullptr, &p.ev_hash_done);
+    } else {
+        // CPU-extract path (blocking, no event)
+        std::vector<uint32_t> L_meta_flat(p.num_matches * n_meta);
+        std::vector<uint32_t> R_meta_flat(p.num_matches * n_meta);
+        for(size_t i = 0; i < p.num_matches; i++) {
+            uint32_t P1 = p.LR_filtered[i * 2];
+            uint32_t P2 = p.LR_filtered[i * 2 + 1];
+            for(int j = 0; j < n_meta; j++) {
+                L_meta_flat[i * n_meta + j] = p.C_combined[P1 * n_meta + j];
+                R_meta_flat[i * n_meta + j] = p.C_combined[P2 * n_meta + j];
+            }
+        }
+        active_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, p.Y_out, p.M_out, KMASK);
+    }
+}
+
+// Phase 3: Wait for hash, write results to dst store
+void collect_bucket_pipeline(BucketPending& p, MemBucketStore& dst)
+{
+    if(p.skip || p.zero_matches) return;
+
+    // Wait for hash results if using GPU meta extract
+    if(get_opt_config().gpu_meta_extract && p.ev_hash_done) {
+        clWaitForEvents(1, &p.ev_hash_done);
+        clReleaseEvent(p.ev_hash_done);
+        p.ev_hash_done = nullptr;
+    }
+
+    const int n_meta = p.n_meta;
+    const int shift = p.shift;
+    int table = p.table;
+
+    // Distribute to dst store (CPU work, single-threaded — no mutex needed)
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
     std::vector<std::vector<uint32_t>> dst_pd_batch(dst.num_buckets);
     std::vector<std::vector<uint32_t>> dst_xp_batch(dst.num_buckets);
-    
-    for(uint32_t i = 0; i < num_filt; i++) {
-        uint32_t bucket = pend.Y_out[i] >> shift;
+
+    for(uint32_t i = 0; i < p.num_filt; i++) {
+        uint32_t bucket = p.Y_out[i] >> shift;
         if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
         for(int j = 0; j < n_meta; j++)
-            dst_batch[bucket].push_back(pend.M_out[i * n_meta + j]);
-        dst_pd_batch[bucket].push_back(pd_data[i * 2]);
-        dst_pd_batch[bucket].push_back(pd_data[i * 2 + 1]);
-        if(pend.table == 2 && i * 2 + 1 < xp_flat.size()) {
-            dst_xp_batch[bucket].push_back(xp_flat[i * 2]);
-            dst_xp_batch[bucket].push_back(xp_flat[i * 2 + 1]);
+            dst_batch[bucket].push_back(p.M_out[i * n_meta + j]);
+        dst_pd_batch[bucket].push_back(p.pd_data[i * 2]);
+        dst_pd_batch[bucket].push_back(p.pd_data[i * 2 + 1]);
+        if(table == 2 && i * 2 + 1 < p.xp_flat.size()) {
+            dst_xp_batch[bucket].push_back(p.xp_flat[i * 2]);
+            dst_xp_batch[bucket].push_back(p.xp_flat[i * 2 + 1]);
         }
     }
     for(int b = 0; b < dst.num_buckets; b++) {
@@ -2430,16 +2454,22 @@ void collect_bucket_pipeline(BucketPending& pend, MemBucketStore& src, MemBucket
         uint32_t cnt = dst_batch[b].size() / n_meta;
         dst.append(b, dst_batch[b].data(), cnt);
         dst.append_pd(b, dst_pd_batch[b].data(), cnt);
-        if(pend.table == 2 && !dst_xp_batch[b].empty()) {
+        if(table == 2 && !dst_xp_batch[b].empty()) {
             dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
         }
     }
-    
+
     // Cleanup GPU buffers if we own them (no pool)
-    if(pend.owns_buffers) {
-        clReleaseMemObject(pend.C_in_buf); clReleaseMemObject(pend.PY_buf); clReleaseMemObject(pend.sub_cnt_buf);
-        clReleaseMemObject(pend.sub_off_buf); clReleaseMemObject(pend.LR_buf); clReleaseMemObject(pend.PD_match_buf);
-        clReleaseMemObject(pend.num_matches_buf);
+    if(get_opt_config().gpu_meta_extract && !p.using_pool) {
+        clReleaseMemObject(p.L_gathered);
+        clReleaseMemObject(p.R_gathered);
+        clReleaseMemObject(p.Yb);
+        clReleaseMemObject(p.Mb);
+    }
+    if(!p.using_pool) {
+        clReleaseMemObject(p.C_in_buf); clReleaseMemObject(p.PY_buf); clReleaseMemObject(p.sub_cnt_buf);
+        clReleaseMemObject(p.sub_off_buf); clReleaseMemObject(p.LR_buf); clReleaseMemObject(p.PD_match_buf);
+        clReleaseMemObject(p.num_matches_buf);
     }
 }
 
@@ -2513,8 +2543,8 @@ void compute_f2_f9_chunked(
                 if(have1) submit_hash_pipeline(p1, src);
                 
                 // Phase 3: collect results (waits on hash event, writes to dst store)
-                if(have0) collect_bucket_pipeline(p0, src, dst);
-                if(have1) collect_bucket_pipeline(p1, src, dst);
+                if(have0) collect_bucket_pipeline(p0, dst);
+                if(have1) collect_bucket_pipeline(p1, dst);
                 
                 // Cross-boundary matching
                 if(have0) cross_boundary_match(*g_plotters[0], src, dst, y, t);
