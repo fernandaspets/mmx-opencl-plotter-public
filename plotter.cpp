@@ -51,6 +51,7 @@ std::vector<OCL_Plotter*> g_plotters;
 std::vector<BufferPool*> g_bufpools;
 std::vector<SVMPool*> g_svmpools;
 int g_num_gpus = 1;
+int g_hash_local = 256;  // work-group size for hash kernels
 std::mutex g_dst_mutex;  // protects dst store writes in multi-GPU mode
 
 // SVM helper: set SVM pointer as kernel arg
@@ -730,7 +731,7 @@ public:
         clSetKernelArg(table_hash_kernel,4,sizeof(uint32_t),&kmask);
         clSetKernelArg(table_hash_kernel,5,sizeof(uint32_t),&num_u32);
         
-        size_t global = num, local = 64;
+        size_t global = num, local = g_hash_local;
         if(global % local) global = ((global/local)+1)*local;
         clEnqueueNDRangeKernel(queue, table_hash_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
         
@@ -778,7 +779,7 @@ public:
         clSetKernelArg(table_hash_kernel, 4, sizeof(uint32_t), &kmask);
         clSetKernelArg(table_hash_kernel, 5, sizeof(uint32_t), &num_u32);
         
-        size_t global = num, local = 64;
+        size_t global = num, local = g_hash_local;
         if(global % local) global = ((global/local)+1)*local;
         clEnqueueNDRangeKernel(queue, table_hash_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
         
@@ -827,7 +828,7 @@ public:
         clSetKernelArg(hash_lr_kernel, 5, sizeof(uint32_t), &num_u32);
         clSetKernelArg(hash_lr_kernel, 6, sizeof(uint32_t), &num_total_u32);
         
-        size_t global = num, local = 64;
+        size_t global = num, local = g_hash_local;
         if(global % local) global = ((global/local)+1)*local;
         clEnqueueNDRangeKernel(queue, hash_lr_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
         
@@ -4082,6 +4083,7 @@ else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
 else if(arg == "--opt-gpu-prefix") get_opt_config().gpu_prefix_sum = true;
 else if(arg == "--opt-async") get_opt_config().async_transfers = true;
 else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::stoi(argv[++i]);
+else if(arg == "--hash-local" && i+1 < argc) g_hash_local = std::stoi(argv[++i]);
 else if(arg == "--timing") timing_detail = true;
 else if(arg == "--opt-bufpool") get_opt_config().bufpool = true;
 else if(arg == "--opt-zero-copy") get_opt_config().zero_copy = true;

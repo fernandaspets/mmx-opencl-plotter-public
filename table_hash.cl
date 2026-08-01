@@ -53,10 +53,10 @@ void sha512_block(__private ulong* msg, __private ulong* state)
 	#pragma unroll 1
 	for(int i = 0; i < 80; i++) {
 		ulong S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
-		ulong ch = (e & f) ^ ((~e) & g);
+		ulong ch = g ^ (e & (f ^ g));	// optimized: 3 ops instead of 4
 		ulong t1 = h + S1 + ch + SHA512_K[i] + w[i];
 		ulong S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
-		ulong maj = (a & b) ^ (a & c) ^ (b & c);
+		ulong maj = (a & b) | (c & (a | b));	// optimized: 4 ops instead of 5
 		ulong t2 = S0 + maj;
 		h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
 	}
