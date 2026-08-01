@@ -378,7 +378,15 @@ public:
             }
             X_batch.resize(count);
             
-            compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+            // Use SVM F1 if available
+            bool use_svm = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
+            if(use_svm) {
+                compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
+                    g_svmpools[0]->svm_F1_X, g_svmpools[0]->svm_F1_Y, g_svmpools[0]->svm_F1_M,
+                    g_svmpools[0]->svm_F1_X ? (size_t)-1 : 0);  // capacity check disabled
+            } else {
+                compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+            }
             
             std::memcpy(Y_all.data() + start, Y_batch.data(), count * sizeof(uint32_t));
             std::memcpy(M_all.data() + start * MY_N_META, M_batch.data(), count * MY_N_META * sizeof(uint32_t));
@@ -500,6 +508,61 @@ public:
         
         clReleaseMemObject(Lb); clReleaseMemObject(Rb);
         clReleaseMemObject(Yb); clReleaseMemObject(Mb);
+    }
+    
+    // SVM-based hash — no cl_mem, direct shared memory (fine-grain: zero-copy on AMD)
+    void gpu_hash_table_svm(
+        const std::vector<uint32_t>& L_meta,  // [num * 14]
+        const std::vector<uint32_t>& R_meta,  // [num * 14]
+        std::vector<uint32_t>& Y_out,
+        std::vector<uint32_t>& M_out,
+        uint32_t kmask,
+        void* svm_L, void* svm_R, void* svm_Y, void* svm_M,
+        bool fine_grain)
+    {
+        const size_t num = L_meta.size() / 14;
+        if(num == 0) { Y_out.clear(); M_out.clear(); return; }
+        
+        // Write L/R metadata to SVM
+        if(fine_grain) {
+            std::memcpy(svm_L, L_meta.data(), L_meta.size() * 4);
+            std::memcpy(svm_R, R_meta.data(), R_meta.size() * 4);
+            std::atomic_thread_fence(std::memory_order_release);
+        } else {
+            clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_WRITE, svm_L, L_meta.size() * 4, 0, nullptr, nullptr);
+            std::memcpy(svm_L, L_meta.data(), L_meta.size() * 4);
+            clEnqueueSVMUnmap(queue, svm_L, 0, nullptr, nullptr);
+            clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_WRITE, svm_R, R_meta.size() * 4, 0, nullptr, nullptr);
+            std::memcpy(svm_R, R_meta.data(), R_meta.size() * 4);
+            clEnqueueSVMUnmap(queue, svm_R, 0, nullptr, nullptr);
+        }
+        
+        uint32_t num_u32 = (uint32_t)num;
+        clSetKernelArgSVMPointer(table_hash_kernel, 0, svm_L);
+        clSetKernelArgSVMPointer(table_hash_kernel, 1, svm_R);
+        clSetKernelArgSVMPointer(table_hash_kernel, 2, svm_Y);
+        clSetKernelArgSVMPointer(table_hash_kernel, 3, svm_M);
+        clSetKernelArg(table_hash_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(table_hash_kernel, 5, sizeof(uint32_t), &num_u32);
+        
+        size_t global = num, local = 64;
+        if(global % local) global = ((global/local)+1)*local;
+        clEnqueueNDRangeKernel(queue, table_hash_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        
+        Y_out.resize(num);
+        M_out.resize(num * 14);
+        if(fine_grain) {
+            clFinish(queue);
+            std::memcpy(Y_out.data(), svm_Y, num * 4);
+            std::memcpy(M_out.data(), svm_M, num * 14 * 4);
+        } else {
+            clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_READ, svm_Y, num * 4, 0, nullptr, nullptr);
+            std::memcpy(Y_out.data(), svm_Y, num * 4);
+            clEnqueueSVMUnmap(queue, svm_Y, 0, nullptr, nullptr);
+            clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_READ, svm_M, num * 14 * 4, 0, nullptr, nullptr);
+            std::memcpy(M_out.data(), svm_M, num * 14 * 4);
+            clEnqueueSVMUnmap(queue, svm_M, 0, nullptr, nullptr);
+        }
     }
     
     // Optimized: hash using M_curr + LR pairs directly (no CPU meta extraction)
@@ -901,7 +964,15 @@ void compute_full_pipeline(
             }
         }
         std::vector<uint32_t> Y_results, M_results;
-        gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
+        if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
+            // SVM hash — no cl_mem, direct shared memory
+            gpu_plotter.gpu_hash_table_svm(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK,
+                g_svmpools[0]->svm_L_gathered, g_svmpools[0]->svm_R_gathered,
+                g_svmpools[0]->svm_Y_hash, g_svmpools[0]->svm_M_hash,
+                g_svmpools[0]->fine_grain);
+        } else {
+            gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
+        }
         
         // Convert to M_next format
         std::vector<std::array<uint32_t, 14>> M_next(total_matches);
@@ -4021,7 +4092,19 @@ std::vector<std::vector<PDEntry>> pd_all;
     }
     
     std::vector<uint32_t> Y_all, M_all;
-    plotter.compute_all_f1(plot_id, Y_all, M_all, 1 << 20, test_mode, test_limit);
+    
+    // SVM F1 for flat path (if --opt-svm)
+    SVMPool flat_svm_pool;
+    if(get_opt_config().svm) {
+        int f1_batch = std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE));
+        // For flat path: hash buffers need to hold all matches (~2^K entries)
+        int flat_max_entries = (1 << KSIZE) * 3 / 2 + 256;  // same as chunked max_bucket_size
+        flat_svm_pool.init(plotter.context, plotter.queue, plotter.device,
+                          flat_max_entries, MY_N_META, 64, 4096, f1_batch);
+        g_svmpools.push_back(&flat_svm_pool);
+    }
+    
+    plotter.compute_all_f1(plot_id, Y_all, M_all, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)), test_mode, test_limit);
     
     // Compute F2-F9 on CPU
     std::cout << "\n[CPU] Computing F2-F9..." << std::endl;
