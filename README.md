@@ -111,3 +111,17 @@ mmx_postool --file <plot.plot> --iter 20 --verbose
 - `test_pipeline.cpp` — verifies full F1→F9 pipeline for small k values
 - `verify_pd.cpp` — traces PD tree for debugging
 - `CMakeLists.txt` — build configuration
+
+## Kimi K2.6 Skeleton Review Notes
+
+Reviewed `mmx_opencl_plotter.zip` (Kimi K2.6's skeleton implementation).
+It implements Chia's algorithm, NOT MMX's — wrong crypto (ChaCha8 vs SHA-512),
+wrong matching (PARAM_BC/PARAM_B vs Y_R==Y_L+1), wrong table count (7 vs 9),
+no PD tree. Not usable directly.
+
+### Good ideas worth borrowing for optimization later:
+- **SVM (Shared Virtual Memory) dual-path memory pool** — could help avoid host↔device copies
+- **Async double-buffered pipeline** with ping-pong buffers + event chaining
+- **Device capability detection** with feature scaling (OpenCL 1.2 vs 2.0+)
+- **Multi-bucket-pair matching kernel** (`match_and_compute_multi`) — processes multiple bucket pairs in one launch
+- **Clean separation of kernels** into files (f1, sort, match, backprop, compress)

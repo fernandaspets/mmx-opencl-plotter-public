@@ -200,13 +200,26 @@ __kernel void hash_table_lr(
     __global uint* Y_out,           // [num_matches]
     __global uint* M_out,           // [num_matches * 14]
     const uint kmask,
-    const uint num_matches)
+    const uint num_matches,
+    const uint num_total_entries)
 {
     const uint gid = get_global_id(0);
     if(gid >= num_matches) return;
     
     uint P1 = LR_pairs[gid * 2];
     uint P2 = LR_pairs[gid * 2 + 1];
+    
+    if(P1 >= num_total_entries || P2 >= num_total_entries) {
+        Y_out[gid] = 0xFFFFFFFF;
+        for(int i = 0; i < 14; i++) M_out[gid * 14 + i] = 0;
+        return;
+    }
+
+    if(P1 >= num_total_entries || P2 >= num_total_entries) {
+        Y_out[gid] = 0xFFFFFFFF;
+        for(int i = 0; i < 14; i++) M_out[gid * 14 + i] = 0;
+        return;
+    }
     
     // Load L_meta and R_meta directly from M_curr
     __private uint L[14], R[14];

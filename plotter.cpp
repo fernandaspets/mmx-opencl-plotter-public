@@ -375,12 +375,14 @@ public:
         cl_mem Mb_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, num * MY_N_META * 4, nullptr, &err2);
         
         uint32_t num_u32 = (uint32_t)num;
+        uint32_t num_total_u32 = (uint32_t)(M_curr_flat.size() / MY_N_META);
         clSetKernelArg(hash_lr_kernel, 0, sizeof(cl_mem), &Mb);
         clSetKernelArg(hash_lr_kernel, 1, sizeof(cl_mem), &LRb);
         clSetKernelArg(hash_lr_kernel, 2, sizeof(cl_mem), &Yb);
         clSetKernelArg(hash_lr_kernel, 3, sizeof(cl_mem), &Mb_out);
         clSetKernelArg(hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
         clSetKernelArg(hash_lr_kernel, 5, sizeof(uint32_t), &num_u32);
+        clSetKernelArg(hash_lr_kernel, 6, sizeof(uint32_t), &num_total_u32);
         
         size_t global = num, local = 64;
         if(global % local) global = ((global/local)+1)*local;
@@ -730,7 +732,6 @@ void compute_full_pipeline(
         }
         
         // GPU hash: upload M_curr flat + LR pairs, kernel indexes directly
-        // No CPU meta extraction needed!
         std::vector<uint32_t> M_curr_flat(M_curr.size() * MY_N_META);
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < M_curr.size(); i++) {
@@ -745,15 +746,8 @@ void compute_full_pipeline(
             LR_flat[i * 2 + 1] = entries[all_lr[i].second].second;
         }
         
-        auto t_hash_start = my_time_ms();
-        
         std::vector<uint32_t> Y_results, M_results;
         gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
-        
-        auto t_hash_end = my_time_ms();
-        double meta_time = (t_hash_start - t_meta_start) / 1000.0;
-        double hash_time = (t_hash_end - t_hash_start) / 1000.0;
-        std::cerr << "[T" << t << "] meta=" << meta_time << "s hash=" << hash_time << "s             \r" << std::flush;
         
         // Convert to M_next format
         std::vector<std::array<uint32_t, 14>> M_next(total_matches);
@@ -1427,9 +1421,20 @@ void process_bucket_chunk(
     if(count_ynext > 0)
         std::memcpy(M_combined.data() + count_y * n_meta, meta_ynext, count_ynext * n_meta * 4);
     
-    // GPU hash
+    // GPU hash — extract L_meta and R_meta on CPU (old method, known working)
+    size_t num_matches = LR_flat.size() / 2;
+    std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
+    std::vector<uint32_t> R_meta_flat(num_matches * n_meta);
+    for(size_t i = 0; i < num_matches; i++) {
+        uint32_t P1 = LR_flat[i * 2];
+        uint32_t P2 = LR_flat[i * 2 + 1];
+        for(int j = 0; j < n_meta; j++) {
+            L_meta_flat[i * n_meta + j] = M_combined[P1 * n_meta + j];
+            R_meta_flat[i * n_meta + j] = M_combined[P2 * n_meta + j];
+        }
+    }
     std::vector<uint32_t> Y_out, M_out;
-    plotter.gpu_hash_table_lr(M_combined, LR_flat, Y_out, M_out, KMASK);
+    plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
     
     // Bucket new metadata → dst store
     std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
@@ -1486,6 +1491,7 @@ void process_bucket_gpu(
                   + num_sub * 4 * 2;  // counts + offsets
     if(needed > vram_available * 8 / 10) {
         // Fallback to CPU for this bucket
+        std::cout << "[WARN] VRAM low, falling back to CPU for bucket " << y << " table " << table << std::endl;
         process_bucket_chunk(plotter, src, dst, y, table);
         return;
     }
@@ -1629,6 +1635,21 @@ void process_bucket_gpu(
     
     uint32_t num_filt = LR_filtered.size() / 2;
     std::vector<uint32_t> pd_data(num_filt * 2);  // (global_sorted_pos, delta) per match
+    
+    if(table == 2) {
+        std::cerr << "DEBUG B0 T2: pos_map size=" << pos_map.size() << " total=" << total << std::endl;
+        std::cerr << "DEBUG B0 T2: LR_filtered[0]=" << LR_filtered[0] << " LR_filtered[1]=" << LR_filtered[1] << std::endl;
+        std::cerr << "DEBUG B0 T2: num_filt=" << num_filt << std::endl;
+        int found = 0, not_found = 0;
+        for(uint32_t i = 0; i < std::min((uint32_t)100, num_filt); i++) {
+            if(pos_map.find(LR_filtered[i * 2]) != pos_map.end()) found++; else not_found++;
+        }
+        std::cerr << "DEBUG B0 T2: found=" << found << " not_found=" << not_found << std::endl;
+        int cnt = 0;
+        for(auto& [k, v] : pos_map) {
+            if(cnt++ < 5) std::cerr << "  pos_map[" << k << "] = " << v << std::endl;
+        }
+    }
     for(uint32_t i = 0; i < num_filt; i++) {
         uint32_t left_orig = LR_filtered[i * 2];
         uint32_t right_orig = LR_filtered[i * 2 + 1];
@@ -1659,12 +1680,14 @@ void process_bucket_gpu(
     
     uint32_t kmask = KMASK;
     uint32_t num_filt_u32 = num_filt;
+    uint32_t total_u32_hash = total;  // total entries in C_combined
     clSetKernelArg(plotter.hash_lr_kernel, 0, sizeof(cl_mem), &C_in_buf);  // reuse C_in on GPU!
     clSetKernelArg(plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_filt_buf);
     clSetKernelArg(plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Y_out_buf);
     clSetKernelArg(plotter.hash_lr_kernel, 3, sizeof(cl_mem), &M_out_buf);
     clSetKernelArg(plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
     clSetKernelArg(plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_filt_u32);
+    clSetKernelArg(plotter.hash_lr_kernel, 6, sizeof(uint32_t), &total_u32_hash);
     
     size_t hash_global = num_filt;
     if(hash_global % 64) hash_global = ((hash_global / 64) + 1) * 64;
@@ -1889,28 +1912,62 @@ void build_plot_data_from_store(
     
     // Build PD for ALL tables (2..9) from pd_all
     // Each pd_all[t] has entries with (Y, sorted_pos, delta)
-    // Sort by Y — NO deduplication (PD must have one entry per match)
+    // where sorted_pos is the STORE-ORDER position in table t-1.
+    // 
+    // The Prover indexes PD[t] by the Y-sorted position in table t.
+    // And PD[t]'s position field must be the Y-sorted position in table t-1.
+    // 
+    // So we need to:
+    // 1. Sort pd_all[t] by (Y, sorted_pos) to get Y-sorted order for table t
+    // 2. Build a remap: store_pos -> Y_sorted_pos for table t-1
+    // 3. Apply remap to PD[t]'s position values
     plot.PD.resize(MY_N_TABLE + 1);
+    
+    // First, compute the Y-sorted order for ALL tables and build remap maps.
+    // remap[t-1][store_pos] = Y_sorted_index in table t-1
+    std::vector<std::unordered_map<uint32_t, uint32_t>> pos_remap(MY_N_TABLE + 1);
+    
     for(int t = 2; t <= MY_N_TABLE; t++) {
         if(t >= (int)pd_all.size() || pd_all[t].empty()) {
             plot.PD[t].clear();
             continue;
         }
         
-        // Sort pd_all[t] by Y
+        // Sort pd_all[t] by (Y, sorted_pos) — same key as final_Y and PD[9]
         std::vector<uint32_t> pd_indices(pd_all[t].size());
         for(size_t i = 0; i < pd_indices.size(); i++) pd_indices[i] = i;
         
         auto pd_sort = [&pd_all, t](uint32_t a, uint32_t b) {
+            if(pd_all[t][a].Y == pd_all[t][b].Y)
+                return pd_all[t][a].sorted_pos < pd_all[t][b].sorted_pos;
             return pd_all[t][a].Y < pd_all[t][b].Y;
         };
         std::sort(pd_indices.begin(), pd_indices.end(), pd_sort);
         
-        // Build PD[t] sorted by Y (NO deduplication)
+        // Build remap for THIS table: store_pos -> Y_sorted_index
+        // pd_all[t][pd_indices[i]].sorted_pos is the store position
+        // i is the Y-sorted index
+        // NOTE: for duplicate Y+sorted_pos, keep the first occurrence
+        for(size_t i = 0; i < pd_indices.size(); i++) {
+            uint32_t store_pos = pd_all[t][pd_indices[i]].sorted_pos;
+            if(pos_remap[t].find(store_pos) == pos_remap[t].end()) {
+                pos_remap[t][store_pos] = (uint32_t)i;
+            }
+        }
+        
+        // Build PD[t] sorted by Y, with remapped positions
         plot.PD[t].resize(pd_indices.size());
         for(size_t i = 0; i < pd_indices.size(); i++) {
             auto& pe = pd_all[t][pd_indices[i]];
-            plot.PD[t][i] = {pe.sorted_pos, pe.delta};
+            uint32_t remapped_pos = pe.sorted_pos;
+            // Remap position from store-order to Y-sorted order in table t-1
+            if(t > 2 && pos_remap[t-1].size() > 0) {
+                auto it = pos_remap[t-1].find(pe.sorted_pos);
+                if(it != pos_remap[t-1].end()) {
+                    remapped_pos = it->second;
+                }
+            }
+            plot.PD[t][i] = {remapped_pos, pe.delta};
         }
         
         std::cout << "[Plot] PD[" << t << "]: " << plot.PD[t].size() << " entries" << std::endl;
@@ -1953,6 +2010,7 @@ int main(int argc, char** argv)
     bool use_ramdisk = false;
     bool use_chunked = false;
 bool gpu_yield = true;
+    bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
     if(argc < 3) {
@@ -1981,6 +2039,7 @@ std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
 else if(arg == "--no-yield") gpu_yield = false;
+        else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
             use_ramdisk = true;
             final_dir = output_dir;
@@ -2081,6 +2140,42 @@ std::vector<std::vector<PDEntry>> pd_all;
         std::cout << "\n[Plot] Building plot data from bucket store..." << std::endl;
         PlotData plot;
         build_plot_data_from_store(store, plot, pd_all, x_pairs_all);
+    
+    if(dump_pd) {
+        for(int t = 2; t <= MY_N_TABLE; t++) {
+            std::string fname = "/tmp/pd_chunked_T" + std::to_string(t) + ".txt";
+            std::ofstream f(fname);
+            f << "T" << t << " PD entries: " << plot.PD[t].size() << "\n";
+            // Show pd_all[t] raw data
+            if(t < (int)pd_all.size() && !pd_all[t].empty()) {
+                f << "pd_all[" << t << "] raw entries: " << pd_all[t].size() << "\n";
+                size_t lim = std::min((size_t)50, pd_all[t].size());
+                for(size_t i = 0; i < lim; i++) {
+                    f << "  pd_all[" << t << "][" << i << "] = (Y=" << pd_all[t][i].Y 
+                      << ", sorted_pos=" << pd_all[t][i].sorted_pos 
+                      << ", delta=" << pd_all[t][i].delta << ")\n";
+                }
+            }
+            f << "\nplot.PD[" << t << "] entries: " << plot.PD[t].size() << "\n";
+            size_t lim = std::min((size_t)50, plot.PD[t].size());
+            for(size_t i = 0; i < lim; i++) {
+                f << "  PD[" << t << "][" << i << "] = (pos=" << plot.PD[t][i].first 
+                  << ", delta=" << plot.PD[t][i].second << ")\n";
+            }
+            f.close();
+            std::cout << "[Dump] Wrote " << fname << std::endl;
+        }
+        std::ofstream fy("/tmp/pd_chunked_finalY.txt");
+        fy << "final_Y entries: " << plot.final_Y.size() << "\n";
+        size_t lim = std::min((size_t)50, plot.final_Y.size());
+        for(size_t i = 0; i < lim; i++) fy << "  Y[" << i << "] = " << plot.final_Y[i] << "\n";
+        fy.close();
+        std::ofstream fx("/tmp/pd_chunked_Xpairs.txt");
+        fx << "X_pairs entries: " << plot.X_pairs.size() << "\n";
+        lim = std::min((size_t)50, plot.X_pairs.size());
+        for(size_t i = 0; i < lim; i++) fx << "  X[" << i << "] = (" << plot.X_pairs[i].first << ", " << plot.X_pairs[i].second << ")\n";
+        fx.close();
+    }
         
         // Write plot file
         std::cout << "\n[Plot] Writing plot file..." << std::endl;
@@ -2127,6 +2222,31 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     PlotData plot;
     compute_full_pipeline(X_values, Y_all, M_all, plot, plotter);
+    
+    if(dump_pd) {
+        for(int t = 2; t <= MY_N_TABLE; t++) {
+            std::string fname = "/tmp/pd_flat_T" + std::to_string(t) + ".txt";
+            std::ofstream f(fname);
+            f << "T" << t << " PD entries: " << plot.PD[t].size() << "\n";
+            size_t lim = std::min((size_t)50, plot.PD[t].size());
+            for(size_t i = 0; i < lim; i++) {
+                f << "  PD[" << t << "][" << i << "] = (pos=" << plot.PD[t][i].first 
+                  << ", delta=" << plot.PD[t][i].second << ")\n";
+            }
+            f.close();
+            std::cout << "[Dump] Wrote " << fname << std::endl;
+        }
+        std::ofstream fy("/tmp/pd_flat_finalY.txt");
+        fy << "final_Y entries: " << plot.final_Y.size() << "\n";
+        size_t lim = std::min((size_t)50, plot.final_Y.size());
+        for(size_t i = 0; i < lim; i++) fy << "  Y[" << i << "] = " << plot.final_Y[i] << "\n";
+        fy.close();
+        std::ofstream fx("/tmp/pd_flat_Xpairs.txt");
+        fx << "X_pairs entries: " << plot.X_pairs.size() << "\n";
+        lim = std::min((size_t)50, plot.X_pairs.size());
+        for(size_t i = 0; i < lim; i++) fx << "  X[" << i << "] = (" << plot.X_pairs[i].first << ", " << plot.X_pairs[i].second << ")\n";
+        fx.close();
+    }
     
     auto t1 = my_time_ms();
     std::cout << "[CPU] F2-F9 done in " << (t1 - t0) / 1000.0 << " sec" << std::endl;
