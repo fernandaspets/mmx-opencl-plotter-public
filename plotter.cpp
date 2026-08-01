@@ -1512,19 +1512,25 @@ void compute_f1_chunked_multi_gpu(
         M_bufs[g].resize(batch_size * n_meta);
     }
     
-    // Process batches in pairs (or singles if 1 GPU)
+    // Process batches in pairs — use threads to overlap GPU computation
     for(uint32_t b = 0; b < num_batches; b += g_num_gpus) {
-        // Submit batches to all GPUs
+        // Submit batches to all GPUs concurrently via threads
+        std::vector<std::future<void>> futs;
         for(int g = 0; g < g_num_gpus && b + g < num_batches; g++) {
             OCL_Plotter& active_pl = (g < (int)g_plotters.size()) ? *g_plotters[g] : plotter;
             const uint32_t start = (b + g) * batch_size;
             const uint32_t count = std::min((uint32_t)batch_size, (uint32_t)(total_entries - start));
             for(uint32_t i = 0; i < count; i++) X_bufs[g][i] = start + i;
             X_bufs[g].resize(count);
-            active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+            // Launch on thread — each thread uses its own GPU's queue
+            futs.push_back(std::async(std::launch::async, [&active_pl, g, &X_bufs, &plot_id, &Y_bufs, &M_bufs]() {
+                active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+            }));
         }
+        // Wait for all GPUs to finish
+        for(auto& f : futs) f.wait();
         
-        // Collect results from all GPUs into store
+        // Collect results from all GPUs into store (single-threaded, no race)
         for(int g = 0; g < g_num_gpus && b + g < num_batches; g++) {
             const uint32_t count = X_bufs[g].size();
             std::vector<std::vector<uint32_t>> batch_buckets(num_buckets);
