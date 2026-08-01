@@ -48,6 +48,7 @@ class OCL_Plotter;  // forward declaration
 std::vector<OCL_Plotter*> g_plotters;
 std::vector<BufferPool*> g_bufpools;
 int g_num_gpus = 1;
+std::mutex g_dst_mutex;  // protects dst store writes in multi-GPU mode
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -2072,10 +2073,19 @@ void process_bucket_gpu(
     for(int b = 0; b < dst.num_buckets; b++) {
         if(dst_batch[b].empty()) continue;
         uint32_t cnt = dst_batch[b].size() / n_meta;
-        dst.append(b, dst_batch[b].data(), cnt);
-        dst.append_pd(b, dst_pd_batch[b].data(), cnt);
-        if(table == 2 && !dst_xp_batch[b].empty()) {
-            dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
+        if(g_num_gpus > 1) {
+            std::lock_guard<std::mutex> lock(g_dst_mutex);
+            dst.append(b, dst_batch[b].data(), cnt);
+            dst.append_pd(b, dst_pd_batch[b].data(), cnt);
+            if(table == 2 && !dst_xp_batch[b].empty()) {
+                dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
+            }
+        } else {
+            dst.append(b, dst_batch[b].data(), cnt);
+            dst.append_pd(b, dst_pd_batch[b].data(), cnt);
+            if(table == 2 && !dst_xp_batch[b].empty()) {
+                dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
+            }
         }
     }
     
