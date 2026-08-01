@@ -31,11 +31,16 @@ struct BufferPool {
     
     bool initialized = false;
     
-    // Module F: Mapped host pointers for zero-copy access
-    void* mapped_C_in = nullptr;
-    void* mapped_LR = nullptr;
-    void* mapped_Y = nullptr;
-    void* mapped_M = nullptr;
+    // Module G: Pinned host buffers (CL_MEM_ALLOC_HOST_PTR)
+    // Page-locked memory enables async DMA — GPU pulls data without CPU involvement
+    cl_mem pinned_C_in = nullptr;    // pinned host buffer for metadata input
+    void* pinned_C_in_ptr = nullptr;  // mapped pointer for writing
+    cl_mem pinned_LR = nullptr;       // pinned host buffer for LR pairs output
+    void* pinned_LR_ptr = nullptr;
+    cl_mem pinned_Y = nullptr;        // pinned host buffer for hash Y output
+    void* pinned_Y_ptr = nullptr;
+    cl_mem pinned_M = nullptr;        // pinned host buffer for hash M output
+    void* pinned_M_ptr = nullptr;
     
     void init(cl_context ctx, cl_command_queue q, 
               int max_bucket_size, int n_meta, int num_sub, int max_bs2) {
@@ -73,8 +78,29 @@ struct BufferPool {
         M_hash_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
             max_matches * n_meta * 4, nullptr, &err);
         
+        // Module G: Pinned host buffers for async DMA
+        // CL_MEM_ALLOC_HOST_PTR: page-locked memory, GPU can DMA directly
+        pinned_C_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
+            max_bucket_size * n_meta * 4, nullptr, &err);
+        pinned_LR = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
+            max_total * 4 * 8, nullptr, &err);
+        pinned_Y = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
+            max_matches * 4, nullptr, &err);
+        pinned_M = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
+            max_matches * n_meta * 4, nullptr, &err);
+        
+        // Map pinned buffers to get host pointers (persistent mapping)
+        pinned_C_in_ptr = clEnqueueMapBuffer(queue, pinned_C_in, CL_TRUE, CL_MAP_WRITE,
+            0, max_bucket_size * n_meta * 4, 0, nullptr, nullptr, &err);
+        pinned_LR_ptr = clEnqueueMapBuffer(queue, pinned_LR, CL_TRUE, CL_MAP_READ,
+            0, max_total * 4 * 8, 0, nullptr, nullptr, &err);
+        pinned_Y_ptr = clEnqueueMapBuffer(queue, pinned_Y, CL_TRUE, CL_MAP_READ,
+            0, max_matches * 4, 0, nullptr, nullptr, &err);
+        pinned_M_ptr = clEnqueueMapBuffer(queue, pinned_M, CL_TRUE, CL_MAP_READ,
+            0, max_matches * n_meta * 4, 0, nullptr, nullptr, &err);
+        
         initialized = true;
-        std::cout << "[OCL] Buffer pool initialized (reusable buffers)" << std::endl;
+        std::cout << "[OCL] Buffer pool initialized (pinned memory enabled)" << std::endl;
     }
     
     void cleanup() {
@@ -90,6 +116,15 @@ struct BufferPool {
         clReleaseMemObject(R_gathered);
         clReleaseMemObject(Y_hash_buf);
         clReleaseMemObject(M_hash_buf);
+        // Unmap and release pinned buffers
+        if(pinned_C_in_ptr) { clEnqueueUnmapMemObject(queue, pinned_C_in, pinned_C_in_ptr, 0, nullptr, nullptr); pinned_C_in_ptr = nullptr; }
+        if(pinned_LR_ptr) { clEnqueueUnmapMemObject(queue, pinned_LR, pinned_LR_ptr, 0, nullptr, nullptr); pinned_LR_ptr = nullptr; }
+        if(pinned_Y_ptr) { clEnqueueUnmapMemObject(queue, pinned_Y, pinned_Y_ptr, 0, nullptr, nullptr); pinned_Y_ptr = nullptr; }
+        if(pinned_M_ptr) { clEnqueueUnmapMemObject(queue, pinned_M, pinned_M_ptr, 0, nullptr, nullptr); pinned_M_ptr = nullptr; }
+        clReleaseMemObject(pinned_C_in);
+        clReleaseMemObject(pinned_LR);
+        clReleaseMemObject(pinned_Y);
+        clReleaseMemObject(pinned_M);
         initialized = false;
     }
 };

@@ -40,9 +40,12 @@ struct OptConfig {
     // Module F: Zero-copy / pinned memory (CL_MEM_ALLOC_HOST_PTR + map/unmap)
     bool zero_copy = false;
     
+    // Module G: Pinned memory (CL_MEM_ALLOC_HOST_PTR) for async DMA
+    bool pinned = false;
+    
     // Helper: any optimization enabled?
     bool any_enabled() const {
-        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool || zero_copy;
+        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool || zero_copy || pinned;
     }
     
     // Print current config
@@ -55,6 +58,7 @@ struct OptConfig {
         std::cout << "  fuse_kernels:   " << (fuse_kernels ? "ON" : "off") << std::endl;
         std::cout << "  bufpool:        " << (bufpool ? "ON" : "off") << std::endl;
         std::cout << "  zero_copy:     " << (zero_copy ? "ON" : "off") << std::endl;
+        std::cout << "  pinned:        " << (pinned ? "ON" : "off") << std::endl;
     }
 };
 

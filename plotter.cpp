@@ -2205,9 +2205,17 @@ BucketPending submit_bucket_pipeline(
         p.LR_buf = active_pool->LR_buf;
         p.PD_match_buf = active_pool->PD_match_buf;
         p.num_matches_buf = active_pool->num_matches_buf;
-        // Non-blocking write — scatter kernel will wait for it via in-order queue
-        clEnqueueWriteBuffer(q, p.C_in_buf, CL_FALSE, 0,
-            p.count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
+        
+        if(get_opt_config().pinned && active_pool->pinned_C_in_ptr) {
+            // Module G: Write to pinned host buffer, then async DMA to GPU
+            std::memcpy(active_pool->pinned_C_in_ptr, meta_y, p.count_y * n_meta * 4);
+            clEnqueueWriteBuffer(q, p.C_in_buf, CL_FALSE, 0,
+                p.count_y * n_meta * 4, active_pool->pinned_C_in_ptr, 0, nullptr, nullptr);
+        } else {
+            // Regular write (blocking or non-blocking depending on flags)
+            clEnqueueWriteBuffer(q, p.C_in_buf, CL_FALSE, 0,
+                p.count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
+        }
     } else {
         p.C_in_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             p.C_combined.size() * 4, (void*)p.C_combined.data(), &err);
@@ -2324,9 +2332,16 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
         return;
     }
 
-    // Read LR pairs (blocking — need size-dependent data for PD computation)
+    // Read LR pairs
     p.LR_filtered.resize(p.gpu_matches * 2);
-    clEnqueueReadBuffer(q, p.LR_buf, CL_TRUE, 0, p.gpu_matches * 8, p.LR_filtered.data(), 0, nullptr, nullptr);
+    if(get_opt_config().pinned && p.active_pool && p.active_pool->pinned_LR_ptr) {
+        // Module G: Async read to pinned buffer, then copy to LR_filtered
+        clEnqueueReadBuffer(q, p.LR_buf, CL_TRUE, 0, p.gpu_matches * 8,
+            p.active_pool->pinned_LR_ptr, 0, nullptr, nullptr);
+        std::memcpy(p.LR_filtered.data(), p.active_pool->pinned_LR_ptr, p.gpu_matches * 8);
+    } else {
+        clEnqueueReadBuffer(q, p.LR_buf, CL_TRUE, 0, p.gpu_matches * 8, p.LR_filtered.data(), 0, nullptr, nullptr);
+    }
 
     // Compute PD (CPU work)
     p.bucket_offset = 0;
@@ -2402,8 +2417,18 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
         // Non-blocking reads of Y + M results — ev_hash_done guards both (in-order queue)
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        clEnqueueReadBuffer(q, p.Yb, CL_TRUE, 0, p.num_matches * 4, p.Y_out.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(q, p.Mb, CL_TRUE, 0, p.num_matches * MY_N_META * 4, p.M_out.data(), 0, nullptr, nullptr);
+        if(get_opt_config().pinned && p.active_pool && p.active_pool->pinned_Y_ptr) {
+            // Module G: Read to pinned buffers (fast DMA), then copy
+            clEnqueueReadBuffer(q, p.Yb, CL_TRUE, 0, p.num_matches * 4,
+                p.active_pool->pinned_Y_ptr, 0, nullptr, nullptr);
+            clEnqueueReadBuffer(q, p.Mb, CL_TRUE, 0, p.num_matches * MY_N_META * 4,
+                p.active_pool->pinned_M_ptr, 0, nullptr, nullptr);
+            std::memcpy(p.Y_out.data(), p.active_pool->pinned_Y_ptr, p.num_matches * 4);
+            std::memcpy(p.M_out.data(), p.active_pool->pinned_M_ptr, p.num_matches * MY_N_META * 4);
+        } else {
+            clEnqueueReadBuffer(q, p.Yb, CL_TRUE, 0, p.num_matches * 4, p.Y_out.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(q, p.Mb, CL_TRUE, 0, p.num_matches * MY_N_META * 4, p.M_out.data(), 0, nullptr, nullptr);
+        }
     } else {
         // CPU-extract path (blocking, no event)
         std::vector<uint32_t> L_meta_flat(p.num_matches * n_meta);
@@ -3134,6 +3159,7 @@ std::cerr << "  --opt-async     Module D: Async PCIe transfers" << std::endl;
 std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buckets)" << std::endl;
 std::cerr << "  --opt-bufpool   Module C: Pre-allocated reusable GPU buffers" << std::endl;
 std::cerr << "  --opt-zero-copy Module F: Pinned memory + map/unmap (zero-copy)" << std::endl;
+std::cerr << "  --opt-pinned   Module G: Pinned host memory (async DMA)" << std::endl;
 std::cerr << "  --timing        Show per-step timing for first bucket of each table" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
@@ -3162,6 +3188,7 @@ else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::
 else if(arg == "--timing") timing_detail = true;
 else if(arg == "--opt-bufpool") get_opt_config().bufpool = true;
 else if(arg == "--opt-zero-copy") get_opt_config().zero_copy = true;
+else if(arg == "--opt-pinned") get_opt_config().pinned = true;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
