@@ -4017,6 +4017,7 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
             // (init_gpu_kernels called later in chunked path)
             g_plotters.push_back(p2);
             std::cout << "[OCL] Multi-GPU: added device [" << (dev_idx + g) % nd << "] as GPU " << g << std::endl;
+            std::cout << "[OCL] g_plotters.size()=" << g_plotters.size() << " g_num_gpus=" << g_num_gpus << std::endl;
         }
     }
     
@@ -4168,11 +4169,13 @@ std::vector<std::vector<PDEntry>> pd_all;
         g_svmpools.push_back(&flat_svm_pool);
         // Additional GPU pools
         for(int g = 1; g < ngpus && g < (int)g_plotters.size(); g++) {
+            std::cout << "[OCL] Setting up SVM pool for GPU " << g << "..." << std::endl;
             SVMPool sp;
             sp.init(g_plotters[g]->context, g_plotters[g]->queue, g_plotters[g]->device,
                    per_gpu_entries, MY_N_META, 64, 4096, f1_batch);
             flat_multi_svm.push_back(std::move(sp));
             g_svmpools.push_back(&flat_multi_svm.back());
+            std::cout << "[OCL] SVM pool for GPU " << g << " ready (g_svmpools.size=" << g_svmpools.size() << ")" << std::endl;
         }
     }
     
