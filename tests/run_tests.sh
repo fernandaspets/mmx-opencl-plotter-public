@@ -236,14 +236,14 @@ if [ "$BUILD_ONLY" != "true" ]; then
         BEST_PCT="0"
         for run in 1 2 3 4 5; do
             PLOT_ID=$(python3 -c "import os; print(os.urandom(32).hex())")
-            rm -f /mnt/ramdisk/plot-mmx-hdd-k18-*.plot 2>/dev/null
+            rm -f /dev/shm/plotram/plot-mmx-hdd-k18-*.plot 2>/dev/null
             
             cd "$BUILD_DIR"
             LD_LIBRARY_PATH=/opt/rocm/lib ./mmx_opencl_plotter "$PLOT_ID" \
                 "02292cd11aa18e5f64344cbe6c580249364dfe5a3683adc25446aadcc1b38555d7" \
-                /mnt/ramdisk/ --k 18 > /dev/null 2>&1
+                /dev/shm/plotram/ --k 18 > /dev/null 2>&1
             
-            PLOTFILE=$(ls /mnt/ramdisk/plot-mmx-hdd-k18-*.plot 2>/dev/null | head -1)
+            PLOTFILE=$(ls /dev/shm/plotram/plot-mmx-hdd-k18-*.plot 2>/dev/null | head -1)
             
             if [ -n "$PLOTFILE" ]; then
                 cd "$MMX_NODE"
@@ -273,12 +273,12 @@ if [ "$BUILD_ONLY" != "true" ]; then
 
     # Generate PD dump with flat pipeline
     PLOT_ID=$(python3 -c "import os; print(os.urandom(32).hex())")
-    rm -f /tmp/pd_flat_*.txt /mnt/ramdisk/plot-mmx-hdd-k18-*.plot 2>/dev/null
+    rm -f /tmp/pd_flat_*.txt /dev/shm/plotram/plot-mmx-hdd-k18-*.plot 2>/dev/null
     
     cd "$BUILD_DIR"
     LD_LIBRARY_PATH=/opt/rocm/lib ./mmx_opencl_plotter "$PLOT_ID" \
         "02292cd11aa18e5f64344cbe6c580249364dfe5a3683adc25446aadcc1b38555d7" \
-        /mnt/ramdisk/ --k 18 --dump-pd 2>&1 | grep -q "Done"
+        /dev/shm/plotram/ --k 18 --dump-pd 2>&1 | grep -q "Done"
     
     cd "$TESTS_DIR"
     PD_RESULT=$(python3 test_pd_chain.py flat 2>&1)
@@ -324,9 +324,9 @@ FARMER_KEY="02292cd11aa18e5f64344cbe6c580249364dfe5a3683adc25446aadcc1b38555d7"
 BEST_PCT=0
 for run in 1 2 3 4 5; do
     PLOT_ID=$(python3 -c "import os; print(os.urandom(32).hex())")
-    rm -f /mnt/ramdisk/plot-mmx-hdd-k18-*.plot
-    LD_LIBRARY_PATH=/opt/rocm/lib "$BUILD_DIR/mmx_opencl_plotter" "$PLOT_ID" "$FARMER_KEY" /mnt/ramdisk/ --k 18 --chunked > /dev/null 2>&1
-    PLOTFILE=$(ls /mnt/ramdisk/plot-mmx-hdd-k18-*.plot 2>/dev/null | head -1)
+    rm -f /dev/shm/plotram/plot-mmx-hdd-k18-*.plot
+    LD_LIBRARY_PATH=/opt/rocm/lib "$BUILD_DIR/mmx_opencl_plotter" "$PLOT_ID" "$FARMER_KEY" /dev/shm/plotram/ --k 18 --chunked > /dev/null 2>&1
+    PLOTFILE=$(ls /dev/shm/plotram/plot-mmx-hdd-k18-*.plot 2>/dev/null | head -1)
     if [ -z "$PLOTFILE" ]; then continue; fi
     RESULT=$(cd ~/mmx-node && LD_LIBRARY_PATH=/opt/rocm/lib ./build_opencl/tools/mmx_postool -f "$PLOTFILE" -n 20 -v 2>&1 | grep "Pass:")
     PCT=$(echo "$RESULT" | grep -oP '\d+(?=\s*%)' | head -1)
@@ -334,7 +334,7 @@ for run in 1 2 3 4 5; do
         BEST_PCT=$PCT
         BEST_RESULT="$RESULT"
     fi
-    rm -f /mnt/ramdisk/plot-mmx-hdd-k18-*.plot
+    rm -f /dev/shm/plotram/plot-mmx-hdd-k18-*.plot
 done
 if [ "$BEST_PCT" -ge 30 ]; then
     result pass "Chunked pipeline k18: best of 5 = ${BEST_PCT}% pass rate (>=30%)"
