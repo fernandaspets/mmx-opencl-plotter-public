@@ -244,6 +244,12 @@ public:
         cl_int werr;
         gen_mem_kernel = clCreateKernel(program, "gen_mem_array_v2_kernel", &werr);
         calc_memhash_kernel = clCreateKernel(program, "calc_mem_hash_v2_kernel", &werr);
+        // Try warp-parallel version (32 threads/entry)
+        cl_kernel warp_memhash = clCreateKernel(program, "calc_mem_hash_warp_kernel", &werr);
+        if(warp_memhash) {
+            calc_memhash_kernel = warp_memhash;  // Use warp version if available
+            std::cout << "[OCL] Using warp-parallel calc_mem_hash (32 threads/entry)" << std::endl;
+        }
         scatter_f1_kernel = clCreateKernel(program, "scatter_f1_v2_kernel", &werr);
         if(gen_mem_kernel && calc_memhash_kernel && scatter_f1_kernel) {
             f1_warp_loaded = true;
@@ -377,10 +383,19 @@ public:
                 clFinish(queue);  // Finish before next kernel to prevent TDR
             }
             
-            // Kernel 2: calc_mem_hash (32 work-items per entry = 1 subgroup)
-            // 4 subgroups per work-group = 128 work-items
+            // Kernel 2: calc_mem_hash
+            // Warp version: 32 work-items per entry, 4 subgroups per WG = 128 local
+            // Sequential version: 1 work-item per entry, 256 local
             {
-                size_t global = count, local = 256;
+                size_t global, local;
+                // Check if using warp kernel (32 threads/entry)
+                std::string kname; kname.resize(128);
+                clGetKernelInfo(calc_memhash_kernel, CL_KERNEL_FUNCTION_NAME, kname.size(), &kname[0], nullptr);
+                if(kname.find("warp") != std::string::npos) {
+                    global = count * 32; local = 128;
+                } else {
+                    global = count; local = 256;
+                }
                 if(global % local) global = ((global / local) + 1) * local;
                 uint32_t num_iter = 256;
                 clSetKernelArg(calc_memhash_kernel, 0, sizeof(cl_mem), &mem_buf);

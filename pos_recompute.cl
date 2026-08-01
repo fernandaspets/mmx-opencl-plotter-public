@@ -487,3 +487,76 @@ void scatter_f1_v2_kernel(
 		M_out[entry * N_META + i] = hash16[i] & kmask;
 	}
 }
+
+/* === Warp-parallel calc_mem_hash === */
+/* 32 work-items per entry. 4 subgroups per work-group (128 work-items). */
+/* Uses shared memory + manual tree reduction (no sub_group ops needed). */
+__kernel
+void calc_mem_hash_warp_kernel(
+	__global const uint* mem_in,
+	__global uint* hash_out,
+	const uint batch_size,
+	const uint num_iter)
+{
+	const uint wg_local = get_local_id(0);   /* 0..127 */
+	const uint sg_slot = wg_local / 32;      /* 0..3 */
+	const uint sgid = wg_local % 32;         /* 0..31 */
+	const uint entry = get_global_id(0) / 32;
+	if(entry >= batch_size) return;
+
+	const uint N = 32;
+
+	__local uint lmem[4][32 * 32];
+	__local uint reduce_buf[4][32];
+
+	/* Load mem: each thread loads 1 element per row */
+	for(int row = 0; row < 32; row++) {
+		lmem[sg_slot][row * 32 + sgid] = mem_in[(row * batch_size + entry) * 32 + sgid];
+	}
+
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	uint state = lmem[sg_slot][(N - 1) * 32 + sgid];
+
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for(int iter = 0; iter < num_iter; iter++)
+	{
+		/* Each thread rotates its element */
+		uint sum = rotl32(state, sgid % 32);
+
+		/* Manual tree reduction using local memory */
+		reduce_buf[sg_slot][sgid] = sum;
+		barrier(CLK_LOCAL_MEM_FENCE);
+		for(int offset = 16; offset > 0; offset /= 2) {
+			if(sgid < offset) {
+				reduce_buf[sg_slot][sgid] += reduce_buf[sg_slot][sgid + offset];
+			}
+			barrier(CLK_LOCAL_MEM_FENCE);
+		}
+		sum = reduce_buf[sg_slot][0];
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		/* Thread 0 computes dir, broadcast via reduce_buf */
+		if(sgid == 0) {
+			reduce_buf[sg_slot][0] = sum + (sum << 11) + (sum << 22);
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+		uint dir = reduce_buf[sg_slot][0];
+
+		const uint bits = (dir >> 22) & 31;
+		const uint offset = (dir >> 27) & 31;
+
+		/* Update state */
+		state += rotl32(lmem[sg_slot][offset * 32 + ((iter + sgid) & 31)], bits) ^ sum;
+
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		/* Write state back to lmem */
+		atomic_xor(&lmem[sg_slot][offset * 32 + sgid], state);
+
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+	hash_out[entry * 32 + sgid] = state;
+}
