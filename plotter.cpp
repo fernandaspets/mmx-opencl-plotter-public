@@ -2643,8 +2643,7 @@ BucketPending submit_bucket_svm(
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
     clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
 
-    // Read match count (blocking — need it to proceed)
-    clFinish(q);  // ensure match kernel completed
+    // Read match count — clEnqueueSVMMap(CL_TRUE) blocks until all prior queue commands complete
     clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
     p.gpu_matches = *(uint32_t*)p.svm_num_matches;
     clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
@@ -2733,12 +2732,10 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         size_t hash_global = p.num_matches, hash_local = 64;
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
         clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
-        clFinish(q);
         
-        // Read Y + M from SVM
+        // Read Y + M from SVM — clEnqueueSVMMap(CL_TRUE) is the sync point
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        clFinish(q);  // ensure hash kernel completed
         clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_Y_hash, p.num_matches * 4, 0, nullptr, nullptr);
         std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
         clEnqueueSVMUnmap(q, p.svm_Y_hash, 0, nullptr, nullptr);
