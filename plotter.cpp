@@ -39,6 +39,12 @@ extern bool timing_detail;
 
 // Global buffer pool (Module C) — initialized in compute_f2_f9_chunked
 BufferPool* g_bufpool = nullptr;
+
+// Multi-GPU support (Module E)
+class OCL_Plotter;  // forward declaration
+std::vector<OCL_Plotter*> g_plotters;
+std::vector<BufferPool*> g_bufpools;
+int g_num_gpus = 1;
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1691,6 +1697,12 @@ void process_bucket_gpu(
     uint32_t count_y = src.counts[y];
     if(count_y == 0) return;
     
+    // Multi-GPU: select plotter + buffer pool for this bucket
+    OCL_Plotter& active_plotter = (g_num_gpus > 1 && g_plotters.size() > 1) ? 
+        *g_plotters[y % g_num_gpus] : plotter;
+    BufferPool* active_pool = (g_num_gpus > 1 && g_bufpools.size() > 1) ? 
+        g_bufpools[y % g_num_gpus] : g_bufpool;
+    
     const uint32_t* meta_y = src.buckets[y].data();
     
     // Process this bucket. Cross-boundary matching is handled separately
@@ -1700,7 +1712,7 @@ void process_bucket_gpu(
     
     // Safety: check VRAM availability
     size_t vram_available = 0;
-    clGetDeviceInfo(plotter.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(vram_available), &vram_available, nullptr);
+    clGetDeviceInfo(active_plotter.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(vram_available), &vram_available, nullptr);
     size_t needed = (size_t)total * n_meta * 4  // C_in
                   + (size_t)num_sub * max_bs2 * 8  // PY_tmp
                   + (size_t)total * 8  // LR
@@ -1737,36 +1749,37 @@ void process_bucket_gpu(
     std::memcpy(C_combined.data(), meta_y, count_y * n_meta * 4);
     
     cl_mem C_in_buf, PY_buf, sub_cnt_buf, sub_off_buf, LR_buf, PD_match_buf, num_matches_buf;
-    bool using_pool = (g_bufpool != nullptr && g_bufpool->initialized);
-    bool pool_release_skip = false;  // if true, don't release at end (pool owns them)
+    
+    bool using_pool = (active_pool != nullptr && active_pool->initialized);
+    bool pool_release_skip = false;
     
     // Module E: Use per-bucket queue for multi-queue pipelining
-    cl_command_queue& q = plotter.get_queue(y);
+    cl_command_queue& q = active_plotter.get_queue(y);
     
     if(using_pool) {
         // Module C: Reuse pre-allocated buffers — just write data, no create/destroy
-        C_in_buf = g_bufpool->C_in_buf;
+        C_in_buf = active_pool->C_in_buf;
         clEnqueueWriteBuffer(q, C_in_buf, CL_TRUE, 0,
             count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
         
-        PY_buf = g_bufpool->PY_buf;
-        sub_cnt_buf = g_bufpool->sub_cnt_buf;
+        PY_buf = active_pool->PY_buf;
+        sub_cnt_buf = active_pool->sub_cnt_buf;
         clEnqueueFillBuffer(q, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
         
-        LR_buf = g_bufpool->LR_buf;
-        PD_match_buf = g_bufpool->PD_match_buf;
-        num_matches_buf = g_bufpool->num_matches_buf;
+        LR_buf = active_pool->LR_buf;
+        PD_match_buf = active_pool->PD_match_buf;
+        num_matches_buf = active_pool->num_matches_buf;
         
         pool_release_skip = true;  // pool will clean these up
     } else {
-        C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        C_in_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             C_combined.size() * 4, (void*)C_combined.data(), &err);
         CL_CHECK(err, "C_in_buf creation");
         
-        PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+        PY_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE,
             (size_t)num_sub * max_bs2 * 8, nullptr, &err);
         CL_CHECK(err, "PY_buf creation");
-        sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+        sub_cnt_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE,
             num_sub * 4, nullptr, &err);
         CL_CHECK(err, "sub_cnt_buf creation");
         clEnqueueFillBuffer(q, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
@@ -1775,37 +1788,37 @@ void process_bucket_gpu(
     
     uint32_t total_u32 = total;
     uint32_t max_bs2_u32 = max_bs2;
-    clSetKernelArg(plotter.k_scatter2, 0, sizeof(cl_mem), &PY_buf);
-    clSetKernelArg(plotter.k_scatter2, 1, sizeof(cl_mem), &sub_cnt_buf);
-    clSetKernelArg(plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);  // Y_in=null → compute from C_in
-    clSetKernelArg(plotter.k_scatter2, 3, sizeof(cl_mem), &C_in_buf);
-    clSetKernelArg(plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
-    clSetKernelArg(plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
+    clSetKernelArg(active_plotter.k_scatter2, 0, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 1, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);  // Y_in=null → compute from C_in
+    clSetKernelArg(active_plotter.k_scatter2, 3, sizeof(cl_mem), &C_in_buf);
+    clSetKernelArg(active_plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
+    clSetKernelArg(active_plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
     
     size_t scatter_global = total;
     if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
-    clEnqueueNDRangeKernel(q, plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, active_plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
     print_step("scatter");
     
     // Step 3: Prefix sum of sub-bucket counts
-    if(using_pool) sub_off_buf = g_bufpool->sub_off_buf;
+    if(using_pool) sub_off_buf = active_pool->sub_off_buf;
     
-    if(get_opt_config().gpu_prefix_sum && plotter.prefix_sum_kernel) {
+    if(get_opt_config().gpu_prefix_sum && active_plotter.prefix_sum_kernel) {
         // Module A: GPU prefix sum — no readback needed (except last element for overflow check)
         if(!using_pool) {
-            sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+            sub_off_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE,
                 (num_sub + 1) * 4, nullptr, &err);
             CL_CHECK(err, "sub_off_buf (gpu prefix)");
         }
         
         uint32_t num_sub_u32 = (uint32_t)num_sub;
-        clSetKernelArg(plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &sub_cnt_buf);
-        clSetKernelArg(plotter.prefix_sum_kernel, 1, sizeof(cl_mem), &sub_off_buf);
-        clSetKernelArg(plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);  // local memory
-        clSetKernelArg(plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &num_sub_u32);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &sub_cnt_buf);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 1, sizeof(cl_mem), &sub_off_buf);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);  // local memory
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &num_sub_u32);
         
         size_t ps_global = num_sub, ps_local = num_sub;
-        clEnqueueNDRangeKernel(q, plotter.prefix_sum_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, active_plotter.prefix_sum_kernel, 1, nullptr,
             &ps_global, &ps_local, 0, nullptr, nullptr);
         print_step("gpu_prefix_sum");
         // No overflow check readback — saves ~500us of latency per bucket.
@@ -1826,7 +1839,7 @@ void process_bucket_gpu(
         }
         
         if(!using_pool) {
-            sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            sub_off_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                 (num_sub + 1) * 4, (void*)sub_off.data(), &err);
             CL_CHECK(err, "sub_off_buf creation");
         } else {
@@ -1838,44 +1851,44 @@ void process_bucket_gpu(
     // Step 4: GPU simple_sort_y — sort within each sub-bucket
     uint32_t max_bs_sort = max_bs2;
     uint32_t num_sub_u32 = num_sub;
-    clSetKernelArg(plotter.k_simple_sort, 0, sizeof(cl_mem), &PY_buf);
-    clSetKernelArg(plotter.k_simple_sort, 1, sizeof(cl_mem), &sub_cnt_buf);
-    clSetKernelArg(plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
-    clSetKernelArg(plotter.k_simple_sort, 3, sizeof(uint32_t), &num_sub_u32);
+    clSetKernelArg(active_plotter.k_simple_sort, 0, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(active_plotter.k_simple_sort, 1, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_simple_sort, 3, sizeof(uint32_t), &num_sub_u32);
     
     size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
-    clEnqueueNDRangeKernel(q, plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, active_plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
     print_step("sort");
     
     // Step 5: GPU match_p1 — find Y,Y+1 pairs
     if(!using_pool) {
-        LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        LR_buf = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY,
             (size_t)total * 4 * 8, nullptr, &err);
         CL_CHECK(err, "LR_buf creation");
-        PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+        PD_match_buf = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY,
             (size_t)total * 4 * 4, nullptr, &err);
         CL_CHECK(err, "PD_match_buf creation");
-        num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+        num_matches_buf = clCreateBuffer(active_plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
         CL_CHECK(err, "num_matches_buf creation");
     }
     clEnqueueFillBuffer(q, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
     
     uint32_t max_total = total * 4;  // matches can exceed entries for high density
     uint32_t write_pd = 0;  // PD tracking WIP
-    clSetKernelArg(plotter.k_match_p1, 0, sizeof(cl_mem), &LR_buf);
-    clSetKernelArg(plotter.k_match_p1, 1, sizeof(cl_mem), &PD_match_buf);
-    clSetKernelArg(plotter.k_match_p1, 2, sizeof(cl_mem), &num_matches_buf);
-    clSetKernelArg(plotter.k_match_p1, 3, sizeof(cl_mem), &PY_buf);
-    clSetKernelArg(plotter.k_match_p1, 4, sizeof(cl_mem), &sub_cnt_buf);
-    clSetKernelArg(plotter.k_match_p1, 5, sizeof(cl_mem), &sub_off_buf);
-    clSetKernelArg(plotter.k_match_p1, 6, sizeof(uint32_t), &num_sub_u32);
-    clSetKernelArg(plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
-    clSetKernelArg(plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
-    clSetKernelArg(plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
+    clSetKernelArg(active_plotter.k_match_p1, 0, sizeof(cl_mem), &LR_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 1, sizeof(cl_mem), &PD_match_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 2, sizeof(cl_mem), &num_matches_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 3, sizeof(cl_mem), &PY_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 4, sizeof(cl_mem), &sub_cnt_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 5, sizeof(cl_mem), &sub_off_buf);
+    clSetKernelArg(active_plotter.k_match_p1, 6, sizeof(uint32_t), &num_sub_u32);
+    clSetKernelArg(active_plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
+    clSetKernelArg(active_plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
     
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
-    clEnqueueNDRangeKernel(q, plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
     print_step("match");
     
     uint32_t gpu_matches = 0;
@@ -1938,49 +1951,49 @@ void process_bucket_gpu(
         // GPU gather: read M_curr[P1], M_curr[P2] → L_meta_out, R_meta_out
         cl_mem L_gathered, R_gathered, Yb, Mb;
         if(using_pool) {
-            L_gathered = g_bufpool->L_gathered;
-            R_gathered = g_bufpool->R_gathered;
-            Yb = g_bufpool->Y_hash_buf;
-            Mb = g_bufpool->M_hash_buf;
+            L_gathered = active_pool->L_gathered;
+            R_gathered = active_pool->R_gathered;
+            Yb = active_pool->Y_hash_buf;
+            Mb = active_pool->M_hash_buf;
         } else {
-            L_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            L_gathered = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY,
                 num_matches * n_meta * 4, nullptr, &err2);
             CL_CHECK(err2, "L_gathered");
-            R_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            R_gathered = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY,
                 num_matches * n_meta * 4, nullptr, &err2);
             CL_CHECK(err2, "R_gathered");
-            Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
+            Yb = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
             CL_CHECK(err2, "Yb (meta-extract)");
-            Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
+            Mb = clCreateBuffer(active_plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
             CL_CHECK(err2, "Mb (meta-extract)");
         }
         
-        clSetKernelArg(plotter.gather_meta_kernel, 0, sizeof(cl_mem), &C_in_buf);
-        clSetKernelArg(plotter.gather_meta_kernel, 1, sizeof(cl_mem), &LR_buf);
-        clSetKernelArg(plotter.gather_meta_kernel, 2, sizeof(cl_mem), &L_gathered);
-        clSetKernelArg(plotter.gather_meta_kernel, 3, sizeof(cl_mem), &R_gathered);
-        clSetKernelArg(plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
-        clSetKernelArg(plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
-        clSetKernelArg(plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 0, sizeof(cl_mem), &C_in_buf);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 1, sizeof(cl_mem), &LR_buf);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 2, sizeof(cl_mem), &L_gathered);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 3, sizeof(cl_mem), &R_gathered);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
         
         size_t gather_global = num_matches, gather_local = 64;
         if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
-        clEnqueueNDRangeKernel(q, plotter.gather_meta_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, active_plotter.gather_meta_kernel, 1, nullptr,
             &gather_global, &gather_local, 0, nullptr, nullptr);
         print_step("gather");
         
         // GPU hash: hash_table_entries with gathered metadata (sequential reads)
         uint32_t kmask = KMASK;
-        clSetKernelArg(plotter.table_hash_kernel, 0, sizeof(cl_mem), &L_gathered);
-        clSetKernelArg(plotter.table_hash_kernel, 1, sizeof(cl_mem), &R_gathered);
-        clSetKernelArg(plotter.table_hash_kernel, 2, sizeof(cl_mem), &Yb);
-        clSetKernelArg(plotter.table_hash_kernel, 3, sizeof(cl_mem), &Mb);
-        clSetKernelArg(plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
-        clSetKernelArg(plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
+        clSetKernelArg(active_plotter.table_hash_kernel, 0, sizeof(cl_mem), &L_gathered);
+        clSetKernelArg(active_plotter.table_hash_kernel, 1, sizeof(cl_mem), &R_gathered);
+        clSetKernelArg(active_plotter.table_hash_kernel, 2, sizeof(cl_mem), &Yb);
+        clSetKernelArg(active_plotter.table_hash_kernel, 3, sizeof(cl_mem), &Mb);
+        clSetKernelArg(active_plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(active_plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
         
         size_t hash_global = num_matches, hash_local = 64;
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
-        clEnqueueNDRangeKernel(q, plotter.table_hash_kernel, 1, nullptr,
+        clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr,
             &hash_global, &hash_local, 0, nullptr, nullptr);
         
         Y_out.resize(num_matches);
@@ -2016,7 +2029,7 @@ void process_bucket_gpu(
                 R_meta_flat[i * n_meta + j] = C_combined[P2 * n_meta + j];
             }
         }
-        plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
+        active_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_out, M_out, KMASK);
         print_step("cpu_extract+hash");
     }
     
@@ -2091,14 +2104,27 @@ void compute_f2_f9_chunked(
     MemBucketStore src(num_buckets, max_bucket_size, n_meta);
     MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
     
-    // Module C: Initialize buffer pool if enabled
+    // Module C: Initialize buffer pool(s) if enabled
     BufferPool bufpool;
+    std::vector<BufferPool> multi_bufpools;
     if(get_opt_config().bufpool) {
         int logbuckets2 = KSIZE - LOGBUCKETS - 9;
         int num_sub = 1 << logbuckets2;
         int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
-        bufpool.init(plotter.context, plotter.queue, max_bucket_size, n_meta, num_sub, max_bs2);
-        g_bufpool = &bufpool;
+        
+        if(g_num_gpus > 1 && g_plotters.size() > 1) {
+            // Multi-GPU: one buffer pool per GPU
+            multi_bufpools.resize(g_num_gpus);
+            for(int g = 0; g < g_num_gpus; g++) {
+                multi_bufpools[g].init(g_plotters[g]->context, g_plotters[g]->queue,
+                                       max_bucket_size, n_meta, num_sub, max_bs2);
+                g_bufpools.push_back(&multi_bufpools[g]);
+            }
+            g_bufpool = g_bufpools[0];  // backwards compatible
+        } else {
+            bufpool.init(plotter.context, plotter.queue, max_bucket_size, n_meta, num_sub, max_bs2);
+            g_bufpool = &bufpool;
+        }
     }
     
     // Copy F1 output to src (metadata + X values)
@@ -2128,6 +2154,10 @@ void compute_f2_f9_chunked(
             if(gpu_yield) {
                 clFinish(plotter.queue);
                 if(plotter.queue2) clFinish(plotter.queue2);
+                // Flush all multi-GPU queues
+                for(auto* p : g_plotters) {
+                    if(p != &plotter) { clFinish(p->queue); if(p->queue2) clFinish(p->queue2); }
+                }
                 usleep(500);
             }
             
@@ -2212,7 +2242,9 @@ std::swap(src.x_values, dst.x_values);
     // Module C: cleanup buffer pool
     if(get_opt_config().bufpool) {
         bufpool.cleanup();
+        for(auto& bp : multi_bufpools) bp.cleanup();
         g_bufpool = nullptr;
+        g_bufpools.clear();
     }
 }
 
@@ -2782,6 +2814,25 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
     plotter.init(ctx, dev);
     plotter.init_table_hash();
     
+    // Multi-GPU: create additional plotters if --num-gpus > 1 and available
+    int num_gpus = std::min(get_opt_config().num_queues, (int)nd);  // reuse num_queues for now
+    if(num_gpus > 1 && nd > 1) {
+        g_num_gpus = num_gpus;
+        g_plotters.push_back(&plotter);  // first plotter
+        for(int g = 1; g < num_gpus; g++) {
+            cl_device_id dev2 = all_devs[(dev_idx + g) % nd];
+            cl_context ctx2 = clCreateContext(nullptr, 1, &dev2, nullptr, nullptr, &err);
+            if(err != CL_SUCCESS) { std::cerr << "Failed to create context for GPU " << g << std::endl; break; }
+            OCL_Plotter* p2 = new OCL_Plotter();
+            p2->init(ctx2, dev2);
+            p2->init_table_hash();
+            // Load kernels for second plotter
+            // (init_gpu_kernels called later in chunked path)
+            g_plotters.push_back(p2);
+            std::cout << "[OCL] Multi-GPU: added device [" << (dev_idx + g) % nd << "] as GPU " << g << std::endl;
+        }
+    }
+    
     // Print optimization config
     if(get_opt_config().any_enabled()) {
         get_opt_config().print();
@@ -2793,6 +2844,10 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         LOGBUCKETS = 8;
         update_constants();
         plotter.init_gpu_kernels();
+        // Init kernels on all multi-GPU plotters
+        for(size_t g = 1; g < g_plotters.size(); g++) {
+            g_plotters[g]->init_gpu_kernels();
+        }
         std::cout << "[Chunked] LOGBUCKETS=" << LOGBUCKETS << " (" << (1 << LOGBUCKETS) << " buckets)" << std::endl;
         
         const int num_buckets = 1 << LOGBUCKETS;
