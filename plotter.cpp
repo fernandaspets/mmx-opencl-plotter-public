@@ -301,6 +301,7 @@ public:
     
     cl_kernel table_hash_kernel = nullptr;
     cl_kernel hash_lr_kernel = nullptr;
+    cl_kernel gather_meta_kernel = nullptr;
     cl_kernel eval_p1_tx_kernel = nullptr;
     cl_kernel k_scatter2 = nullptr;
     cl_kernel k_simple_sort = nullptr;
@@ -328,6 +329,24 @@ public:
         hash_lr_kernel = clCreateKernel(prog, "hash_table_lr", &err);
         if(err != CL_SUCCESS) throw std::runtime_error("hash_table_lr not found");
         if(err != CL_SUCCESS) throw std::runtime_error("hash_table_entries not found");
+        
+        // Load gather kernel (Module B variant 2)
+        {
+            std::string gpath = "gather_meta.cl";
+            FILE* gf = fopen(gpath.c_str(), "r");
+            if(gf) {
+                fseek(gf, 0, SEEK_END); size_t gsz = ftell(gf); fseek(gf, 0, SEEK_SET);
+                char* gsrc = new char[gsz+1]; fread(gsrc, 1, gsz, gf); gsrc[gsz] = 0; fclose(gf);
+                cl_program gprog = clCreateProgramWithSource(context, 1, (const char**)&gsrc, &gsz, &err);
+                delete[] gsrc;
+                err = clBuildProgram(gprog, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
+                if(err == CL_SUCCESS) {
+                    gather_meta_kernel = clCreateKernel(gprog, "gather_meta", &err);
+                    if(err == CL_SUCCESS) std::cout << "[OCL] Gather kernel loaded" << std::endl;
+                }
+            }
+        }
+        
         std::cout << "[OCL] Table hash kernel loaded" << std::endl;
     }
     
@@ -1801,33 +1820,61 @@ void process_bucket_gpu(
     std::vector<uint32_t> Y_out, M_out;
     
     if(get_opt_config().gpu_meta_extract) {
-        // Module B: GPU metadata extraction — call hash_table_lr directly
+        // Module B: GPU metadata extraction — gather on GPU + hash on GPU
+        // Two kernels: gather_meta (scattered reads) + hash_table_entries (sequential reads)
+        // This avoids the AMD codegen bug in hash_table_lr (interleaved scatter+hash)
         cl_int err2;
+        uint32_t num_m = (uint32_t)num_matches;
+        uint32_t num_total = total;
+        uint32_t n_meta_u32 = (uint32_t)n_meta;
+        
+        // GPU gather: read M_curr[P1], M_curr[P2] → L_meta_out, R_meta_out
+        cl_mem L_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            num_matches * n_meta * 4, nullptr, &err2);
+        CL_CHECK(err2, "L_gathered");
+        cl_mem R_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            num_matches * n_meta * 4, nullptr, &err2);
+        CL_CHECK(err2, "R_gathered");
+        
+        clSetKernelArg(plotter.gather_meta_kernel, 0, sizeof(cl_mem), &C_in_buf);
+        clSetKernelArg(plotter.gather_meta_kernel, 1, sizeof(cl_mem), &LR_buf);
+        clSetKernelArg(plotter.gather_meta_kernel, 2, sizeof(cl_mem), &L_gathered);
+        clSetKernelArg(plotter.gather_meta_kernel, 3, sizeof(cl_mem), &R_gathered);
+        clSetKernelArg(plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
+        clSetKernelArg(plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
+        clSetKernelArg(plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
+        
+        size_t gather_global = num_matches, gather_local = 64;
+        if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
+        clEnqueueNDRangeKernel(plotter.queue, plotter.gather_meta_kernel, 1, nullptr,
+            &gather_global, &gather_local, 0, nullptr, nullptr);
+        
+        // GPU hash: hash_table_entries with gathered metadata (sequential reads)
         cl_mem Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
         CL_CHECK(err2, "Yb (meta-extract)");
         cl_mem Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
         CL_CHECK(err2, "Mb (meta-extract)");
         
         uint32_t kmask = KMASK;
-        uint32_t num_m = (uint32_t)num_matches;
-        uint32_t num_total = total;
-        clSetKernelArg(plotter.hash_lr_kernel, 0, sizeof(cl_mem), &C_in_buf);
-        clSetKernelArg(plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_buf);
-        clSetKernelArg(plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Yb);
-        clSetKernelArg(plotter.hash_lr_kernel, 3, sizeof(cl_mem), &Mb);
-        clSetKernelArg(plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
-        clSetKernelArg(plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_m);
-        clSetKernelArg(plotter.hash_lr_kernel, 6, sizeof(uint32_t), &num_total);
+        clSetKernelArg(plotter.table_hash_kernel, 0, sizeof(cl_mem), &L_gathered);
+        clSetKernelArg(plotter.table_hash_kernel, 1, sizeof(cl_mem), &R_gathered);
+        clSetKernelArg(plotter.table_hash_kernel, 2, sizeof(cl_mem), &Yb);
+        clSetKernelArg(plotter.table_hash_kernel, 3, sizeof(cl_mem), &Mb);
+        clSetKernelArg(plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
         
-        size_t global = num_matches, local = 64;
-        if(global % local) global = ((global / local) + 1) * local;
-        clEnqueueNDRangeKernel(plotter.queue, plotter.hash_lr_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        size_t hash_global = num_matches, hash_local = 64;
+        if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
+        clEnqueueNDRangeKernel(plotter.queue, plotter.table_hash_kernel, 1, nullptr,
+            &hash_global, &hash_local, 0, nullptr, nullptr);
         
         Y_out.resize(num_matches);
         M_out.resize(num_matches * MY_N_META);
         clEnqueueReadBuffer(plotter.queue, Yb, CL_TRUE, 0, num_matches * 4, Y_out.data(), 0, nullptr, nullptr);
         clEnqueueReadBuffer(plotter.queue, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
         
+        clReleaseMemObject(L_gathered);
+        clReleaseMemObject(R_gathered);
         clReleaseMemObject(Yb);
         clReleaseMemObject(Mb);
     } else {
