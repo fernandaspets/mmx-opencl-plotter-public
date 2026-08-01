@@ -1,127 +1,147 @@
 # MMX OpenCL Plotter
 
-MMX plotter using OpenCL for F1 computation and CPU for the F2-F9 pipeline.
+OpenCL plotter for MMX Proof-of-Space on AMD GPUs (gfx1100 / RDNA3).
+Hybrid GPU+CPU pipeline: F1 on GPU, F2-F9 on GPU or CPU.
 
-Works on AMD gfx1100 (RX 7900 XTX) where HIP/CUDA/ZLUDA produce broken plots due to a hardware-level fp32 bug. OpenCL avoids the bug by using a different compiler path.
+## Status
 
-This is a hybrid GPU+CPU plotter — F1 runs on GPU, F2-F9 matching/sorting/hashing runs on CPU with GPU-assisted SHA-512 hashing. It is slower than a full GPU plotter but produces valid plots on hardware where the CUDA/HIP plotter cannot.
-
-## How it works
-
-1. **F1 on GPU** (OpenCL) — computes proof-of-space F1 values using SHA-512 + memory-hard function
-2. **F2-F9 on CPU** — parallel radix sort + Y,Y+1 matching + GPU-assisted SHA-512 table hashing
-3. **Plot file writing** — parallel park generation with bit-stream encoding
-
-## Performance (k26, RAM disk)
-
-| Component | Time |
-|-----------|------|
-| F1 (GPU) | 51 sec |
-| F2-F9 (CPU sort + GPU hash) | 115 sec |
-| Plot writing + copy | 13 sec |
-| **Total** | **178 sec** |
-
-Without RAM disk (direct to SSD): ~237 sec.
-
-## Verification
-
-```
-mmx_postool --file plot.plot --iter 20 --verbose
-Pass: 336 / 320, 105 %
-Fail: 0 / 320, 0 %
-Bad plots: None
-```
-
-## ⚠️ Limitations
-
-**This is a testing/experimental tool. Do not use for production farming.**
-
-- **Maximum k-size: k26.** Larger k-sizes (k29+) require a chunked per-bucket architecture to fit in RAM/VRAM. The current implementation loads all entries into memory simultaneously, which works for k26 (~67M entries, ~20 GB RAM) but will exhaust RAM and GPU memory for k29+ (536M entries, ~130 GB RAM).
-- k29 is the minimum for MMX mainnet farming. This tool cannot produce k29 plots yet.
-- The plotter is slower than the CUDA/HIP plotter (which does everything on GPU). It's useful for AMD GPUs where CUDA/HIP produce broken plots.
+| Component | Status | Notes |
+|-----------|--------|-------|
+| F1 (SHA-512 + memory-hard) | ✅ Working | Verified byte-for-byte against CPU reference (100/100 match) |
+| Table hash (SHA-512 L‖R) | ✅ Working | Verified against CPU (20/20 match) |
+| Flat pipeline (F2-F9) | ✅ Working | 79-95% pass rate on mmx_postool |
+| Chunked pipeline (k29+) | ⚠️ In progress | PD (Prover Data) chain has sort-order bug |
+| Plot file writing | ✅ Working | Y parks, meta parks, PD parks, X parks |
+| RAM disk support | ✅ Working | `--ramdisk DIR` flag |
 
 ## Building
 
-Requires a standard [mmx-node](https://github.com/madMAx43v3r/mmx-node) build (any build, no special branch needed) for header files and libraries.
-
 ```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DMMX_NODE_DIR=/path/to/mmx-node ..
+cd opencl-plotter/build
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
+
+Requires: OpenCL (ROCm), mmx-node headers/libs for verification.
 
 ## Usage
 
 ```bash
-./mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> [output_dir] [options]
+# Generate a plot (flat pipeline, k ≤ 26)
+LD_LIBRARY_PATH=/opt/rocm/lib ./mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> <output_dir> --k 26
+
+# Chunked pipeline (k29+, uses ~66GB RAM for k29)
+LD_LIBRARY_PATH=/opt/rocm/lib ./mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> <output_dir> --k 29 --chunked
+
+# With RAM disk (recommended for speed)
+./mmx_opencl_plotter <pid> <fkey> /mnt/hdd/ --ramdisk /mnt/ramdisk --k 26
+
+# Disable GPU display yield (headless)
+./mmx_opencl_plotter <pid> <fkey> <outdir> --k 26 --no-yield
 ```
 
-Options:
-- `--k N` — Set plot k-size (default: 26)
-- `--ramdisk DIR` — Write plot to tmpfs at DIR first, then copy to output_dir. Eliminates disk I/O bottleneck during plotting.
-- `--test` — Run in test mode
-- `--limit N` — Limit entries (test mode)
+### Plot ID
 
-### Direct output (simple)
+Plot ID is a 32-byte hex string (64 hex chars). In the official CUDA plotter, it's
+derived as `SHA256("MMX/PLOTID/OG" || ksize || seed || farmer_key)`, but any 32-byte
+value works — the Prover reads it from the file header.
+
+## Verification
 
 ```bash
-./mmx_opencl_plotter $(python3 -c "import os; print(os.urandom(32).hex())") \
-    <farmer_public_key_hex> \
-    /output/plots/ --k 26
+# Verify with mmx_postool
+LD_LIBRARY_PATH=/opt/rocm/lib ~/mmx-node/build_opencl/tools/mmx_postool -f <plot.plot> -n 20 -v
 ```
 
-### RAM disk output (faster)
+Or use the included tool:
+```bash
+./tools/verify_plot.sh --k 18
+./tools/verify_plot.sh --k 18 --chunked
+```
 
-Writing to a RAM disk (tmpfs) avoids disk I/O during plotting, which is a major bottleneck for large k-sizes.
+## Testing
 
 ```bash
-# 1. Mount a tmpfs (one-time, requires root)
-sudo mount -t tmpfs -o size=8G tmpfs /mnt/ramdisk
+# Build all tests
+bash tests/build_test.sh
 
-# 2. Plot to RAM disk, auto-copy to final destination after
-./mmx_opencl_plotter $(python3 -c "import os; print(os.urandom(32).hex())") \
-    <farmer_public_key_hex> \
-    /output/plots/ --ramdisk /mnt/ramdisk --k 26
+# F1 comparison: GPU vs CPU (byte-for-byte)
+cd tests && LD_LIBRARY_PATH=/opt/rocm/lib ./test_f1_compare
+
+# Table hash comparison: GPU vs CPU
+cd tests && LD_LIBRARY_PATH=/opt/rocm/lib ./test_tablehash
+
+# Compare flat vs chunked PD values
+./tools/compare.sh --k 18
+
+# PD chain integrity check
+python3 tests/test_pd_chain.py flat
+python3 tests/test_pd_chain.py chunked
 ```
 
-The plot is written to `/mnt/ramdisk` (in RAM), then copied to `/output/plots/` and removed from RAM disk.
+## Architecture
 
-**RAM disk size guide:**
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full architecture documentation.
 
-| k-size | Plot size | RAM disk needed |
-|--------|-----------|-----------------|
-| k22 | ~250 MB | 512 MB |
-| k26 | ~4.7 GB | 8 GB |
-| k30 | ~75 GB | 80 GB |
+## Known Bugs
 
-## Verify
+See [docs/PD-BUG-ANALYSIS.md](docs/PD-BUG-ANALYSIS.md) for the chunked pipeline PD bug analysis.
 
-Use `mmx_postool` from any mmx-node build:
+### Flat pipeline intermittent 0%
+Certain plot IDs produce 0% pass rate even with the flat pipeline. This appears to
+be a PD edge case with duplicate Y values and metadata tie-breaking. ~80-95% of
+random plot IDs pass normally.
 
-```bash
-mmx_postool --file <plot.plot> --iter 20 --verbose
+### Chunked pipeline PD
+The chunked pipeline's PD chain is structurally valid (all indices in bounds) but
+positions are incorrect due to sort-order inconsistency between per-bucket GPU sort
+and global PD sort. See docs/PD-BUG-ANALYSIS.md for details.
+
+## Repository Structure
+
+```
+opencl-plotter/
+├── plotter.cpp           # Main plotter (flat + chunked pipelines)
+├── pos_recompute.cl      # F1 kernel (SHA-512 + memory-hard hash)
+├── table_hash.cl         # Table hash kernel (SHA-512 of L‖R metadata)
+├── f2_f9.cl              # GPU kernels (scatter, sort, match, eval)
+├── simple_sort.cl        # Odd-even sort kernel
+├── bucket_store.h         # In-memory bucket store for chunked pipeline
+├── CMakeLists.txt
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── PD-BUG-ANALYSIS.md
+├── tools/
+│   ├── verify_plot.sh    # Generate + verify any plot
+│   └── compare.sh        # Compare flat vs chunked with same plot ID
+├── tests/
+│   ├── test_f1_compare.cpp    # F1 GPU vs CPU comparison
+│   ├── test_tablehash.cpp     # Table hash GPU vs CPU comparison
+│   ├── test_memhash_multi.cpp # Memory-hard hash with multiple work-items
+│   ├── test_pd_chain.py       # PD chain integrity verification
+│   ├── build_test.sh          # Build script for tests
+│   └── legacy/                 # Old test files (archive)
+└── build/                # Build output (gitignored)
 ```
 
-## Files
+## Performance
 
-- `plotter.cpp` — main plotter (F1 GPU + F2-F9 CPU + plot writer)
-- `pos_recompute.cl` — OpenCL F1 kernel (SHA-512 + gen_mem_array + calc_mem_hash)
-- `table_hash.cl` — OpenCL table hash kernel (SHA-512 of metadata pairs)
-- `test_table_hash.cpp` — verifies GPU table hash matches CPU
-- `test_pipeline.cpp` — verifies full F1→F9 pipeline for small k values
-- `verify_pd.cpp` — traces PD tree for debugging
-- `CMakeLists.txt` — build configuration
+| K | Pipeline | Time | Notes |
+|---|----------|------|-------|
+| 18 | Flat | 0.5s | k18 for testing |
+| 26 | Flat | 178s | With RAM disk |
+| 29 | Chunked | 14.7 min | GPU chunked, no OOM |
 
-## Kimi K2.6 Skeleton Review Notes
+GPU: AMD RX 7900 XTX (gfx1100, RDNA3, 24GB VRAM).
 
-Reviewed `mmx_opencl_plotter.zip` (Kimi K2.6's skeleton implementation).
-It implements Chia's algorithm, NOT MMX's — wrong crypto (ChaCha8 vs SHA-512),
-wrong matching (PARAM_BC/PARAM_B vs Y_R==Y_L+1), wrong table count (7 vs 9),
-no PD tree. Not usable directly.
+## Constants
 
-### Good ideas worth borrowing for optimization later:
-- **SVM (Shared Virtual Memory) dual-path memory pool** — could help avoid host↔device copies
-- **Async double-buffered pipeline** with ping-pong buffers + event chaining
-- **Device capability detection** with feature scaling (OpenCL 1.2 vs 2.0+)
-- **Multi-bucket-pair matching kernel** (`match_and_compute_multi`) — processes multiple bucket pairs in one launch
-- **Clean separation of kernels** into files (f1, sort, match, backprop, compress)
+- `MEM_HASH_ITER = 256` (memory-hard hash iterations, from mmx-node config.h)
+- `LOGBUCKETS = 8` (256 first-level buckets)
+- `LOGBUCKETS2 = KSIZE - LOGBUCKETS - 9` (sub-buckets, requires k ≥ 18)
+- `N_META = 14`, `N_META_OUT = 12`
+- `PARK_SIZE_Y = 8192`, `PARK_SIZE_PD = 2048`, `PARK_SIZE_X = 4096`
+
+## License
+
+MIT

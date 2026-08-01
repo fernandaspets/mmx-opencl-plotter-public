@@ -1,28 +1,30 @@
+# Build artifacts
 build/
-debug_plot
-test_pipeline
-test_table_hash
-trace_proof
-verify_pd
 *.o
-*.a
 *.so
-test_scatter_2
-test_sort
-test_sort_simple
-test_sort_debug
-test_sort_proper
-test_match
-test_eval
-test_offset_sum
-test_sort_single
-test_sort_two
-test_chain_debug
-test_chain_debug2
-test_simple_sort
-test_multi_table
-test_chain_debug
-test_chain_debug2
-test_sort_single
-test_sort_two
-test_chunked
+*.a
+
+# Compiled test binaries
+tests/test_f1_compare
+tests/test_sha512_gpu
+tests/test_sha512_step
+tests/test_tablehash
+tests/test_memhash_gpu
+tests/test_memhash_iter
+tests/test_memhash_multi
+
+# Copied kernels (runtime)
+build/*.cl
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
