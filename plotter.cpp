@@ -4324,29 +4324,30 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     std::vector<uint32_t> Y_all, M_all;
     
-    // SVM F1 for flat path (if --opt-svm)
+    // SVM pool for flat path — only allocate if needed.
+    // With hash_table_lr (cl_mem) + warp F1 (cl_mem), SVM pool is NOT used.
+    // Allocating it wastes ~7GB VRAM for k24 (dangerous on 24GB GPUs).
+    // Only allocate if hash_lr_kernel is NOT available (fallback to SVM hash).
     SVMPool flat_svm_pool;
     std::vector<SVMPool> flat_multi_svm;
-    if(get_opt_config().svm) {
+    bool need_svm = get_opt_config().svm && !plotter.hash_lr_kernel;
+    if(need_svm) {
+        std::cout << "[OCL] Allocating SVM pool (fallback hash path)" << std::endl;
         int f1_batch = std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE));
-        // For flat path: hash buffers need to hold all matches (~2^K entries)
-        // Per-GPU: each GPU handles 1/ngpus of entries
         int ngpus = std::max(1, g_num_gpus);
         int per_gpu_entries = ((1 << KSIZE) * 3 / 2 + 256 + ngpus - 1) / ngpus;
-        // GPU 0 pool
         flat_svm_pool.init(plotter.context, plotter.queue, plotter.device,
                           per_gpu_entries, MY_N_META, 64, 4096, f1_batch);
         g_svmpools.push_back(&flat_svm_pool);
-        // Additional GPU pools
         for(int g = 1; g < ngpus && g < (int)g_plotters.size(); g++) {
-            std::cout << "[OCL] Setting up SVM pool for GPU " << g << "..." << std::endl;
             SVMPool sp;
             sp.init(g_plotters[g]->context, g_plotters[g]->queue, g_plotters[g]->device,
                    per_gpu_entries, MY_N_META, 64, 4096, f1_batch);
             flat_multi_svm.push_back(std::move(sp));
             g_svmpools.push_back(&flat_multi_svm.back());
-            std::cout << "[OCL] SVM pool for GPU " << g << " ready (g_svmpools.size=" << g_svmpools.size() << ")" << std::endl;
         }
+    } else {
+        std::cout << "[OCL] Skipping SVM pool (using cl_mem hash_table_lr + warp F1) — saves ~7GB VRAM" << std::endl;
     }
     
     plotter.compute_all_f1(plot_id, Y_all, M_all, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)), test_mode, test_limit);

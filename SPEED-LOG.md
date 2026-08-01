@@ -41,3 +41,17 @@
 4. **Skip dedup**: MMX F2-F9 never produces duplicates (verified, CUDA also skips)
 5. **FLAT pipeline**: Process all entries in one kernel launch per table (no per-bucket overhead)
 6. **SVM**: Fine-grain zero-copy on AMD (no cl_mem for hash buffers)
+
+### k24 (16M entries)
+| Platform | Time | Pass |
+|----------|------|------|
+| AMD 7900 XTX 1GPU | **18.2s** | 96.25% (308/320) |
+| NVIDIA P40 1GPU | **33.6s** | 96.25% (308/320) |
+| CUDA reference | ~6s | ~100% |
+
+## k24 AMD Breakdown (18.2s)
+| Phase | Time | % |
+|-------|------|---|
+| F1 (warp-parallel) | 3.4s | 19% |
+| F2-F9 (8 tables) | 13.3s | 73% |
+| Final (sort+copy+PD9) | 1.5s | 8% |
