@@ -2289,7 +2289,7 @@ BucketPending submit_bucket_pipeline(
     
     // Non-blocking read of match count — event on the READ (not kernel)
     // so that clWaitForEvents guarantees the data is in gpu_matches
-    clEnqueueReadBuffer(q, p.num_matches_buf, CL_FALSE, 0, 4, &p.gpu_matches, 0, nullptr, &p.ev_match_done);
+    clEnqueueReadBuffer(q, p.num_matches_buf, CL_TRUE, 0, 4, &p.gpu_matches, 0, nullptr, nullptr);
 
     p.skip = false;
     return p;
@@ -2402,8 +2402,8 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
         // Non-blocking reads of Y + M results — ev_hash_done guards both (in-order queue)
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        clEnqueueReadBuffer(q, p.Yb, CL_FALSE, 0, p.num_matches * 4, p.Y_out.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(q, p.Mb, CL_FALSE, 0, p.num_matches * MY_N_META * 4, p.M_out.data(), 0, nullptr, &p.ev_hash_done);
+        clEnqueueReadBuffer(q, p.Yb, CL_TRUE, 0, p.num_matches * 4, p.Y_out.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(q, p.Mb, CL_TRUE, 0, p.num_matches * MY_N_META * 4, p.M_out.data(), 0, nullptr, nullptr);
     } else {
         // CPU-extract path (blocking, no event)
         std::vector<uint32_t> L_meta_flat(p.num_matches * n_meta);
