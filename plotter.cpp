@@ -1078,28 +1078,22 @@ void compute_full_pipeline(
     // Sort by meta, then dedup linearly
     std::cerr << "[Final] Deduplicating " << entries.size() << " entries...     \r" << std::flush;
     {
-        // Build index array sorted by meta
-        std::vector<uint32_t> meta_idx(entries.size());
-        for(size_t i = 0; i < entries.size(); i++) meta_idx[i] = (uint32_t)i;
-        
-        auto meta_cmp = [&entries, &M_curr](uint32_t a, uint32_t b) {
-            return M_curr[entries[a].second] < M_curr[entries[b].second];
-        };
-        
-        __gnu_parallel::sort(meta_idx.begin(), meta_idx.end(), meta_cmp,
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
-        
-        // Linear dedup
+        // Entries are already sorted by Y from the radix sort above.
+        // Duplicates have the same Y AND same metadata (Y = XOR of metadata).
+        // So duplicates are adjacent in Y-sorted order — no meta sort needed!
+        // Just scan linearly, comparing metadata of entries with the same Y.
         std::array<uint32_t, 14> prev_meta = {};
+        uint32_t prev_Y = 0xFFFFFFFF;
         bool first = true;
-        for(size_t i = 0; i < meta_idx.size(); i++) {
-            const auto& entry = entries[meta_idx[i]];
-            const auto& meta = M_curr[entry.second];
-            if(first || meta != prev_meta) {
-                plot.final_Y.push_back(entry.first);
+        for(size_t i = 0; i < entries.size(); i++) {
+            uint32_t Y = entries[i].first;
+            const auto& meta = M_curr[entries[i].second];
+            if(first || Y != prev_Y || meta != prev_meta) {
+                plot.final_Y.push_back(Y);
                 plot.final_meta.push_back(meta);
-                final_indices.push_back(entry.second);
+                final_indices.push_back(entries[i].second);
                 prev_meta = meta;
+                prev_Y = Y;
                 first = false;
             }
         }
@@ -1107,34 +1101,10 @@ void compute_full_pipeline(
     
     std::cout << "[Final] " << plot.final_Y.size() << " unique entries          " << std::endl;
     
-    // Re-sort final entries by Y (dedup destroyed Y order)
-    std::cerr << "[Final] Re-sorting by Y...                       \r" << std::flush;
-    {
-        size_t nf = plot.final_Y.size();
-        std::vector<uint32_t> idx(nf);
-        for(size_t i = 0; i < nf; i++) idx[i] = (uint32_t)i;
-        
-        // Sort index by Y value
-        __gnu_parallel::sort(idx.begin(), idx.end(),
-            [&](uint32_t a, uint32_t b) { return plot.final_Y[a] < plot.final_Y[b]; },
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
-        
-        // Reorder all arrays
-        std::vector<uint32_t> new_Y(nf);
-        std::vector<std::array<uint32_t, 14>> new_meta(nf);
-        std::vector<uint32_t> new_indices(nf);
-        #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < nf; i++) {
-            new_Y[i] = plot.final_Y[idx[i]];
-            new_meta[i] = plot.final_meta[idx[i]];
-            new_indices[i] = final_indices[idx[i]];
-        }
-        plot.final_Y = std::move(new_Y);
-        plot.final_meta = std::move(new_meta);
-        final_indices = std::move(new_indices);
-    }
+    // No re-sort needed — entries are already in Y-sorted order from dedup!
+    // No re-sort needed — entries are already in Y-sorted order from dedup!
+    // (The old code sorted by metadata then re-sorted by Y — we skip both)
     
-// PD[9] dedup: keep only entries for deduped final entries
     {
         auto old_pd9 = std::move(plot.PD[9]);
         plot.PD[9].resize(final_indices.size());
