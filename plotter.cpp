@@ -2285,10 +2285,11 @@ BucketPending submit_bucket_pipeline(
     clSetKernelArg(active_plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
     int groups_per_sub = (max_bs2 + 127) / 128;
     size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
-    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, &p.ev_match_done);
-
-    // Non-blocking read of match count — will be ready when we sync on ev_match_done
-    clEnqueueReadBuffer(q, p.num_matches_buf, CL_FALSE, 0, 4, &p.gpu_matches, 0, nullptr, nullptr);
+    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+    
+    // Non-blocking read of match count — event on the READ (not kernel)
+    // so that clWaitForEvents guarantees the data is in gpu_matches
+    clEnqueueReadBuffer(q, p.num_matches_buf, CL_FALSE, 0, 4, &p.gpu_matches, 0, nullptr, &p.ev_match_done);
 
     p.skip = false;
     return p;
@@ -3091,6 +3092,18 @@ void build_plot_data_from_store(
 
 bool gpu_yield = true;
 int device_id = 0;
+
+// Assert queue is in-order (Module E v2 relies on FIFO ordering for event-based sync)
+void assert_queue_in_order(cl_command_queue q, const char* label) {
+    if(!q) return;
+    cl_command_queue_properties props = 0;
+    cl_int err = clGetCommandQueueInfo(q, CL_QUEUE_PROPERTIES, sizeof(props), &props, nullptr);
+    if(err != CL_SUCCESS) { std::cerr << "[FATAL] assert_queue_in_order(" << label << "): failed" << std::endl; std::exit(1); }
+    if(props & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) {
+        std::cerr << "[FATAL] assert_queue_in_order(" << label << "): OUT-OF-ORDER queue! Pipeline assumes in-order." << std::endl;
+        std::exit(1);
+    }
+}
 bool timing_detail = false;
 
 int main(int argc, char** argv)
@@ -3261,6 +3274,12 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         // Init kernels on all multi-GPU plotters
         for(size_t g = 1; g < g_plotters.size(); g++) {
             g_plotters[g]->init_gpu_kernels();
+        }
+        // Assert all queues are in-order (pipeline relies on FIFO)
+        assert_queue_in_order(plotter.queue, "plotter.queue");
+        for(auto* pl : g_plotters) {
+            assert_queue_in_order(pl->queue, "g_plotters[].queue");
+            if(pl->queue2) assert_queue_in_order(pl->queue2, "g_plotters[].queue2");
         }
         std::cout << "[Chunked] LOGBUCKETS=" << LOGBUCKETS << " (" << (1 << LOGBUCKETS) << " buckets)" << std::endl;
         
