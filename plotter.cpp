@@ -2206,8 +2206,8 @@ BucketPending submit_bucket_pipeline(
         p.PD_match_buf = active_pool->PD_match_buf;
         p.num_matches_buf = active_pool->num_matches_buf;
         
-        if(get_opt_config().pinned && active_pool->pinned_C_in_ptr) {
-            // Module G: Write to pinned host buffer, then async DMA to GPU
+        if(false && get_opt_config().pinned && active_pool->pinned_C_in_ptr) {
+            // Module G: disabled — NVIDIA OCL has issues with persistently mapped buffers
             std::memcpy(active_pool->pinned_C_in_ptr, meta_y, p.count_y * n_meta * 4);
             clEnqueueWriteBuffer(q, p.C_in_buf, CL_FALSE, 0,
                 p.count_y * n_meta * 4, active_pool->pinned_C_in_ptr, 0, nullptr, nullptr);
