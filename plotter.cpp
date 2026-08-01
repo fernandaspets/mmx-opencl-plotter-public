@@ -1297,6 +1297,7 @@ void compute_full_pipeline(
     }
     
     // Final sort using radix sort (same as table sort)
+    auto t_final_start = my_time_ms();
     std::cerr << "[Final] Sorting " << entries.size() << " entries...           \r" << std::flush;
     {
         const int log_buckets = std::min(LOGBUCKETS, KSIZE - 1);
@@ -1329,22 +1330,28 @@ void compute_full_pipeline(
         entries = std::move(sorted_entries);
     }
     
+    auto t_sort_done = my_time_ms();
+    
     // Skip dedup — MMX F2-F9 never produces duplicate entries (verified).
     // The CUDA plotter also has no dedup step.
     // Entries are already sorted by Y from the radix sort above.
     // Just copy directly — saves ~5s for k23 (meta sort + re-sort of 8M entries).
+    // Parallelized: pre-allocate and fill with OpenMP.
     std::cerr << "[Final] Copying " << entries.size() << " entries (no dedup needed)...  \r" << std::flush;
     {
-        plot.final_Y.reserve(entries.size());
-        plot.final_meta.reserve(entries.size());
-        final_indices.reserve(entries.size());
-        for(size_t i = 0; i < entries.size(); i++) {
-            plot.final_Y.push_back(entries[i].first);
-            { std::array<uint32_t,14> meta; std::memcpy(meta.data(), &M_curr_flat[entries[i].second * MY_N_META], 14 * sizeof(uint32_t)); plot.final_meta.push_back(meta); }
-            final_indices.push_back(entries[i].second);
+        const size_t ne = entries.size();
+        plot.final_Y.resize(ne);
+        plot.final_meta.resize(ne);
+        final_indices.resize(ne);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < ne; i++) {
+            plot.final_Y[i] = entries[i].first;
+            std::memcpy(plot.final_meta[i].data(), &M_curr_flat[entries[i].second * MY_N_META], 14 * sizeof(uint32_t));
+            final_indices[i] = entries[i].second;
         }
     }
     
+    auto t_copy_done = my_time_ms();
     std::cout << "[Final] " << plot.final_Y.size() << " entries          " << std::endl;
     
     // No re-sort needed — entries are already in Y-sorted order from radix sort!
@@ -1360,6 +1367,9 @@ void compute_full_pipeline(
             plot.PD[9][i] = old_pd9[final_indices[i]];
         }
     }
+    
+    auto t_pd9_done = my_time_ms();
+    std::cerr << "[Final] sort=" << (t_sort_done-t_final_start) << "ms copy=" << (t_copy_done-t_sort_done) << "ms pd9=" << (t_pd9_done-t_copy_done) << "ms    \r" << std::flush;
     
     // X pairs: compute in match order, then reorder by sorted position
     {
