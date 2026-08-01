@@ -287,6 +287,65 @@ public:
         clReleaseMemObject(M_buf);
     }
     
+    // SVM-based F1 batch — no cl_mem, no upload/download, direct shared memory
+    void compute_f1_batch_svm(
+        std::vector<uint32_t>& X_values,
+        const hash_t& plot_id,
+        std::vector<uint32_t>& Y_out,
+        std::vector<uint32_t>& M_out,
+        void* svm_X, void* svm_Y, void* svm_M,  // pre-allocated SVM buffers
+        size_t svm_capacity)  // max entries that fit in SVM buffers
+    {
+        const size_t num_x = X_values.size();
+        if(num_x == 0) return;
+        if(num_x > svm_capacity) throw std::runtime_error("F1 SVM batch too large");
+        
+        std::vector<uint32_t> id_u32(8);
+        std::memcpy(id_u32.data(), plot_id.data(), 32);
+        
+        // Write X values to SVM (fine-grain: direct write, coarse-grain: map/unmap)
+        // For now use map/unmap which works on both
+        cl_int err;
+        clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_WRITE, svm_X, num_x * sizeof(uint32_t), 0, nullptr, nullptr);
+        std::memcpy(svm_X, X_values.data(), num_x * sizeof(uint32_t));
+        clEnqueueSVMUnmap(queue, svm_X, 0, nullptr, nullptr);
+        
+        // Upload plot_id (small, use regular buffer)
+        cl_mem ID_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       8 * sizeof(uint32_t), (void*)id_u32.data(), &err);
+        
+        uint32_t kmask = KMASK;
+        uint32_t xbits = 0;
+        uint32_t num_x_u32 = (uint32_t)num_x;
+        
+        clSetKernelArgSVMPointer(f1_kernel, 0, svm_X);
+        clSetKernelArg(f1_kernel, 1, sizeof(cl_mem), &ID_buf);  // plot_id as regular buffer
+        clSetKernelArgSVMPointer(f1_kernel, 2, svm_Y);
+        clSetKernelArgSVMPointer(f1_kernel, 3, svm_M);
+        clSetKernelArg(f1_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(f1_kernel, 5, sizeof(uint32_t), &xbits);
+        clSetKernelArg(f1_kernel, 6, sizeof(uint32_t), &num_x_u32);
+        
+        size_t global = num_x;
+        size_t local = 64;
+        if(global % local != 0) global = ((global / local) + 1) * local;
+        
+        err = clEnqueueNDRangeKernel(queue, f1_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        if(err != CL_SUCCESS) throw std::runtime_error("F1 SVM kernel launch failed: " + std::to_string(err));
+        
+        // Read results from SVM
+        Y_out.resize(num_x);
+        M_out.resize(num_x * MY_N_META);
+        clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_READ, svm_Y, num_x * sizeof(uint32_t), 0, nullptr, nullptr);
+        std::memcpy(Y_out.data(), svm_Y, num_x * sizeof(uint32_t));
+        clEnqueueSVMUnmap(queue, svm_Y, 0, nullptr, nullptr);
+        clEnqueueSVMMap(queue, CL_TRUE, CL_MAP_READ, svm_M, num_x * MY_N_META * sizeof(uint32_t), 0, nullptr, nullptr);
+        std::memcpy(M_out.data(), svm_M, num_x * MY_N_META * sizeof(uint32_t));
+        clEnqueueSVMUnmap(queue, svm_M, 0, nullptr, nullptr);
+        
+        clReleaseMemObject(ID_buf);
+    }
+    
     void compute_all_f1(
         const hash_t& plot_id,
         std::vector<uint32_t>& Y_all,
@@ -1447,12 +1506,23 @@ void compute_f1_chunked(
     std::vector<uint32_t> X_batch(batch_size), Y_batch(batch_size), M_batch(batch_size * n_meta);
     std::vector<std::vector<uint32_t>> batch_buckets(num_buckets);
     
+    // Use SVM F1 if available
+    bool use_svm_f1 = get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_F1_X;
+    SVMPool* f1_svm = use_svm_f1 ? g_svmpools[0] : nullptr;
+    
     for(uint32_t b = 0; b < num_batches; b++) {
         const uint32_t start = b * batch_size;
         const uint32_t count = std::min((uint32_t)batch_size, (uint32_t)(total_entries - start));
         
         for(uint32_t i = 0; i < count; i++) X_batch[i] = start + i;
-        plotter.compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+        X_batch.resize(count);
+        
+        if(use_svm_f1) {
+            plotter.compute_f1_batch_svm(X_batch, plot_id, Y_batch, M_batch,
+                f1_svm->svm_F1_X, f1_svm->svm_F1_Y, f1_svm->svm_F1_M, batch_size);
+        } else {
+            plotter.compute_f1_batch(X_batch, plot_id, Y_batch, M_batch);
+        }
         
         for(int i = 0; i < num_buckets; i++) batch_buckets[i].clear();
         // Also batch X values (F1 indices) per bucket
@@ -1518,13 +1588,19 @@ void compute_f1_chunked_multi_gpu(
         std::vector<std::future<void>> futs;
         for(int g = 0; g < g_num_gpus && b + g < num_batches; g++) {
             OCL_Plotter& active_pl = (g < (int)g_plotters.size()) ? *g_plotters[g] : plotter;
+            SVMPool* f1_svm_g = (g < (int)g_svmpools.size() && g_svmpools[g]->svm_F1_X) ? g_svmpools[g] : nullptr;
             const uint32_t start = (b + g) * batch_size;
             const uint32_t count = std::min((uint32_t)batch_size, (uint32_t)(total_entries - start));
             for(uint32_t i = 0; i < count; i++) X_bufs[g][i] = start + i;
             X_bufs[g].resize(count);
             // Launch on thread — each thread uses its own GPU's queue
-            futs.push_back(std::async(std::launch::async, [&active_pl, g, &X_bufs, &plot_id, &Y_bufs, &M_bufs]() {
-                active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+            futs.push_back(std::async(std::launch::async, [&active_pl, g, &X_bufs, &plot_id, &Y_bufs, &M_bufs, f1_svm_g, batch_size]() {
+                if(f1_svm_g) {
+                    active_pl.compute_f1_batch_svm(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g],
+                        f1_svm_g->svm_F1_X, f1_svm_g->svm_F1_Y, f1_svm_g->svm_F1_M, batch_size);
+                } else {
+                    active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+                }
             }));
         }
         // Wait for all GPUs to finish
@@ -2905,12 +2981,12 @@ void compute_f2_f9_chunked(
             multi_svm_pools.resize(g_num_gpus);
             for(int g = 0; g < g_num_gpus; g++) {
                 multi_svm_pools[g].init(g_plotters[g]->context, g_plotters[g]->queue, g_plotters[g]->device,
-                                       max_bucket_size, n_meta, num_sub, max_bs2);
+                                       max_bucket_size, n_meta, num_sub, max_bs2, 1 << 18);
                 g_svmpools.push_back(&multi_svm_pools[g]);
             }
         } else {
             svm_pool.init(plotter.context, plotter.queue, plotter.device,
-                         max_bucket_size, n_meta, num_sub, max_bs2);
+                         max_bucket_size, n_meta, num_sub, max_bs2, 1 << 20);
             g_svmpools.push_back(&svm_pool);
         }
     }
@@ -3783,8 +3859,10 @@ auto t0 = my_time_ms();
 std::vector<std::vector<PDEntry>> pd_all;
         // F1 → bucket store
         if(g_num_gpus > 1 && g_plotters.size() > 1)
-            compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 20);
+            // Multi-GPU: use smaller batches for more overlap rounds
+            compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 18);
         else
+            // Single-GPU: larger batches are fine (no overlap needed)
             compute_f1_chunked(plotter, plot_id, store, 1 << 20);
         
         // F2-F9 chunked

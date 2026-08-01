@@ -31,6 +31,11 @@ struct SVMPool {
     void* svm_Y_hash = nullptr;      // [max_matches]
     void* svm_M_hash = nullptr;      // [max_matches * N_META]
     
+    // F1 SVM buffers
+    void* svm_F1_X = nullptr;        // [batch_size] X values
+    void* svm_F1_Y = nullptr;        // [batch_size] Y output
+    void* svm_F1_M = nullptr;        // [batch_size * N_META] M output
+    
     // cl_mem wrappers for coarse-grain SVM (needed for kernel args on some platforms)
     cl_mem mem_C_in = nullptr;
     cl_mem mem_PY = nullptr;
@@ -48,7 +53,8 @@ struct SVMPool {
     bool initialized = false;
     
     void init(cl_context ctx, cl_command_queue q, cl_device_id dev,
-              int max_bucket_size, int n_meta, int num_sub, int max_bs2) {
+              int max_bucket_size, int n_meta, int num_sub, int max_bs2,
+              int f1_batch_size = 0) {
         context = ctx;
         queue = q;
         device = dev;
@@ -100,6 +106,18 @@ struct SVMPool {
         svm_M_hash = clSVMAlloc(context, CL_MEM_WRITE_ONLY | (fine_grain ? CL_MEM_SVM_FINE_GRAIN_BUFFER : 0),
             max_matches * n_meta * 4, 0);
         
+        // F1 SVM buffers (optional — only if f1_batch_size > 0)
+        if(f1_batch_size > 0) {
+            svm_F1_X = clSVMAlloc(context, CL_MEM_READ_ONLY | (fine_grain ? CL_MEM_SVM_FINE_GRAIN_BUFFER : 0),
+                f1_batch_size * sizeof(uint32_t), 0);
+            svm_F1_Y = clSVMAlloc(context, CL_MEM_WRITE_ONLY | (fine_grain ? CL_MEM_SVM_FINE_GRAIN_BUFFER : 0),
+                f1_batch_size * sizeof(uint32_t), 0);
+            svm_F1_M = clSVMAlloc(context, CL_MEM_WRITE_ONLY | (fine_grain ? CL_MEM_SVM_FINE_GRAIN_BUFFER : 0),
+                f1_batch_size * n_meta * 4, 0);
+            if(svm_F1_X && svm_F1_Y && svm_F1_M)
+                std::cout << "[OCL] SVM F1 buffers allocated (batch_size=" << f1_batch_size << ")" << std::endl;
+        }
+        
         if(!svm_C_in || !svm_PY || !svm_sub_cnt || !svm_LR || !svm_num_matches ||
            !svm_L_gathered || !svm_Y_hash) {
             std::cerr << "[OCL] SVM allocation failed!" << std::endl;
@@ -145,6 +163,9 @@ struct SVMPool {
         if(svm_R_gathered) clSVMFree(context, svm_R_gathered);
         if(svm_Y_hash) clSVMFree(context, svm_Y_hash);
         if(svm_M_hash) clSVMFree(context, svm_M_hash);
+        if(svm_F1_X) clSVMFree(context, svm_F1_X);
+        if(svm_F1_Y) clSVMFree(context, svm_F1_Y);
+        if(svm_F1_M) clSVMFree(context, svm_F1_M);
         initialized = false;
     }
 };
