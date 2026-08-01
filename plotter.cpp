@@ -2870,24 +2870,51 @@ void compute_f2_f9_chunked(
         dst.clear();
         
         if(get_opt_config().svm && g_svmpools.size() > 0) {
-            // Module H: SVM pipeline
-            for(int y = 0; y < num_buckets; y++) {
-                if(src.counts[y] == 0) continue;
-                
-                SVMPool* svm = (g_num_gpus > 1 && g_svmpools.size() > 1) ? 
-                    g_svmpools[y % g_num_gpus] : g_svmpools[0];
-                OCL_Plotter& active_pl = (g_num_gpus > 1 && g_plotters.size() > 1) ?
-                    *g_plotters[y % g_num_gpus] : plotter;
-                
-                BucketPending p = submit_bucket_svm(active_pl, src, y, t, svm);
-                submit_hash_svm(p, src);
-                collect_bucket_svm(p, dst);
-                cross_boundary_match(active_pl, src, dst, y, t);
-                
-                if(y % 32 == 0 || y == num_buckets - 1) {
-                    std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
-                              << " (" << (y+1)*100/num_buckets << "%) "
-                              << (my_time_ms() - tt0) / 1000.0 << "s" << std::flush;
+            // Module H: SVM pipeline — 2-wide for multi-GPU
+            if(g_num_gpus > 1 && g_svmpools.size() > 1) {
+                // Multi-GPU: submit pairs concurrently
+                for(int y = 0; y < num_buckets; y += 2) {
+                    bool have0 = (src.counts[y] > 0);
+                    bool have1 = (y + 1 < num_buckets && src.counts[y + 1] > 0);
+                    if(!have0 && !have1) continue;
+                    
+                    // Phase 1: submit BOTH buckets' scatter/sort/match (kernels queue on each GPU)
+                    BucketPending p0, p1;
+                    if(have0) p0 = submit_bucket_svm(*g_plotters[0], src, y, t, g_svmpools[0]);
+                    if(have1) p1 = submit_bucket_svm(*g_plotters[1], src, y + 1, t, g_svmpools[1]);
+                    // Both GPUs are now executing kernels concurrently!
+                    
+                    // Phase 2: submit hash for both (each waits on its own GPU's match)
+                    if(have0) submit_hash_svm(p0, src);
+                    if(have1) submit_hash_svm(p1, src);
+                    
+                    // Phase 3: collect both
+                    if(have0) collect_bucket_svm(p0, dst);
+                    if(have1) collect_bucket_svm(p1, dst);
+                    
+                    if(have0) cross_boundary_match(*g_plotters[0], src, dst, y, t);
+                    if(have1) cross_boundary_match(*g_plotters[1], src, dst, y + 1, t);
+                    
+                    if(y % 32 == 0 || y >= num_buckets - 2) {
+                        std::cerr << "\r[T" << t << "] Bucket " << (y+2) << "/" << num_buckets
+                                  << " (" << (y+2)*100/num_buckets << "%) "
+                                  << (my_time_ms() - tt0) / 1000.0 << "s" << std::flush;
+                    }
+                }
+            } else {
+                // Single-GPU SVM
+                for(int y = 0; y < num_buckets; y++) {
+                    if(src.counts[y] == 0) continue;
+                    BucketPending p = submit_bucket_svm(plotter, src, y, t, g_svmpools[0]);
+                    submit_hash_svm(p, src);
+                    collect_bucket_svm(p, dst);
+                    cross_boundary_match(plotter, src, dst, y, t);
+                    
+                    if(y % 32 == 0 || y == num_buckets - 1) {
+                        std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
+                                  << " (" << (y+1)*100/num_buckets << "%) "
+                                  << (my_time_ms() - tt0) / 1000.0 << "s" << std::flush;
+                    }
                 }
             }
         } else if(g_num_gpus > 1 && g_plotters.size() > 1 && get_opt_config().bufpool) {
