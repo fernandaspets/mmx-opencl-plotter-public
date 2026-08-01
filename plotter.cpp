@@ -358,12 +358,13 @@ public:
             total = std::min(total, test_limit);
             std::cout << "[F1] TEST MODE: limiting to " << total << " entries" << std::endl;
         }
-        const uint64_t num_batches = (total + batch_size - 1) / batch_size;
-        
+        const int ngpus = std::max(1, std::min(g_num_gpus, (int)g_plotters.size()));
+        // For multi-GPU, use smaller batch_size so each GPU gets work
+        uint64_t effective_batch = batch_size;
+        if(ngpus > 1) effective_batch = std::max((uint64_t)(1 << 18), total / ngpus);
+        const uint64_t num_batches = (total + effective_batch - 1) / effective_batch;
         Y_all.resize(total);
         M_all.resize(total * MY_N_META);
-        
-        const int ngpus = std::max(1, std::min(g_num_gpus, (int)g_plotters.size()));
         std::cout << "[F1] Computing " << total << " entries in " << num_batches << " batches on " << ngpus << " GPU" << (ngpus > 1 ? "s" : "") << "..." << std::endl;
         auto t0 = my_time_ms();
         
@@ -371,17 +372,17 @@ public:
             // Multi-GPU: split batches across GPUs concurrently
             std::vector<std::vector<uint32_t>> X_bufs(ngpus), Y_bufs(ngpus), M_bufs(ngpus);
             for(int g = 0; g < ngpus; g++) {
-                X_bufs[g].resize(batch_size);
-                Y_bufs[g].resize(batch_size);
-                M_bufs[g].resize(batch_size * MY_N_META);
+                X_bufs[g].resize(effective_batch);
+                Y_bufs[g].resize(effective_batch);
+                M_bufs[g].resize(effective_batch * MY_N_META);
             }
             
             for(uint64_t b = 0; b < num_batches; b += ngpus) {
                 std::vector<std::future<void>> futs;
                 for(int g = 0; g < ngpus && b + g < num_batches; g++) {
                     OCL_Plotter& active_pl = *g_plotters[g];
-                    const uint64_t start = (b + g) * batch_size;
-                    const uint32_t count = (uint32_t)std::min((uint64_t)batch_size, total - start);
+                    const uint64_t start = (b + g) * effective_batch;
+                    const uint32_t count = (uint32_t)std::min((uint64_t)effective_batch, total - start);
                     for(uint32_t i = 0; i < count; i++) X_bufs[g][i] = (uint32_t)(start + i);
                     X_bufs[g].resize(count);
                     Y_bufs[g].resize(count);
