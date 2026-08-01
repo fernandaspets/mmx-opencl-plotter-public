@@ -2724,16 +2724,12 @@ BucketPending submit_bucket_svm(
 
     // Write C_in data to SVM buffer
     if(svm->fine_grain) {
-        // Fine-grain: use SVM map/unmap as memory barrier (even though fine-grain)
-        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_C_in, p.count_y * n_meta * 4, 0, nullptr, nullptr);
+        // Fine-grain AMD: direct CPU memcpy (shared physical memory, no DMA needed)
+        // std::atomic_thread_fence ensures CPU write is visible to GPU
         std::memcpy(p.svm_C_in, meta_y, p.count_y * n_meta * 4);
-        clEnqueueSVMUnmap(q, p.svm_C_in, 0, nullptr, nullptr);
-        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_sub_cnt, num_sub * 4, 0, nullptr, nullptr);
         std::memset(p.svm_sub_cnt, 0, num_sub * 4);
-        clEnqueueSVMUnmap(q, p.svm_sub_cnt, 0, nullptr, nullptr);
-        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_num_matches, 4, 0, nullptr, nullptr);
         std::memset(p.svm_num_matches, 0, 4);
-        clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
+        std::atomic_thread_fence(std::memory_order_release);
     } else {
         // Coarse-grain: map, write, unmap
         svm->map(p.svm_C_in, p.count_y * n_meta * 4, CL_MAP_WRITE);
@@ -2815,21 +2811,33 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
     const int n_meta = p.n_meta;
     int y = p.y, table = p.table;
     
-    // Read match count — THIS is the sync point (blocks until match kernel done)
-    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
-    p.gpu_matches = *(uint32_t*)p.svm_num_matches;
-    clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
+    // Read match count — clFinish ensures kernel done, then direct CPU read (fine-grain)
+    if(svm->fine_grain) {
+        clFinish(q);
+        p.gpu_matches = *(volatile uint32_t*)p.svm_num_matches;
+    } else {
+        uint32_t match_count = 0;
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
+        match_count = *(uint32_t*)p.svm_num_matches;
+        clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
+        p.gpu_matches = match_count;
+    }
     
     if(p.gpu_matches == 0) {
         p.zero_matches = true;
         return;
     }
     
-    // Read LR pairs from SVM
-    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_LR, p.gpu_matches * 8, 0, nullptr, nullptr);
+    // Read LR pairs — fine-grain: clFinish + direct memcpy; coarse: map/unmap
     p.LR_filtered.resize(p.gpu_matches * 2);
-    std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
-    clEnqueueSVMUnmap(q, p.svm_LR, 0, nullptr, nullptr);
+    if(svm->fine_grain) {
+        clFinish(q);
+        std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
+    } else {
+        svm->map(p.svm_LR, p.gpu_matches * 8, CL_MAP_READ);
+        std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
+        svm->unmap(p.svm_LR);
+    }
     
     // Compute PD
     p.bucket_offset = 0;
@@ -2894,12 +2902,19 @@ void submit_hash_svm(BucketPending& p, MemBucketStore& src)
         // Read Y + M from SVM — clEnqueueSVMMap(CL_TRUE) is the sync point
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_Y_hash, p.num_matches * 4, 0, nullptr, nullptr);
-        std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
-        clEnqueueSVMUnmap(q, p.svm_Y_hash, 0, nullptr, nullptr);
-        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_M_hash, p.num_matches * MY_N_META * 4, 0, nullptr, nullptr);
-        std::memcpy(p.M_out.data(), p.svm_M_hash, p.num_matches * MY_N_META * 4);
-        clEnqueueSVMUnmap(q, p.svm_M_hash, 0, nullptr, nullptr);
+        // Read Y+M — fine-grain: clFinish + direct memcpy; coarse: map/unmap
+        if(svm->fine_grain) {
+            clFinish(q);
+            std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
+            std::memcpy(p.M_out.data(), p.svm_M_hash, p.num_matches * MY_N_META * 4);
+        } else {
+            svm->map(p.svm_Y_hash, p.num_matches * 4, CL_MAP_READ);
+            std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
+            svm->unmap(p.svm_Y_hash);
+            svm->map(p.svm_M_hash, p.num_matches * MY_N_META * 4, CL_MAP_READ);
+            std::memcpy(p.M_out.data(), p.svm_M_hash, p.num_matches * MY_N_META * 4);
+            svm->unmap(p.svm_M_hash);
+        }
     } else {
         // CPU-extract path
         std::vector<uint32_t> L_meta_flat(p.num_matches * n_meta);
@@ -2986,7 +3001,7 @@ void compute_f2_f9_chunked(
             }
         } else {
             svm_pool.init(plotter.context, plotter.queue, plotter.device,
-                         max_bucket_size, n_meta, num_sub, max_bs2, 1 << 20);
+                         max_bucket_size, n_meta, num_sub, max_bs2, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)));
             g_svmpools.push_back(&svm_pool);
         }
     }
@@ -3231,6 +3246,8 @@ void build_plot_data_from_store(
     
     std::cout << "[Plot] Building plot data from pd_all..." << std::endl;
     
+    auto bt0 = my_time_ms();
+    
     // ====================================================================
     // Step 1: For each table t (2..9), sort pd_all[t] by (Y, left_pos)
     //         to get the Y-sorted order. Build remap maps.
@@ -3271,6 +3288,9 @@ void build_plot_data_from_store(
     }
     
     // ====================================================================
+    std::cerr << "[Build] Step 1 (sort pd_all): " << (my_time_ms() - bt0) / 1000.0 << "s" << std::endl;
+    auto bt1 = my_time_ms();
+    
     // Step 2: Build final_Y and final_meta from pd_all[9] (table 9 = final table)
     //         Sort by (Y, left_pos), deduplicate by (Y, metadata)
     // ====================================================================
@@ -3318,6 +3338,9 @@ void build_plot_data_from_store(
         plot.final_Y[i] = pd_all[9][idx].Y;
         plot.final_meta[i] = t9_meta[idx];
     }
+    
+    std::cerr << "[Build] Step 2 (final_Y+meta): " << (my_time_ms() - bt1) / 1000.0 << "s" << std::endl;
+    auto bt2 = my_time_ms();
     
     // ====================================================================
     // Step 3: Build PD[t] for t=2..9
@@ -3372,6 +3395,9 @@ void build_plot_data_from_store(
         std::cout << "[Plot] PD[" << t << "]: " << plot.PD[t].size() << " entries" << std::endl;
     }
     
+    std::cerr << "[Build] Step 3 (PD tables): " << (my_time_ms() - bt2) / 1000.0 << "s" << std::endl;
+    auto bt3 = my_time_ms();
+    
     // ====================================================================
     // ====================================================================
     // Step 4: Build X_pairs from x_pairs_all
@@ -3397,6 +3423,9 @@ void build_plot_data_from_store(
     }
     
     // ====================================================================
+    std::cerr << "[Build] Step 4 (X_pairs): " << (my_time_ms() - bt3) / 1000.0 << "s" << std::endl;
+    auto bt4 = my_time_ms();
+    
     // Step 5: Deduplicate PD[9] to match final_Y
     //         final_indices has the surviving pd_all[9] indices
     //         PD[9] currently has all pd_all[9] entries (sorted by Y)
@@ -3478,7 +3507,7 @@ void build_plot_data_from_store(
     // ====================================================================
     
     // Mark reachable entries in each table (using Y-sorted indices)
-    std::vector<std::vector<bool>> reachable(MY_N_TABLE + 1);
+    std::vector<std::vector<uint8_t>> reachable(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> compact_remap(MY_N_TABLE + 1);  // old Y-sorted idx -> new Y-sorted idx
     
     // T9: all reachable
@@ -3578,6 +3607,8 @@ void build_plot_data_from_store(
     
     std::cout << "[Compact] Done. PD[9]=" << plot.PD[9].size()
               << " X_pairs=" << plot.X_pairs.size() << std::endl;
+    
+    std::cerr << "[Build] Step 5 (compact+dedup): " << (my_time_ms() - bt4) / 1000.0 << "s" << std::endl;
     
 
     // Post-compaction verification: check all PD positions are in bounds
@@ -3862,18 +3893,23 @@ std::vector<std::vector<PDEntry>> pd_all;
             // Multi-GPU: use smaller batches for more overlap rounds
             compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 18);
         else
-            // Single-GPU: larger batches are fine (no overlap needed)
-            compute_f1_chunked(plotter, plot_id, store, 1 << 20);
+            // Single-GPU: batch = total entries (1 batch, no round-trip overhead)
+            compute_f1_chunked(plotter, plot_id, store, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)));
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
         std::vector<std::pair<uint32_t, uint32_t>> x_pairs_all;
         compute_f2_f9_chunked(plotter, store, num_buckets, max_bucket_size, n_meta, gpu_yield, pd_all, x_pairs_all);
         
+        auto t_f29 = my_time_ms();
+        
         // Build PlotData from final bucket store
         std::cout << "\n[Plot] Building plot data from bucket store..." << std::endl;
         PlotData plot;
         build_plot_data_from_store(store, plot, pd_all, x_pairs_all);
+        
+        auto t_build = my_time_ms();
+        std::cout << "[Plot] Build+compact: " << (t_build - t_f29) / 1000.0 << " sec" << std::endl;
     
     if(dump_pd) {
         for(int t = 2; t <= MY_N_TABLE; t++) {
@@ -3914,6 +3950,8 @@ std::vector<std::vector<PDEntry>> pd_all;
         // Write plot file
         std::cout << "\n[Plot] Writing plot file..." << std::endl;
         write_plot(plot_path, plot_id, farmer_key, plot, true);
+        auto t_write = my_time_ms();
+        std::cout << "[Plot] Write: " << (t_write - t_build) / 1000.0 << " sec" << std::endl;
         
         // If using ramdisk, copy plot to final destination
         if(use_ramdisk && !final_dir.empty()) {
