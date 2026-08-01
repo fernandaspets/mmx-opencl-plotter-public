@@ -278,17 +278,18 @@ void compute_f1_kernel(
 	uint hash_state[32];
 	for(int i = 0; i < 32; i++) hash_state[i] = mem[31 * 32 + i];
 
+	#pragma unroll 1
 	for(int iter = 0; iter < MEM_HASH_ITER; iter++) {
 		uint sum = 0;
 		for(int i = 0; i < 32; i++) {
 			sum += rotl32(hash_state[i], i % 32);
 		}
 		uint dir = sum + (sum << 11) + (sum << 22);
-		uint bits = (dir >> 22) % 32;
-		uint offset = (dir >> 27);
+		uint bits = (dir >> 22) & 31;
+		uint offset = (dir >> 27) & 31;
 
 		for(int i = 0; i < 32; i++) {
-			hash_state[i] += rotl32(mem[offset * 32 + (iter + i) % 32], bits) ^ sum;
+			hash_state[i] += rotl32(mem[offset * 32 + ((iter + i) & 31)], bits) ^ sum;
 		}
 		for(int i = 0; i < 32; i++) {
 			mem[offset * 32 + i] ^= hash_state[i];

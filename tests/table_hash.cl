@@ -214,12 +214,6 @@ __kernel void hash_table_lr(
         for(int i = 0; i < 14; i++) M_out[gid * 14 + i] = 0;
         return;
     }
-
-    if(P1 >= num_total_entries || P2 >= num_total_entries) {
-        Y_out[gid] = 0xFFFFFFFF;
-        for(int i = 0; i < 14; i++) M_out[gid * 14 + i] = 0;
-        return;
-    }
     
     // Load L_meta and R_meta directly from M_curr
     __private uint L[14], R[14];
