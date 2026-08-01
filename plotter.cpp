@@ -1487,7 +1487,77 @@ void compute_f1_chunked(
     std::cout << "[F1] Total entries: " << total << std::endl;
 }
 
-void process_bucket_chunk(
+// Multi-GPU F1: split batches across GPUs for concurrent F1 computation
+void compute_f1_chunked_multi_gpu(
+    OCL_Plotter& plotter,
+    const hash_t& plot_id,
+    MemBucketStore& store,
+    int batch_size)
+{
+    const uint64_t total_entries = (uint64_t)1 << KSIZE;
+    const int num_buckets = store.num_buckets;
+    const int n_meta = store.n_meta;
+    const int shift = KSIZE - LOGBUCKETS;
+    
+    const uint32_t num_batches = (total_entries + batch_size - 1) / batch_size;
+    std::cout << "[F1] Multi-GPU: " << total_entries << " entries in " << num_batches
+              << " batches on " << g_num_gpus << " GPUs..." << std::endl;
+    auto t0 = my_time_ms();
+    
+    // Each GPU has its own batch buffers
+    std::vector<std::vector<uint32_t>> X_bufs(g_num_gpus), Y_bufs(g_num_gpus), M_bufs(g_num_gpus);
+    for(int g = 0; g < g_num_gpus; g++) {
+        X_bufs[g].resize(batch_size);
+        Y_bufs[g].resize(batch_size);
+        M_bufs[g].resize(batch_size * n_meta);
+    }
+    
+    // Process batches in pairs (or singles if 1 GPU)
+    for(uint32_t b = 0; b < num_batches; b += g_num_gpus) {
+        // Submit batches to all GPUs
+        for(int g = 0; g < g_num_gpus && b + g < num_batches; g++) {
+            OCL_Plotter& active_pl = (g < (int)g_plotters.size()) ? *g_plotters[g] : plotter;
+            const uint32_t start = (b + g) * batch_size;
+            const uint32_t count = std::min((uint32_t)batch_size, (uint32_t)(total_entries - start));
+            for(uint32_t i = 0; i < count; i++) X_bufs[g][i] = start + i;
+            X_bufs[g].resize(count);
+            active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+        }
+        
+        // Collect results from all GPUs into store
+        for(int g = 0; g < g_num_gpus && b + g < num_batches; g++) {
+            const uint32_t count = X_bufs[g].size();
+            std::vector<std::vector<uint32_t>> batch_buckets(num_buckets);
+            std::vector<std::vector<uint32_t>> batch_x(num_buckets);
+            for(uint32_t i = 0; i < count; i++) {
+                uint32_t Y = Y_bufs[g][i];
+                uint32_t bucket = Y >> shift;
+                if(bucket >= (uint32_t)num_buckets) bucket = num_buckets - 1;
+                for(int j = 0; j < n_meta; j++)
+                    batch_buckets[bucket].push_back(M_bufs[g][i * n_meta + j]);
+                batch_x[bucket].push_back(X_bufs[g][i]);
+            }
+            for(int y = 0; y < num_buckets; y++) {
+                if(batch_buckets[y].empty()) continue;
+                uint32_t cnt = batch_buckets[y].size() / n_meta;
+                store.append(y, batch_buckets[y].data(), cnt);
+                store.append_x(y, batch_x[y].data(), cnt);
+            }
+        }
+        
+        if(b % 16 == 0 || b >= num_batches - g_num_gpus) {
+            std::cerr << "\r[F1] Batch " << std::min(b + g_num_gpus, num_batches) << "/" << num_batches
+                      << " (" << std::min((b + g_num_gpus) * 100 / num_batches, 100u) << "%) "
+                      << (my_time_ms() - t0) / 1000.0 << "s" << std::flush;
+        }
+    }
+    
+    auto elapsed = my_time_ms() - t0;
+    std::cout << "\n[F1] Done in " << elapsed / 1000.0 << " sec" << std::endl;
+    uint64_t total = 0;
+    for(int i = 0; i < num_buckets; i++) total += store.counts[i];
+    std::cout << "[F1] Total entries: " << total << std::endl;
+}
     OCL_Plotter& plotter,
     MemBucketStore& src,
     MemBucketStore& dst,
@@ -3702,7 +3772,10 @@ else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
 auto t0 = my_time_ms();
 std::vector<std::vector<PDEntry>> pd_all;
         // F1 → bucket store
-        compute_f1_chunked(plotter, plot_id, store, 1 << 18);
+        if(g_num_gpus > 1 && g_plotters.size() > 1)
+            compute_f1_chunked_multi_gpu(plotter, plot_id, store, 1 << 18);
+        else
+            compute_f1_chunked(plotter, plot_id, store, 1 << 18);
         
         // F2-F9 chunked
         std::cout << "\n[CPU] Computing F2-F9 (chunked)..." << std::endl;
