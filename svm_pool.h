@@ -31,6 +31,8 @@ struct SVMPool {
     void* svm_Y_hash = nullptr;      // [max_matches]
     void* svm_M_hash = nullptr;      // [max_matches * N_META]
     
+    size_t max_matches = 0;  // max_bucket_size * 4, stored for kernel launches
+    
     // F1 SVM buffers
     void* svm_F1_X = nullptr;        // [batch_size] X values
     void* svm_F1_Y = nullptr;        // [batch_size] Y output
@@ -78,7 +80,7 @@ struct SVMPool {
         }
         
         size_t max_total = (size_t)max_bucket_size;
-        size_t max_matches = (size_t)max_bucket_size * 4;
+        max_matches = (size_t)max_bucket_size * 4;
         
         // Allocate SVM buffers
         svm_C_in = clSVMAlloc(context, CL_MEM_READ_ONLY | (fine_grain ? CL_MEM_SVM_FINE_GRAIN_BUFFER : 0),
