@@ -1088,6 +1088,7 @@ void write_plot(
                 for(uint64_t i = 1; i < count; i++) {
                     uint32_t delta = plot.final_Y[start + i] - plot.final_Y[start + i - 1];
                     if(delta > 255) throw std::runtime_error("Y delta too large: " + std::to_string(delta));
+                    if(delta > 47) std::cerr << "[WARN] Y delta " << delta << " > 47 at park " << p << " entry " << i << std::endl;
                     auto sym = mmx::pos::encode_symbol((uint8_t)delta);
                     write_bits(park, sym.first, delta_bit_offset, sym.second);
                     delta_bit_offset += sym.second;
@@ -1513,6 +1514,10 @@ void cross_boundary_match(
 
     // All combinations of left × right are matches (Y, Y+1)
     size_t num_cross = left_indices.size() * right_indices.size();
+    static uint64_t total_cross = 0;
+    total_cross += num_cross;
+    std::cout << "[Cross] T" << table << " bucket " << y << ": " << num_cross
+              << " cross-boundary matches (total: " << total_cross << ")" << std::endl;
 
     // Build L_meta and R_meta for hashing
     std::vector<uint32_t> L_meta_flat(num_cross * n_meta);
@@ -1902,6 +1907,12 @@ void compute_f2_f9_chunked(
         // For table 2, X_pairs are now collected from dst store alongside pd_all
         if(t == 2) {
             std::cout << "[T2] X_pairs saved: " << x_pairs_all.size() << " entries" << std::endl;
+            
+            // Verify x_pairs_all and pd_all[2] are in sync
+            if(x_pairs_all.size() != pd_all[2].size()) {
+                std::cerr << "[ERROR] x_pairs_all size (" << x_pairs_all.size()
+                          << ") != pd_all[2] size (" << pd_all[2].size() << ")" << std::endl;
+            }
         }
         
         // Swap src and dst
@@ -1997,8 +2008,20 @@ void build_plot_data_from_store(
         }
     }
     
-    // Build final_Y sorted by (Y, left_pos), deduped by (Y, metadata)
+    // Build final_Y sorted by (Y, pd_all_index), deduped by (Y, metadata)
     std::vector<uint32_t> final_indices;  // pd_all[9] indices that survive dedup
+    
+    // Count true (Y, metadata) duplicates
+    {
+        std::map<std::pair<uint32_t, std::array<uint32_t, 14>>, int> seen;
+        int total_dups = 0;
+        for(size_t i = 0; i < pd_all[9].size(); i++) {
+            auto key = std::make_pair(pd_all[9][i].Y, t9_meta[i]);
+            if(seen[key]++ > 0) total_dups++;
+        }
+        std::cout << "[Plot] True (Y, metadata) duplicates: " << total_dups
+                  << " out of " << pd_all[9].size() << std::endl;
+    }
     
     for(size_t i = 0; i < sort_order[9].size(); i++) {
         uint32_t orig_idx = sort_order[9][i];
@@ -2078,6 +2101,7 @@ void build_plot_data_from_store(
     }
     
     // ====================================================================
+    // ====================================================================
     // Step 4: Build X_pairs from x_pairs_all
     //         Sort by Y to match PD[2] ordering
     // ====================================================================
@@ -2134,6 +2158,118 @@ void build_plot_data_from_store(
         plot.num_entries[t] = (t < (int)pd_all.size()) ? pd_all[t].size() : 0;
     }
     
+    // Step 3b: Phase 2 compaction — remove unreachable entries
+    //          CUDA plotter does this in phase 2. We need to match.
+    //          1. Start from T9 (all reachable — they're the roots)
+    //          2. For t = 8 down to 2: mark T(t) entries referenced by reachable T(t+1)
+    //          3. Build remap: old Y-sorted index -> new compacted Y-sorted index
+    //          4. Rebuild PD with compacted positions
+    //          5. Rebuild final_Y, final_meta, X_pairs with compacted indices
+    // ====================================================================
+    
+    // Mark reachable entries in each table (using Y-sorted indices)
+    std::vector<std::vector<bool>> reachable(MY_N_TABLE + 1);
+    std::vector<std::vector<uint32_t>> compact_remap(MY_N_TABLE + 1);  // old Y-sorted idx -> new Y-sorted idx
+    
+    // T9: all reachable
+    reachable[MY_N_TABLE].resize(plot.PD[MY_N_TABLE].size(), true);
+    
+    // T8 down to T2: mark entries referenced by reachable T(t+1)
+    for(int t = MY_N_TABLE - 1; t >= 2; t--) {
+        if(t + 1 > MY_N_TABLE || plot.PD[t + 1].empty()) {
+            reachable[t].resize(plot.PD[t].size(), true);
+            continue;
+        }
+        reachable[t].resize(plot.PD[t].size(), false);
+        
+        // For each reachable entry in T(t+1), mark its left and right parents in T(t)
+        for(size_t i = 0; i < plot.PD[t + 1].size(); i++) {
+            if(t + 1 < MY_N_TABLE && !reachable[t + 1][i]) continue;
+            uint32_t pos = plot.PD[t + 1][i].first;
+            uint32_t delta = plot.PD[t + 1][i].second;
+            uint32_t right = pos + delta;
+            if(pos < reachable[t].size()) reachable[t][pos] = true;
+            if(right < reachable[t].size()) reachable[t][right] = true;
+        }
+        
+        // Build compact remap for table t
+        compact_remap[t].resize(reachable[t].size());
+        uint32_t new_idx = 0;
+        for(size_t i = 0; i < reachable[t].size(); i++) {
+            if(reachable[t][i]) {
+                compact_remap[t][i] = new_idx++;
+            } else {
+                compact_remap[t][i] = 0xFFFFFFFF;  // invalid
+            }
+        }
+        size_t removed = reachable[t].size() - new_idx;
+        std::cout << "[Compact] T" << t << ": " << new_idx << " reachable, "
+                  << removed << " removed (was " << reachable[t].size() << ")" << std::endl;
+    }
+    
+    // Build compact remap for T9 (all reachable, so identity)
+    compact_remap[MY_N_TABLE].resize(plot.PD[MY_N_TABLE].size());
+    for(size_t i = 0; i < compact_remap[MY_N_TABLE].size(); i++) {
+        compact_remap[MY_N_TABLE][i] = (uint32_t)i;
+    }
+    
+    // Remap PD positions to compacted indices
+    for(int t = 3; t <= MY_N_TABLE; t++) {
+        if(plot.PD[t].empty()) continue;
+        for(size_t i = 0; i < plot.PD[t].size(); i++) {
+            // Only keep entries that are reachable in T(t)
+            if(t < MY_N_TABLE && !reachable[t][i]) continue;
+            uint32_t pos = plot.PD[t][i].first;
+            uint32_t delta = plot.PD[t][i].second;
+            uint32_t right = pos + delta;
+            // Remap to compacted indices in T(t-1)
+            if(pos < compact_remap[t - 1].size()) {
+                plot.PD[t][i].first = compact_remap[t - 1][pos];
+            }
+            if(right < compact_remap[t - 1].size()) {
+                uint32_t new_right = compact_remap[t - 1][right];
+                plot.PD[t][i].second = new_right - plot.PD[t][i].first;
+            }
+        }
+    }
+    
+    // Remove unreachable entries from PD tables (compact them)
+    for(int t = 3; t <= MY_N_TABLE; t++) {
+        if(plot.PD[t].empty() || reachable[t].empty()) continue;
+        std::vector<std::pair<uint32_t, uint32_t>> new_pd;
+        new_pd.reserve(reachable[t].size());
+        for(size_t i = 0; i < plot.PD[t].size(); i++) {
+            if(t < MY_N_TABLE && !reachable[t][i]) continue;
+            new_pd.push_back(plot.PD[t][i]);
+        }
+        plot.PD[t] = std::move(new_pd);
+    }
+    
+    // Compact X_pairs (table 2): only keep reachable entries
+    if(!plot.X_pairs.empty()) {
+        std::vector<std::pair<uint32_t, uint32_t>> new_xp;
+        new_xp.reserve(plot.X_pairs.size());
+        for(size_t i = 0; i < plot.X_pairs.size(); i++) {
+            if(i < reachable[2].size() && reachable[2][i]) {
+                new_xp.push_back(plot.X_pairs[i]);
+            }
+        }
+        plot.X_pairs = std::move(new_xp);
+    }
+    
+    // Compact final_Y and final_meta (T9 — all reachable, no change needed)
+    // But update num_entries
+    for(int t = 2; t <= MY_N_TABLE; t++) {
+        if(t < (int)plot.num_entries.size()) {
+            plot.num_entries[t] = plot.PD[t].size();
+        }
+    }
+    plot.num_entries[2] = plot.X_pairs.size();
+    
+    std::cout << "[Compact] Done. PD[9]=" << plot.PD[9].size()
+              << " X_pairs=" << plot.X_pairs.size() << std::endl;
+    
+
     // Verify PD chain before writing
     {
         // Build Y-sorted arrays for each table: Y_sorted[t][j] = pd_all[t][sort_order[t][j]].Y
