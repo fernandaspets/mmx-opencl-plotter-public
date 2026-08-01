@@ -31,10 +31,14 @@
 #include <iostream>
 #include <stdexcept>
 #include "opt_config.h"
+#include "buffer_pool.h"
 
 // Forward declarations for globals defined later
 extern bool gpu_yield;
 extern bool timing_detail;
+
+// Global buffer pool (Module C) — initialized in compute_f2_f9_chunked
+BufferPool* g_bufpool = nullptr;
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1721,19 +1725,39 @@ void process_bucket_gpu(
     std::vector<uint32_t> C_combined(total * n_meta);
     std::memcpy(C_combined.data(), meta_y, count_y * n_meta * 4);
     
-    cl_mem C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        C_combined.size() * 4, (void*)C_combined.data(), &err);
-    CL_CHECK(err, "C_in_buf creation");
-    print_step("upload_C_in");
+    cl_mem C_in_buf, PY_buf, sub_cnt_buf, sub_off_buf, LR_buf, PD_match_buf, num_matches_buf;
+    bool using_pool = (g_bufpool != nullptr && g_bufpool->initialized);
+    bool pool_release_skip = false;  // if true, don't release at end (pool owns them)
     
-    // Step 2: GPU scatter_2 — sub-bucket by Y's full (LOGBUCKETS+LOGBUCKETS2) bits
-    cl_mem PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
-        (size_t)num_sub * max_bs2 * 8, nullptr, &err);
-    CL_CHECK(err, "PY_buf creation");
-    cl_mem sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
-        num_sub * 4, nullptr, &err);
-    CL_CHECK(err, "sub_cnt_buf creation");
-    clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+    if(using_pool) {
+        // Module C: Reuse pre-allocated buffers — just write data, no create/destroy
+        C_in_buf = g_bufpool->C_in_buf;
+        clEnqueueWriteBuffer(plotter.queue, C_in_buf, CL_TRUE, 0,
+            count_y * n_meta * 4, meta_y, 0, nullptr, nullptr);
+        
+        PY_buf = g_bufpool->PY_buf;
+        sub_cnt_buf = g_bufpool->sub_cnt_buf;
+        clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+        
+        LR_buf = g_bufpool->LR_buf;
+        PD_match_buf = g_bufpool->PD_match_buf;
+        num_matches_buf = g_bufpool->num_matches_buf;
+        
+        pool_release_skip = true;  // pool will clean these up
+    } else {
+        C_in_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            C_combined.size() * 4, (void*)C_combined.data(), &err);
+        CL_CHECK(err, "C_in_buf creation");
+        
+        PY_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+            (size_t)num_sub * max_bs2 * 8, nullptr, &err);
+        CL_CHECK(err, "PY_buf creation");
+        sub_cnt_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+            num_sub * 4, nullptr, &err);
+        CL_CHECK(err, "sub_cnt_buf creation");
+        clEnqueueFillBuffer(plotter.queue, sub_cnt_buf, &zero, 4, 0, num_sub * 4, 0, nullptr, nullptr);
+    }
+    print_step("upload_C_in");
     
     uint32_t total_u32 = total;
     uint32_t max_bs2_u32 = max_bs2;
@@ -1750,13 +1774,15 @@ void process_bucket_gpu(
     print_step("scatter");
     
     // Step 3: Prefix sum of sub-bucket counts
-    // Step 3: Prefix sum of sub-bucket counts
-    cl_mem sub_off_buf;
+    if(using_pool) sub_off_buf = g_bufpool->sub_off_buf;
+    
     if(get_opt_config().gpu_prefix_sum && plotter.prefix_sum_kernel) {
         // Module A: GPU prefix sum — no readback needed (except last element for overflow check)
-        sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
-            (num_sub + 1) * 4, nullptr, &err);
-        CL_CHECK(err, "sub_off_buf (gpu prefix)");
+        if(!using_pool) {
+            sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE,
+                (num_sub + 1) * 4, nullptr, &err);
+            CL_CHECK(err, "sub_off_buf (gpu prefix)");
+        }
         
         uint32_t num_sub_u32 = (uint32_t)num_sub;
         clSetKernelArg(plotter.prefix_sum_kernel, 0, sizeof(cl_mem), &sub_cnt_buf);
@@ -1785,9 +1811,14 @@ void process_bucket_gpu(
                       << " bucket " << y << " table " << table << std::endl;
         }
         
-        sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            (num_sub + 1) * 4, (void*)sub_off.data(), &err);
-        CL_CHECK(err, "sub_off_buf creation");
+        if(!using_pool) {
+            sub_off_buf = clCreateBuffer(plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                (num_sub + 1) * 4, (void*)sub_off.data(), &err);
+            CL_CHECK(err, "sub_off_buf creation");
+        } else {
+            clEnqueueWriteBuffer(plotter.queue, sub_off_buf, CL_TRUE, 0,
+                (num_sub + 1) * 4, sub_off.data(), 0, nullptr, nullptr);
+        }
     }
     
     // Step 4: GPU simple_sort_y — sort within each sub-bucket
@@ -1803,14 +1834,16 @@ void process_bucket_gpu(
     print_step("sort");
     
     // Step 5: GPU match_p1 — find Y,Y+1 pairs
-    cl_mem LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-        (size_t)total * 4 * 8, nullptr, &err);
-    CL_CHECK(err, "LR_buf creation");
-    cl_mem PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-        (size_t)total * 4 * 4, nullptr, &err);
-    CL_CHECK(err, "PD_match_buf creation");
-    cl_mem num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
-    CL_CHECK(err, "num_matches_buf creation");
+    if(!using_pool) {
+        LR_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            (size_t)total * 4 * 8, nullptr, &err);
+        CL_CHECK(err, "LR_buf creation");
+        PD_match_buf = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+            (size_t)total * 4 * 4, nullptr, &err);
+        CL_CHECK(err, "PD_match_buf creation");
+        num_matches_buf = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+        CL_CHECK(err, "num_matches_buf creation");
+    }
     clEnqueueFillBuffer(plotter.queue, num_matches_buf, &zero, 4, 0, 4, 0, nullptr, nullptr);
     
     uint32_t max_total = total * 4;  // matches can exceed entries for high density
@@ -1836,9 +1869,11 @@ void process_bucket_gpu(
     print_step("download_match_count");
     
     if(gpu_matches == 0) {
-        clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
-        clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
-        clReleaseMemObject(num_matches_buf);
+        if(!using_pool) {
+            clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+            clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+            clReleaseMemObject(num_matches_buf);
+        }
         return;
     }
     
@@ -1850,9 +1885,11 @@ void process_bucket_gpu(
     // X pairs for table 2 are now saved into dst store alongside metadata and PD
     
     if(LR_filtered.empty()) {
-        clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
-        clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
-        clReleaseMemObject(num_matches_buf);
+        if(!using_pool) {
+            clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+            clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+            clReleaseMemObject(num_matches_buf);
+        }
         return;
     }
     
@@ -1892,12 +1929,24 @@ void process_bucket_gpu(
         uint32_t n_meta_u32 = (uint32_t)n_meta;
         
         // GPU gather: read M_curr[P1], M_curr[P2] → L_meta_out, R_meta_out
-        cl_mem L_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-            num_matches * n_meta * 4, nullptr, &err2);
-        CL_CHECK(err2, "L_gathered");
-        cl_mem R_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
-            num_matches * n_meta * 4, nullptr, &err2);
-        CL_CHECK(err2, "R_gathered");
+        cl_mem L_gathered, R_gathered, Yb, Mb;
+        if(using_pool) {
+            L_gathered = g_bufpool->L_gathered;
+            R_gathered = g_bufpool->R_gathered;
+            Yb = g_bufpool->Y_hash_buf;
+            Mb = g_bufpool->M_hash_buf;
+        } else {
+            L_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+                num_matches * n_meta * 4, nullptr, &err2);
+            CL_CHECK(err2, "L_gathered");
+            R_gathered = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY,
+                num_matches * n_meta * 4, nullptr, &err2);
+            CL_CHECK(err2, "R_gathered");
+            Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
+            CL_CHECK(err2, "Yb (meta-extract)");
+            Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
+            CL_CHECK(err2, "Mb (meta-extract)");
+        }
         
         clSetKernelArg(plotter.gather_meta_kernel, 0, sizeof(cl_mem), &C_in_buf);
         clSetKernelArg(plotter.gather_meta_kernel, 1, sizeof(cl_mem), &LR_buf);
@@ -1914,11 +1963,6 @@ void process_bucket_gpu(
         print_step("gather");
         
         // GPU hash: hash_table_entries with gathered metadata (sequential reads)
-        cl_mem Yb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err2);
-        CL_CHECK(err2, "Yb (meta-extract)");
-        cl_mem Mb = clCreateBuffer(plotter.context, CL_MEM_WRITE_ONLY, num_matches * MY_N_META * 4, nullptr, &err2);
-        CL_CHECK(err2, "Mb (meta-extract)");
-        
         uint32_t kmask = KMASK;
         clSetKernelArg(plotter.table_hash_kernel, 0, sizeof(cl_mem), &L_gathered);
         clSetKernelArg(plotter.table_hash_kernel, 1, sizeof(cl_mem), &R_gathered);
@@ -1938,10 +1982,12 @@ void process_bucket_gpu(
         clEnqueueReadBuffer(plotter.queue, Mb, CL_TRUE, 0, num_matches * MY_N_META * 4, M_out.data(), 0, nullptr, nullptr);
         print_step("hash+download");
         
-        clReleaseMemObject(L_gathered);
-        clReleaseMemObject(R_gathered);
-        clReleaseMemObject(Yb);
-        clReleaseMemObject(Mb);
+        if(!using_pool) {
+            clReleaseMemObject(L_gathered);
+            clReleaseMemObject(R_gathered);
+            clReleaseMemObject(Yb);
+            clReleaseMemObject(Mb);
+        }
     } else {
         // Original path: CPU meta extraction + gpu_hash_table (re-upload)
         std::vector<uint32_t> L_meta_flat(num_matches * n_meta);
@@ -2002,9 +2048,11 @@ void process_bucket_gpu(
     }
     
     // Cleanup GPU resources
-    clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
-    clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
-    clReleaseMemObject(num_matches_buf);
+    if(!using_pool) {
+        clReleaseMemObject(C_in_buf); clReleaseMemObject(PY_buf); clReleaseMemObject(sub_cnt_buf);
+        clReleaseMemObject(sub_off_buf); clReleaseMemObject(LR_buf); clReleaseMemObject(PD_match_buf);
+        clReleaseMemObject(num_matches_buf);
+    }
 
 }
 
@@ -2026,6 +2074,16 @@ void compute_f2_f9_chunked(
 {
     MemBucketStore src(num_buckets, max_bucket_size, n_meta);
     MemBucketStore dst(num_buckets, max_bucket_size, n_meta);
+    
+    // Module C: Initialize buffer pool if enabled
+    BufferPool bufpool;
+    if(get_opt_config().bufpool) {
+        int logbuckets2 = KSIZE - LOGBUCKETS - 9;
+        int num_sub = 1 << logbuckets2;
+        int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
+        bufpool.init(plotter.context, plotter.queue, max_bucket_size, n_meta, num_sub, max_bs2);
+        g_bufpool = &bufpool;
+    }
     
     // Copy F1 output to src (metadata + X values)
     for(int y = 0; y < num_buckets; y++) {
@@ -2133,6 +2191,12 @@ std::swap(src.x_values, dst.x_values);
     }
     
     std::cout << "[CPU] F2-F9 done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
+    
+    // Module C: cleanup buffer pool
+    if(get_opt_config().bufpool) {
+        bufpool.cleanup();
+        g_bufpool = nullptr;
+    }
 }
 
 
@@ -2591,6 +2655,7 @@ std::cerr << "  --opt-gpu-meta  Module B: GPU metadata extraction (skip CPU extr
 std::cerr << "  --opt-gpu-prefix Module A: GPU prefix sum (skip sub-count readback)" << std::endl;
 std::cerr << "  --opt-async     Module D: Async PCIe transfers" << std::endl;
 std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buckets)" << std::endl;
+std::cerr << "  --opt-bufpool   Module C: Pre-allocated reusable GPU buffers" << std::endl;
 std::cerr << "  --timing        Show per-step timing for first bucket of each table" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
@@ -2617,6 +2682,7 @@ else if(arg == "--opt-gpu-prefix") get_opt_config().gpu_prefix_sum = true;
 else if(arg == "--opt-async") get_opt_config().async_transfers = true;
 else if(arg == "--opt-queues" && i+1 < argc) get_opt_config().num_queues = std::stoi(argv[++i]);
 else if(arg == "--timing") timing_detail = true;
+else if(arg == "--opt-bufpool") get_opt_config().bufpool = true;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {

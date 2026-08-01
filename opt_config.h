@@ -34,9 +34,12 @@ struct OptConfig {
     // Module F: Kernel fusion (combine scatter+sort+match)
     bool fuse_kernels = false;
     
+    // Module C: Pre-allocated buffer pool (reuse GPU buffers across buckets)
+    bool bufpool = false;
+    
     // Helper: any optimization enabled?
     bool any_enabled() const {
-        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels;
+        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool;
     }
     
     // Print current config
@@ -47,6 +50,7 @@ struct OptConfig {
         std::cout << "  async_transfers: " << (async_transfers ? "ON" : "off") << std::endl;
         std::cout << "  num_queues:      " << num_queues << std::endl;
         std::cout << "  fuse_kernels:   " << (fuse_kernels ? "ON" : "off") << std::endl;
+        std::cout << "  bufpool:        " << (bufpool ? "ON" : "off") << std::endl;
     }
 };
 
