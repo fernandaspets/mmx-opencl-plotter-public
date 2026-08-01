@@ -170,7 +170,7 @@ public:
         
         program = clCreateProgramWithSource(context, 1, (const char**)&src, &sz, &err);
         delete[] src;
-        err = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+        err = clBuildProgram(program, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
         if(err != CL_SUCCESS) {
             char log[4096]; clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
             throw std::runtime_error(std::string("OpenCL build failed: ") + log);
@@ -304,7 +304,7 @@ public:
         cl_int err;
         cl_program prog = clCreateProgramWithSource(context, 1, (const char**)&src, &sz, &err);
         delete[] src;
-        err = clBuildProgram(prog, 1, &device, nullptr, nullptr, nullptr);
+        err = clBuildProgram(prog, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
         if(err != CL_SUCCESS) {
             char log[4096]; clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
             throw std::runtime_error(std::string("table_hash build failed: ") + log);
@@ -425,7 +425,7 @@ public:
         f2f9_program = clCreateProgramWithSource(context, 1, &cstr, &len, &err2);
         
         // Build with current constants
-        std::string opts = "-DKSIZE=" + std::to_string(KSIZE)
+        std::string opts = "-cl-std=CL1.2 -DKSIZE=" + std::to_string(KSIZE)
                          + " -DLOGBUCKETS=" + std::to_string(LOGBUCKETS)
                          + " -DLOGBUCKETS2=" + std::to_string(KSIZE - LOGBUCKETS - 9)
                          + " -DN_META=" + std::to_string(MY_N_META)
