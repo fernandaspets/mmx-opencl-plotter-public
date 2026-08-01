@@ -389,19 +389,24 @@ public:
                     M_bufs[g].resize(count * MY_N_META);
                     
                     bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_F1_X;
-                    futs.push_back(std::async(std::launch::async, [&, g, start, count]() {
-                        if(use_svm_g) {
-                            active_pl.compute_f1_batch_svm(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g],
-                                g_svmpools[g]->svm_F1_X, g_svmpools[g]->svm_F1_Y, g_svmpools[g]->svm_F1_M, (size_t)-1);
-                        } else {
-                            active_pl.compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+                    futs.push_back(std::async(std::launch::async, [&, g, start, count, use_svm_g]() {
+                        try {
+                            if(use_svm_g) {
+                                g_plotters[g]->compute_f1_batch_svm(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g],
+                                    g_svmpools[g]->svm_F1_X, g_svmpools[g]->svm_F1_Y, g_svmpools[g]->svm_F1_M, (size_t)-1);
+                            } else {
+                                g_plotters[g]->compute_f1_batch(X_bufs[g], plot_id, Y_bufs[g], M_bufs[g]);
+                            }
+                        } catch(const std::exception& e) {
+                            std::cerr << "[F1] GPU " << g << " error: " << e.what() << std::endl;
+                            throw;
                         }
                     }));
                 }
                 for(auto& f : futs) f.wait();
                 
                 for(int g = 0; g < ngpus && b + g < num_batches; g++) {
-                    const uint64_t start = (b + g) * batch_size;
+                    const uint64_t start = (b + g) * effective_batch;
                     const uint32_t count = X_bufs[g].size();
                     std::memcpy(Y_all.data() + start, Y_bufs[g].data(), count * sizeof(uint32_t));
                     std::memcpy(M_all.data() + start * MY_N_META, M_bufs[g].data(), count * MY_N_META * sizeof(uint32_t));
