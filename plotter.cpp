@@ -2334,8 +2334,8 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
 
     // Read LR pairs
     p.LR_filtered.resize(p.gpu_matches * 2);
-    if(get_opt_config().pinned && p.active_pool && p.active_pool->pinned_LR_ptr) {
-        // Module G: Async read to pinned buffer, then copy to LR_filtered
+    if(false && get_opt_config().pinned && p.active_pool && p.active_pool->pinned_LR_ptr) {
+        // Module G: disabled on NVIDIA (mapped buffer read conflict)
         clEnqueueReadBuffer(q, p.LR_buf, CL_TRUE, 0, p.gpu_matches * 8,
             p.active_pool->pinned_LR_ptr, 0, nullptr, nullptr);
         std::memcpy(p.LR_filtered.data(), p.active_pool->pinned_LR_ptr, p.gpu_matches * 8);
@@ -2417,8 +2417,8 @@ void submit_hash_pipeline(BucketPending& p, MemBucketStore& src)
         // Non-blocking reads of Y + M results — ev_hash_done guards both (in-order queue)
         p.Y_out.resize(p.num_matches);
         p.M_out.resize(p.num_matches * MY_N_META);
-        if(get_opt_config().pinned && p.active_pool && p.active_pool->pinned_Y_ptr) {
-            // Module G: Read to pinned buffers (fast DMA), then copy
+        if(false && get_opt_config().pinned && p.active_pool && p.active_pool->pinned_Y_ptr) {
+            // Module G: disabled on NVIDIA (mapped buffer read conflict)
             clEnqueueReadBuffer(q, p.Yb, CL_TRUE, 0, p.num_matches * 4,
                 p.active_pool->pinned_Y_ptr, 0, nullptr, nullptr);
             clEnqueueReadBuffer(q, p.Mb, CL_TRUE, 0, p.num_matches * MY_N_META * 4,
