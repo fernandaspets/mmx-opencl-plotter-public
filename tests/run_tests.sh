@@ -322,3 +322,23 @@ if [ "$FAIL" -gt 0 ]; then
 else
     exit 0
 fi
+
+# Test 8: Chunked pipeline verification
+run_test 8 "Chunked pipeline k18: generate + verify with postool" "" ""
+PLOT_ID=$(python3 -c "import os; print(os.urandom(32).hex())")
+FARMER_KEY="02292cd11aa18e5f64344cbe6c580249364dfe5a3683adc25446aadcc1b38555d7"
+rm -f /mnt/ramdisk/plot-mmx-hdd-k18-*.plot
+LD_LIBRARY_PATH=/opt/rocm/lib "$BUILDDIR/mmx_opencl_plotter" "$PLOT_ID" "$FARMER_KEY" /mnt/ramdisk/ --k 18 --chunked > /dev/null 2>&1
+PLOTFILE=$(ls /mnt/ramdisk/plot-mmx-hdd-k18-*.plot 2>/dev/null | head -1)
+if [ -z "$PLOTFILE" ]; then
+    fail "No plot file generated"
+else
+    RESULT=$(cd ~/mmx-node && LD_LIBRARY_PATH=/opt/rocm/lib ./build_opencl/tools/mmx_postool -f "$PLOTFILE" -n 20 -v 2>&1 | grep "Pass:")
+    PASS_PCT=$(echo "$RESULT" | grep -oP '\d+(?=\s*%)' | head -1)
+    if [ -n "$PASS_PCT" ] && [ "$PASS_PCT" -ge 30 ]; then
+        pass "Chunked pipeline k18: $RESULT"
+    else
+        fail "Chunked pipeline k18: $RESULT (expected >=30%)"
+    fi
+fi
+rm -f /mnt/ramdisk/plot-mmx-hdd-k18-*.plot
