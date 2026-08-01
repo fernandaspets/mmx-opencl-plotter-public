@@ -239,31 +239,17 @@ public:
         
         std::cout << "[OCL] F1 kernel loaded" << std::endl;
         
-        // Try loading warp-parallel F1 kernels
-        std::string warp_path = "f1_warp.cl";
-        FILE* fw = fopen(warp_path.c_str(), "r");
-        if(fw) {
-            fseek(fw, 0, SEEK_END); size_t wsz = ftell(fw); fseek(fw, 0, SEEK_SET);
-            char* wsrc = new char[wsz+1]; fread(wsrc, 1, wsz, fw); wsrc[wsz] = 0; fclose(fw);
-            cl_int werr;
-            f1_warp_program = clCreateProgramWithSource(context, 1, (const char**)&wsrc, &wsz, &werr);
-            delete[] wsrc;
-            werr = clBuildProgram(f1_warp_program, 1, &device, "-cl-std=CL2.0", nullptr, nullptr);
-            if(werr != CL_SUCCESS) {
-                char log[8192]; clGetProgramBuildInfo(f1_warp_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
-                std::cerr << "[OCL] f1_warp.cl build failed (warp F1 disabled): " << log << std::endl;
-                clReleaseProgram(f1_warp_program); f1_warp_program = nullptr;
-            } else {
-                gen_mem_kernel = clCreateKernel(f1_warp_program, "gen_mem_array_kernel", &werr);
-                calc_memhash_kernel = clCreateKernel(f1_warp_program, "calc_mem_hash_kernel", &werr);
-                scatter_f1_kernel = clCreateKernel(f1_warp_program, "scatter_f1_kernel", &werr);
-                if(gen_mem_kernel && calc_memhash_kernel && scatter_f1_kernel) {
-                    f1_warp_loaded = true;
-                    std::cout << "[OCL] Warp-parallel F1 kernels loaded (3-kernel pipeline)" << std::endl;
-                } else {
-                    std::cerr << "[OCL] Some warp F1 kernels missing" << std::endl;
-                }
-            }
+        // Try loading split F1 kernels from the SAME program (pos_recompute.cl)
+        // These are gen_mem_array_v2_kernel, calc_mem_hash_v2_kernel, scatter_f1_v2_kernel
+        cl_int werr;
+        gen_mem_kernel = clCreateKernel(program, "gen_mem_array_v2_kernel", &werr);
+        calc_memhash_kernel = clCreateKernel(program, "calc_mem_hash_v2_kernel", &werr);
+        scatter_f1_kernel = clCreateKernel(program, "scatter_f1_v2_kernel", &werr);
+        if(gen_mem_kernel && calc_memhash_kernel && scatter_f1_kernel) {
+            f1_warp_loaded = true;
+            std::cout << "[OCL] Split F1 kernels loaded (3-kernel pipeline from pos_recompute.cl)" << std::endl;
+        } else {
+            std::cerr << "[OCL] Split F1 kernels not found" << std::endl;
         }
     }
     
@@ -394,7 +380,7 @@ public:
             // Kernel 2: calc_mem_hash (32 work-items per entry = 1 subgroup)
             // 4 subgroups per work-group = 128 work-items
             {
-                size_t global = count * 32, local = 128;
+                size_t global = count, local = 256;
                 if(global % local) global = ((global / local) + 1) * local;
                 uint32_t num_iter = 256;
                 clSetKernelArg(calc_memhash_kernel, 0, sizeof(cl_mem), &mem_buf);
@@ -1350,22 +1336,28 @@ void compute_full_pipeline(
     // Sort by meta, then dedup linearly
     std::cerr << "[Final] Deduplicating " << entries.size() << " entries...     \r" << std::flush;
     {
-        // Entries are already sorted by Y from the radix sort above.
-        // Duplicates have the same Y AND same metadata (Y = XOR of metadata).
-        // So duplicates are adjacent in Y-sorted order — no meta sort needed!
-        // Just scan linearly, comparing metadata of entries with the same Y.
+        // Build index array sorted by meta
+        std::vector<uint32_t> meta_idx(entries.size());
+        for(size_t i = 0; i < entries.size(); i++) meta_idx[i] = (uint32_t)i;
+        
+        auto meta_cmp = [&entries, &M_curr](uint32_t a, uint32_t b) {
+            return M_curr[entries[a].second] < M_curr[entries[b].second];
+        };
+        
+        __gnu_parallel::sort(meta_idx.begin(), meta_idx.end(), meta_cmp,
+            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        
+        // Linear dedup
         std::array<uint32_t, 14> prev_meta = {};
-        uint32_t prev_Y = 0xFFFFFFFF;
         bool first = true;
-        for(size_t i = 0; i < entries.size(); i++) {
-            uint32_t Y = entries[i].first;
-            const auto& meta = M_curr[entries[i].second];
-            if(first || Y != prev_Y || meta != prev_meta) {
-                plot.final_Y.push_back(Y);
+        for(size_t i = 0; i < meta_idx.size(); i++) {
+            const auto& entry = entries[meta_idx[i]];
+            const auto& meta = M_curr[entry.second];
+            if(first || meta != prev_meta) {
+                plot.final_Y.push_back(entry.first);
                 plot.final_meta.push_back(meta);
-                final_indices.push_back(entries[i].second);
+                final_indices.push_back(entry.second);
                 prev_meta = meta;
-                prev_Y = Y;
                 first = false;
             }
         }
@@ -1373,10 +1365,34 @@ void compute_full_pipeline(
     
     std::cout << "[Final] " << plot.final_Y.size() << " unique entries          " << std::endl;
     
-    // No re-sort needed — entries are already in Y-sorted order from dedup!
-    // No re-sort needed — entries are already in Y-sorted order from dedup!
-    // (The old code sorted by metadata then re-sorted by Y — we skip both)
+    // Re-sort final entries by Y (dedup destroyed Y order)
+    std::cerr << "[Final] Re-sorting by Y...                       \r" << std::flush;
+    {
+        size_t nf = plot.final_Y.size();
+        std::vector<uint32_t> idx(nf);
+        for(size_t i = 0; i < nf; i++) idx[i] = (uint32_t)i;
+        
+        // Sort index by Y value
+        __gnu_parallel::sort(idx.begin(), idx.end(),
+            [&](uint32_t a, uint32_t b) { return plot.final_Y[a] < plot.final_Y[b]; },
+            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        
+        // Reorder all arrays
+        std::vector<uint32_t> new_Y(nf);
+        std::vector<std::array<uint32_t, 14>> new_meta(nf);
+        std::vector<uint32_t> new_indices(nf);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < nf; i++) {
+            new_Y[i] = plot.final_Y[idx[i]];
+            new_meta[i] = plot.final_meta[idx[i]];
+            new_indices[i] = final_indices[idx[i]];
+        }
+        plot.final_Y = std::move(new_Y);
+        plot.final_meta = std::move(new_meta);
+        final_indices = std::move(new_indices);
+    }
     
+// PD[9] dedup: keep only entries for deduped final entries
     {
         auto old_pd9 = std::move(plot.PD[9]);
         plot.PD[9].resize(final_indices.size());

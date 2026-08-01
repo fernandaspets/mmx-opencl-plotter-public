@@ -326,3 +326,164 @@ void compute_f1_kernel(
 		M_out[gid * N_META + i] = hash16[i] & kmask;
 	}
 }
+
+/*
+ * Split F1 kernels for warp-parallel pipeline.
+ * Uses the EXACT same algorithm as compute_f1_kernel above, just splits into 3 stages
+ * with mem in global memory instead of private (eliminates register spill).
+ */
+
+/* Kernel 1: gen_mem_array_v2 — same as compute_f1_kernel steps 1-2, outputs to global */
+__kernel
+void gen_mem_array_v2_kernel(
+	__global uint* mem_out,     /* [batch_size * 1024] */
+	__global uint* key_out,     /* [batch_size * 16] */
+	__global const uint* ID_in, /* [8] plot_id */
+	const uint batch_size,
+	const uint x_base)
+{
+	const uint entry = get_global_id(0);
+	if(entry >= batch_size) return;
+
+	const uint X_i = x_base + entry;
+
+	/* Step 1: key = SHA-512(X_i || plot_id) — EXACT same as compute_f1_kernel */
+	uint msg32_key[18];
+	for(int i = 0; i < 18; i++) msg32_key[i] = 0;
+	msg32_key[0] = X_i;
+	for(int i = 0; i < 8; i++) msg32_key[1 + i] = ID_in[i];
+
+	ulong msg64_key[16];
+	for(int i = 0; i < 16; i++) msg64_key[i] = 0;
+	pack_uint32_to_be_ulong(msg32_key, 9, msg64_key, 16);
+
+	ulong key_state[8];
+	sha512_hash(msg64_key, 36, key_state);
+
+	uint key32[16];
+	extract_uint32_from_sha512(key_state, key32);
+
+	/* Write key to global memory */
+	for(int i = 0; i < 16; i++) {
+		key_out[entry * 16 + i] = key32[i];
+	}
+
+	/* Step 2: gen_mem_array — EXACT same as compute_f1_kernel */
+	uint state[32];
+	for(int i = 0; i < 16; i++) state[i] = key32[i];
+	for(int i = 0; i < 16; i++) state[16 + i] = MEM_HASH_INIT[i];
+
+	uint b = 0, c = 0;
+
+	for(uint i = 0; i < 32; i++) {
+		for(int j = 0; j < 4; j++) {
+			for(int k = 0; k < 16; k++) {
+				MMXPOS_HASHROUND(state[k], b, c, state[16 + k]);
+			}
+		}
+		/* Write to global memory: mem[(i * batch_size + entry) * 32 + k] */
+		for(int k = 0; k < 32; k++) {
+			mem_out[(i * batch_size + entry) * 32 + k] = state[k];
+		}
+	}
+}
+
+/* Kernel 2: calc_mem_hash_v2 — same as compute_f1_kernel step 3, reads from global mem */
+__kernel
+void calc_mem_hash_v2_kernel(
+	__global const uint* mem_in,  /* [batch_size * 1024] */
+	__global uint* hash_out,      /* [batch_size * 32] */
+	const uint batch_size,
+	const uint num_iter)
+{
+	const uint entry = get_global_id(0);
+	if(entry >= batch_size) return;
+
+	/* Load mem from global to private — same layout as compute_f1_kernel */
+	uint mem[1024];
+	for(uint i = 0; i < 32; i++) {
+		for(int k = 0; k < 32; k++) {
+			mem[i * 32 + k] = mem_in[(i * batch_size + entry) * 32 + k];
+		}
+	}
+
+	/* Step 3: calc_mem_hash — EXACT same as compute_f1_kernel */
+	uint hash_state[32];
+	for(int i = 0; i < 32; i++) hash_state[i] = mem[31 * 32 + i];
+
+	#pragma unroll 1
+	for(int iter = 0; iter < num_iter; iter++) {
+		uint sum = 0;
+		for(int i = 0; i < 32; i++) {
+			sum += rotl32(hash_state[i], i % 32);
+		}
+		uint dir = sum + (sum << 11) + (sum << 22);
+		uint bits = (dir >> 22) & 31;
+		uint offset = (dir >> 27) & 31;
+
+		for(int i = 0; i < 32; i++) {
+			hash_state[i] += rotl32(mem[offset * 32 + ((iter + i) & 31)], bits) ^ sum;
+		}
+		for(int i = 0; i < 32; i++) {
+			mem[offset * 32 + i] ^= hash_state[i];
+		}
+	}
+
+	/* Write hash output */
+	for(int i = 0; i < 32; i++) {
+		hash_out[entry * 32 + i] = hash_state[i];
+	}
+}
+
+/* Kernel 3: scatter_f1_v2 — same as compute_f1_kernel steps 4-5, reads from global */
+__kernel
+void scatter_f1_v2_kernel(
+	__global const uint* key_in,   /* [batch_size * 16] */
+	__global const uint* hash_in,  /* [batch_size * 32] */
+	__global uint* Y_out,
+	__global uint* M_out,
+	const uint kmask,
+	const uint batch_size,
+	const uint x_base,
+	const uint total_entries)
+{
+	const uint entry = get_global_id(0);
+	if(entry >= batch_size) return;
+
+	const uint global_entry = x_base + entry;
+
+	/* Load key and hash from global memory */
+	uint key32[16];
+	for(int i = 0; i < 16; i++) key32[i] = key_in[entry * 16 + i];
+
+	uint hash_state[32];
+	for(int i = 0; i < 32; i++) hash_state[i] = hash_in[entry * 32 + i];
+
+	/* Step 4: hash = SHA-512(key || hash_state) — EXACT same as compute_f1_kernel */
+	uint msg32_final[48];
+	for(int i = 0; i < 16; i++) msg32_final[i] = key32[i];
+	for(int i = 0; i < 32; i++) msg32_final[16 + i] = hash_state[i];
+
+	ulong msg64_final[32];
+	for(int i = 0; i < 32; i++) msg64_final[i] = 0;
+	pack_uint32_to_be_ulong(msg32_final, 48, msg64_final, 32);
+
+	ulong final_state[8];
+	sha512_hash(msg64_final, 192, final_state);
+
+	uint hash16[16];
+	extract_uint32_from_sha512(final_state, hash16);
+
+	/* Step 5: Y = XOR(hash[0..13]) & kmask, M[i] = hash[i] & kmask */
+	uint Y_i = 0;
+	for(int i = 0; i < N_META; i++) {
+		Y_i ^= hash16[i];
+	}
+	Y_i &= kmask;
+
+	/* Write to LOCAL index (not global) — caller handles global offset */
+	Y_out[entry] = Y_i;
+	for(int i = 0; i < N_META; i++) {
+		M_out[entry * N_META + i] = hash16[i] & kmask;
+	}
+}

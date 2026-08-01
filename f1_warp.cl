@@ -6,12 +6,12 @@
  * 2. calc_mem_hash: 32 work-items/entry (subgroup) → hash[32] using shared memory
  * 3. scatter_f1: 1 work-item/entry → final SHA-512(key||hash) → Y, M
  *
- * This eliminates the register spill from mem[1024] in private memory.
+ * Uses the EXACT same SHA-512 implementation as pos_recompute.cl (proven correct).
  */
 
-/* === SHA-512 (shared with table_hash.cl) === */
+/* === SHA-512 (copied from pos_recompute.cl — DO NOT CHANGE) === */
 
-__constant ulong SHA512_K_F1[80] = {
+__constant ulong SHA512_K[80] = {
 	0x428a2f98d728ae22UL, 0x7137449123ef65cdUL, 0xb5c0fbcfec4d3b2fUL, 0xe9b5dba58189dbbcUL, 0x3956c25bf348b538UL,
 	0x59f111f1b605d019UL, 0x923f82a4af194f9bUL, 0xab1c5ed5da6d8118UL, 0xd807aa98a3030242UL, 0x12835b0145706fbeUL,
 	0x243185be4ee4b28cUL, 0x550c7dc3d5ffb4e2UL, 0x72be5d74f27b896fUL, 0x80deb1fe3b1696b1UL, 0x9bdc06a725c71235UL,
@@ -30,50 +30,31 @@ __constant ulong SHA512_K_F1[80] = {
 	0x431d67c49c100d4cUL, 0x4cc5d4becb3e42b6UL, 0x597f299cfc657e2aUL, 0x5fcb6fab3ad6faecUL, 0x6c44198c4a475817UL
 };
 
-__constant ulong SHA512_INIT_F1[8] = {
+__constant ulong SHA512_INIT[8] = {
 	0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL, 0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL,
 	0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL, 0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL
 };
 
-ulong rotr64_f1(ulong x, int n) { return (x >> n) | (x << (64 - n)); }
+ulong rotr64(ulong x, int n) { return (x >> n) | (x << (64 - n)); }
 
-inline ulong bswap64_f1(ulong x) {
-	return ((x & 0x00000000000000FFUL) << 56)
-	     | ((x & 0x000000000000FF00UL) << 40)
-	     | ((x & 0x0000000000FF0000UL) << 24)
-	     | ((x & 0x00000000FF000000UL) << 8)
-	     | ((x & 0x000000FF00000000UL) >> 8)
-	     | ((x & 0x0000FF0000000000UL) >> 24)
-	     | ((x & 0x00FF000000000000UL) >> 40)
-	     | ((x & 0xFF00000000000000UL) >> 56);
-}
-
-uint bswap32_f1(uint x) {
-	return (x >> 24) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) | (x << 24);
-}
-
-uint rotl32_f1(uint v, int bits) {
-	if(bits == 0) return v;
-	return (v << bits) | (v >> (32 - bits));
-}
-
-void sha512_block_f1(__private const ulong* msg, __private ulong* state)
+/* SHA-512 single block. msg = 16 ulong words (big-endian). state = 8 ulong (native LE). */
+void sha512_block(__private const ulong* msg, __private ulong* state)
 {
-	__private ulong w[80];
-	for(int i = 0; i < 16; i++) w[i] = bswap64_f1(msg[i]);
+	ulong w[80];
+	for(int i = 0; i < 16; i++) w[i] = msg[i];
 	for(int i = 16; i < 80; i++) {
-		ulong s0 = rotr64_f1(w[i-15], 1) ^ rotr64_f1(w[i-15], 8) ^ (w[i-15] >> 7);
-		ulong s1 = rotr64_f1(w[i-2], 19) ^ rotr64_f1(w[i-2], 61) ^ (w[i-2] >> 6);
+		ulong s0 = rotr64(w[i-15], 1) ^ rotr64(w[i-15], 8) ^ (w[i-15] >> 7);
+		ulong s1 = rotr64(w[i-2], 19) ^ rotr64(w[i-2], 61) ^ (w[i-2] >> 6);
 		w[i] = w[i-16] + s0 + w[i-7] + s1;
 	}
 	ulong a=state[0], b=state[1], c=state[2], d=state[3];
 	ulong e=state[4], f=state[5], g=state[6], h=state[7];
 	for(int i = 0; i < 80; i++) {
-		ulong S1 = rotr64_f1(e, 14) ^ rotr64_f1(e, 18) ^ rotr64_f1(e, 41);
-		ulong ch = g ^ (e & (f ^ g));  /* optimized Ch */
-		ulong t1 = h + S1 + ch + SHA512_K_F1[i] + w[i];
-		ulong S0 = rotr64_f1(a, 28) ^ rotr64_f1(a, 34) ^ rotr64_f1(a, 39);
-		ulong maj = (a & b) | (c & (a | b));  /* optimized Maj */
+		ulong S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
+		ulong ch = (e & f) ^ ((~e) & g);
+		ulong t1 = h + S1 + ch + SHA512_K[i] + w[i];
+		ulong S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
+		ulong maj = (a & b) ^ (a & c) ^ (b & c);
 		ulong t2 = S0 + maj;
 		h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
 	}
@@ -82,79 +63,85 @@ void sha512_block_f1(__private const ulong* msg, __private ulong* state)
 }
 
 /*
- * SHA-512 hash of a message stored as LE ulong array.
- * data must have room for padding (17 extra bytes, multiple of 16 ulong).
- * Output state is LE (caller extracts with bswap).
+ * SHA-512(data, length, out)
+ * data = ulong array (each ulong = 8 bytes in big-endian order)
+ * length = message length in bytes
+ * out = 8 ulong output (native LE state values, NOT byte-swapped)
+ * data must be zero-initialized with room for padding (17 extra bytes, multiple of 16 ulong)
  */
-void sha512_hash_f1(__private ulong* data, const uint length, __private ulong* out)
+void sha512_hash(__private ulong* data, uint length, __private ulong* out)
 {
 	const ulong num_bits = (ulong)length * 8;
 	const uint total_bytes = length + 17;
 	const uint num_chunks = (total_bytes + 127) / 128;
 
-	/* Padding: set 0x80 bit after last data byte */
 	uint byte_idx = length / 8;
 	uint bit_shift = (7 - (length % 8)) * 8;
 	data[byte_idx] |= ((ulong)0x80 << bit_shift);
 
-	/* Bit length in last ulong of last chunk (LE, bswap inside block) */
-	data[num_chunks * 16 - 1] = bswap64_f1(num_bits);
+	data[num_chunks * 16 - 1] = num_bits;
 
-	for(int i = 0; i < 8; i++) out[i] = SHA512_INIT_F1[i];
-	for(uint i = 0; i < num_chunks; i++) {
-		sha512_block_f1(data + i * 16, out);
-	}
+	for(int i = 0; i < 8; i++) out[i] = SHA512_INIT[i];
+	for(uint i = 0; i < num_chunks; i++) sha512_block(data + i * 16, out);
 }
 
-void extract_uint32_f1(__private const ulong* sha_out, __private uint* state32)
+uint bswap32(uint x) {
+	return (x >> 24) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) | (x << 24);
+}
+
+void extract_uint32_from_sha512(__private const ulong* sha_out, __private uint* state32)
 {
 	for(int i = 0; i < 8; i++) {
-		ulong be = bswap64_f1(sha_out[i]);
-		state32[2*i]   = (uint)be;
-		state32[2*i+1] = (uint)(be >> 32);
+		state32[2*i]   = bswap32((uint)(sha_out[i] >> 32));
+		state32[2*i+1] = bswap32((uint)(sha_out[i] & 0xFFFFFFFFUL));
 	}
 }
 
-void pack_uint32_to_be_ulong_f1(__private const uint* msg32, int num32, __private ulong* msg64, int num64)
+void pack_uint32_to_be_ulong(__private const uint* msg32, int num32, __private ulong* msg64, int num64)
 {
 	for(int i = 0; i < num64; i++) msg64[i] = 0;
 	for(int i = 0; i < num32 / 2; i++) {
-		msg64[i] = ((ulong)bswap32_f1(msg32[2*i]) << 32) | bswap32_f1(msg32[2*i+1]);
+		msg64[i] = ((ulong)bswap32(msg32[2*i]) << 32) | bswap32(msg32[2*i+1]);
 	}
 	if(num32 % 2) {
-		msg64[num32/2] = (ulong)bswap32_f1(msg32[num32-1]) << 32;
+		msg64[num32/2] = (ulong)bswap32(msg32[num32-1]) << 32;
 	}
 }
 
 /* === MMXPOS hash round === */
-#define MMXPOS_HASHROUND_F1(a, b, c, d) \
-	a = a + b;                       \
-	d = rotl32_f1(d ^ a, 16);        \
-	c = c + d;                       \
-	b = rotl32_f1(b ^ c, 12);        \
-	a = a + b;                       \
-	d = rotl32_f1(d ^ a, 8);         \
-	c = c + d;                       \
-	b = rotl32_f1(b ^ c, 7);
+uint rotl32(uint v, int bits) {
+	if(bits == 0) return v;
+	return (v << bits) | (v >> (32 - bits));
+}
 
-__constant uint MEM_HASH_INIT_F1[16] = {
+#define MMXPOS_HASHROUND(a, b, c, d) \
+	a = a + b;                       \
+	d = rotl32(d ^ a, 16);           \
+	c = c + d;                       \
+	b = rotl32(b ^ c, 12);           \
+	a = a + b;                       \
+	d = rotl32(d ^ a, 8);            \
+	c = c + d;                       \
+	b = rotl32(b ^ c, 7);
+
+__constant uint MEM_HASH_INIT[16] = {
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
 	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174
 };
 
-#define MEM_HASH_ITER_F1 256
-#define N_META_F1 14
+#define MEM_HASH_ITER 256
+#define N_META 14
 
 /* === Kernel 1: gen_mem_array === */
 /* 1 work-item per entry. Outputs key[16] and mem[1024] to global memory. */
-/* mem_buf layout: mem[(row * batch_size + entry) * 32 + elem]  (matching CUDA) */
+/* mem_buf layout: mem[(row * batch_size + entry) * 32 + elem] (matching CUDA) */
 /* key_buf layout: key[entry * 16 + i] */
 __kernel void gen_mem_array_kernel(
-    __global uint* mem_out,     // [batch_size * 1024] device memory
-    __global uint* key_out,     // [batch_size * 16] device memory
+    __global uint* mem_out,     // [batch_size * 1024]
+    __global uint* key_out,     // [batch_size * 16]
     __global const uint* id_in, // [8] plot_id as uint32 array
-    const uint batch_size,      // number of entries in this batch
-    const uint x_base)          // base X value (global offset)
+    const uint batch_size,
+    const uint x_base)
 {
     const uint entry = get_global_id(0);
     if(entry >= batch_size) return;
@@ -168,15 +155,14 @@ __kernel void gen_mem_array_kernel(
     for(int i = 0; i < 8; i++) msg32_key[1 + i] = id_in[i];
     
     ulong msg64_key[16];
-    pack_uint32_to_be_ulong_f1(msg32_key, 9, msg64_key, 16);
+    pack_uint32_to_be_ulong(msg32_key, 9, msg64_key, 16);
     
     ulong key_state[8];
-    sha512_hash_f1(msg64_key, 36, key_state);
+    sha512_hash(msg64_key, 36, key_state);
     
     uint key32[16];
-    extract_uint32_f1(key_state, key32);
+    extract_uint32_from_sha512(key_state, key32);
     
-    /* Write key to global memory */
     for(int i = 0; i < 16; i++) {
         key_out[entry * 16 + i] = key32[i];
     }
@@ -184,102 +170,79 @@ __kernel void gen_mem_array_kernel(
     /* Step 2: gen_mem_array */
     uint state[32];
     for(int i = 0; i < 16; i++) state[i] = key32[i];
-    for(int i = 0; i < 16; i++) state[16 + i] = MEM_HASH_INIT_F1[i];
+    for(int i = 0; i < 16; i++) state[16 + i] = MEM_HASH_INIT[i];
     
     uint b = 0, c = 0;
     
-    /* mem_size = 1024 = 32 * 32, so 32 iterations of 32 elements */
     for(uint i = 0; i < 32; i++) {
         for(int j = 0; j < 4; j++) {
             for(int k = 0; k < 16; k++) {
-                MMXPOS_HASHROUND_F1(state[k], b, c, state[16 + k]);
+                MMXPOS_HASHROUND(state[k], b, c, state[16 + k]);
             }
         }
-        /* Write row i to global memory: mem[(i * batch_size + entry) * 32 + elem] */
         for(int k = 0; k < 32; k++) {
             mem_out[(i * batch_size + entry) * 32 + k] = state[k];
         }
     }
 }
 
-/* === Kernel 2: calc_mem_hash (warp-parallel) === */
-/* 32 work-items per entry (one subgroup). 4 subgroups per work-group (128 work-items). */
-/* Uses shared memory: lmem[subgroup][32 * 32] = 4KB per subgroup, 16KB per work-group. */
-#pragma OPENCL_EXTENSION cl_khr_subgroups : enable
+/* === Kernel 2: calc_mem_hash (sequential fallback for correctness verification) === */
+/* 1 work-item per entry, same algorithm as original pos_recompute.cl */
+/* This is SLOWER but guaranteed correct — used to isolate bugs. */
 
 __kernel void calc_mem_hash_kernel(
-    __global const uint* mem_in,   // [batch_size * 1024] device memory
-    __global uint* hash_out,       // [batch_size * 32] device memory
+    __global const uint* mem_in,
+    __global uint* hash_out,
     const uint batch_size,
     const uint num_iter)
 {
-    const uint sgid = get_sub_group_local_id();  /* 0..31, element index within entry */
-    const uint entry = get_global_id(0) / 32;    /* which entry this subgroup handles */
+    const uint entry = get_global_id(0);
     if(entry >= batch_size) return;
     
     const uint N = 32;
     
-    /* Shared memory: 4 subgroups × 32 rows × 32 elements = 4096 uint32 = 16KB */
-    __local uint lmem[4][32 * 32];
-    
-    /* Determine which subgroup slot we're in (0..3 within the work-group) */
-    const uint wg_local = get_local_id(0);  /* 0..127 */
-    const uint sg_slot = wg_local / 32;     /* 0..3 */
-    
-    /* Load mem for this entry into shared memory.
-     * Each thread loads 32 values (one per row).
-     * lmem[sg_slot][row * 32 + sgid] = mem_in[(row * batch_size + entry) * 32 + sgid] */
+    /* Load mem for this entry into private memory */
+    uint mem[1024];
     for(int row = 0; row < 32; row++) {
-        lmem[sg_slot][row * 32 + sgid] = mem_in[(row * batch_size + entry) * 32 + sgid];
+        for(int k = 0; k < 32; k++) {
+            mem[row * 32 + k] = mem_in[(row * batch_size + entry) * 32 + k];
+        }
     }
     
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    /* Initial state = last row of mem */
+    uint hash_state[32];
+    for(int i = 0; i < 32; i++) hash_state[i] = mem[31 * 32 + i];
     
-    /* Initial state = last row of lmem */
-    uint state = lmem[sg_slot][(N - 1) * 32 + sgid];
-    
-    sub_group_barrier(CLK_LOCAL_MEM_FENCE);
-    
-    for(int iter = 0; iter < num_iter; iter++)
-    {
-        /* Each thread rotates its state element by its index */
-        uint sum = rotl32_f1(state, sgid % 32);
-        
-        /* Warp-level reduce_add using sub_group_reduce_add */
-        sum = sub_group_reduce_add(sum);
-        
-        /* Thread 0 computes dir, broadcast to all */
-        uint dir = 0;
-        if(sgid == 0) {
-            dir = sum + (sum << 11) + (sum << 22);
+    for(int iter = 0; iter < num_iter; iter++) {
+        uint sum = 0;
+        for(int i = 0; i < 32; i++) {
+            sum += rotl32(hash_state[i], i % 32);
         }
-        dir = sub_group_broadcast(dir, 0);
+        uint dir = sum + (sum << 11) + (sum << 22);
+        uint bits = (dir >> 22) & 31;
+        uint offset = (dir >> 27) & 31;
         
-        const uint bits = (dir >> 22) % 32u;
-        const uint offset = (dir >> 27) % 32u;
-        
-        /* Update state */
-        state += rotl32_f1(lmem[sg_slot][offset * 32 + (iter + sgid) % N], bits) ^ sum;
-        
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
-        
-        /* Atomic XOR state back into lmem */
-        atomic_xor(&lmem[sg_slot][offset * 32 + sgid], state);
-        
-        sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+        for(int i = 0; i < 32; i++) {
+            hash_state[i] += rotl32(mem[offset * 32 + ((iter + i) & 31)], bits) ^ sum;
+        }
+        for(int i = 0; i < 32; i++) {
+            mem[offset * 32 + i] ^= hash_state[i];
+        }
     }
     
     /* Write hash output */
-    hash_out[entry * 32 + sgid] = state;
+    for(int i = 0; i < 32; i++) {
+        hash_out[entry * 32 + i] = hash_state[i];
+    }
 }
 
 /* === Kernel 3: scatter_f1 === */
 /* 1 work-item per entry. Final SHA-512(key || hash) → Y, M */
 __kernel void scatter_f1_kernel(
-    __global const uint* key_in,     // [batch_size * 16]
-    __global const uint* hash_in,    // [batch_size * 32]
-    __global uint* Y_out,            // [total_entries]
-    __global uint* M_out,            // [total_entries * N_META_F1]
+    __global const uint* key_in,
+    __global const uint* hash_in,
+    __global uint* Y_out,
+    __global uint* M_out,
     const uint kmask,
     const uint batch_size,
     const uint x_base,
@@ -290,28 +253,25 @@ __kernel void scatter_f1_kernel(
     
     const uint global_entry = x_base + entry;
     
-    /* Load key[16] and hash[32] */
-    uint msg32_final[48];  /* 16 + 32 = 48 uint32 = 192 bytes */
+    uint msg32_final[48];
     for(int i = 0; i < 16; i++) msg32_final[i] = key_in[entry * 16 + i];
     for(int i = 0; i < 32; i++) msg32_final[16 + i] = hash_in[entry * 32 + i];
     
-    /* SHA-512(msg, 192 bytes) → 2 chunks */
     ulong msg64_final[32];
-    pack_uint32_to_be_ulong_f1(msg32_final, 48, msg64_final, 32);
+    pack_uint32_to_be_ulong(msg32_final, 48, msg64_final, 32);
     
     ulong final_state[8];
-    sha512_hash_f1(msg64_final, 192, final_state);
+    sha512_hash(msg64_final, 192, final_state);
     
     uint hash16[16];
-    extract_uint32_f1(final_state, hash16);
+    extract_uint32_from_sha512(final_state, hash16);
     
-    /* Y = XOR(hash[0..13]) & kmask */
     uint Y = 0;
-    for(int i = 0; i < N_META_F1; i++) Y ^= hash16[i];
+    for(int i = 0; i < N_META; i++) Y ^= hash16[i];
     Y &= kmask;
     
     Y_out[global_entry] = Y;
-    for(int i = 0; i < N_META_F1; i++) {
-        M_out[global_entry * N_META_F1 + i] = hash16[i] & kmask;
+    for(int i = 0; i < N_META; i++) {
+        M_out[global_entry * N_META + i] = hash16[i] & kmask;
     }
 }
