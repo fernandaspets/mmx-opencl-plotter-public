@@ -13,6 +13,7 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include "svm_pool.h"
 
 // Forward declarations
 class OCL_Plotter;
@@ -27,6 +28,8 @@ struct BucketPending {
     int y = -1, table = -1;
     OCL_Plotter* active_plotter = nullptr;
     BufferPool* active_pool = nullptr;
+    SVMPool* active_svm = nullptr;  // Module H: SVM pool
+    bool using_svm = false;
     bool using_pool = false;
     cl_command_queue q = nullptr;
 
@@ -52,4 +55,17 @@ struct BucketPending {
 
     cl_event ev_match_done = nullptr;
     cl_event ev_hash_done = nullptr;
+    
+    // SVM pointers (Module H) — when using_svm, these replace cl_mem
+    void* svm_C_in = nullptr;
+    void* svm_PY = nullptr;
+    void* svm_sub_cnt = nullptr;
+    void* svm_sub_off = nullptr;
+    void* svm_LR = nullptr;
+    void* svm_PD_match = nullptr;
+    void* svm_num_matches = nullptr;
+    void* svm_L_gathered = nullptr;
+    void* svm_R_gathered = nullptr;
+    void* svm_Y_hash = nullptr;
+    void* svm_M_hash = nullptr;
 };

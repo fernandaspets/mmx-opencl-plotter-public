@@ -43,9 +43,12 @@ struct OptConfig {
     // Module G: Pinned memory (CL_MEM_ALLOC_HOST_PTR) for async DMA
     bool pinned = false;
     
+    // Module H: SVM (Shared Virtual Memory) — OpenCL 2.0
+    bool svm = false;
+    
     // Helper: any optimization enabled?
     bool any_enabled() const {
-        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool || zero_copy || pinned;
+        return gpu_prefix_sum || gpu_meta_extract || async_transfers || num_queues > 1 || fuse_kernels || bufpool || zero_copy || pinned || svm;
     }
     
     // Print current config
@@ -59,6 +62,7 @@ struct OptConfig {
         std::cout << "  bufpool:        " << (bufpool ? "ON" : "off") << std::endl;
         std::cout << "  zero_copy:     " << (zero_copy ? "ON" : "off") << std::endl;
         std::cout << "  pinned:        " << (pinned ? "ON" : "off") << std::endl;
+        std::cout << "  svm:           " << (svm ? "ON" : "off") << std::endl;
     }
 };
 

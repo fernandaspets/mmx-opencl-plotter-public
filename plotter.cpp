@@ -36,6 +36,7 @@
 #include "opt_config.h"
 #include "buffer_pool.h"
 #include "pipeline.h"
+#include "svm_pool.h"
 
 // Forward declarations for globals defined later
 extern bool gpu_yield;
@@ -48,8 +49,14 @@ BufferPool* g_bufpool = nullptr;
 class OCL_Plotter;  // forward declaration
 std::vector<OCL_Plotter*> g_plotters;
 std::vector<BufferPool*> g_bufpools;
+std::vector<SVMPool*> g_svmpools;
 int g_num_gpus = 1;
 std::mutex g_dst_mutex;  // protects dst store writes in multi-GPU mode
+
+// SVM helper: set SVM pointer as kernel arg
+inline cl_int clSetKernelArgSVM(cl_kernel kernel, cl_uint idx, const void* svm_ptr) {
+    return clSetKernelArgSVMPointer(kernel, idx, svm_ptr);
+}
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -2502,6 +2509,294 @@ void collect_bucket_pipeline(BucketPending& p, MemBucketStore& dst)
     }
 }
 
+// ============================================================================
+// Module H: SVM pipeline — uses Shared Virtual Memory (OpenCL 2.0)
+// No cl_mem, no clEnqueueWriteBuffer/ReadBuffer. CPU and GPU share pointers.
+// Fine-grain (AMD): write directly, GPU sees it immediately.
+// Coarse-grain (NVIDIA): map/unmap around CPU access.
+// ============================================================================
+
+BucketPending submit_bucket_svm(
+    OCL_Plotter& plotter,
+    MemBucketStore& src,
+    int y,
+    int table,
+    SVMPool* svm)
+{
+    BucketPending p;
+    p.skip = true;
+    p.y = y;
+    p.table = table;
+    p.n_meta = src.n_meta;
+    p.shift = KSIZE - LOGBUCKETS;
+    const int logbuckets2 = KSIZE - LOGBUCKETS - 9;
+    p.num_sub = 1 << logbuckets2;
+    p.max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / p.num_sub));
+
+    p.count_y = src.counts[y];
+    if(p.count_y == 0) return p;
+
+    p.active_plotter = &plotter;
+    p.active_svm = svm;
+    p.using_svm = true;
+    const uint32_t* meta_y = src.buckets[y].data();
+    p.total = p.count_y;
+
+    OCL_Plotter& active_plotter = *p.active_plotter;
+    const int n_meta = p.n_meta;
+    const int num_sub = p.num_sub;
+    const int max_bs2 = p.max_bs2;
+    uint32_t total = p.total;
+
+    cl_int err;
+    int zero = 0;
+    p.q = active_plotter.queue;
+    cl_command_queue& q = p.q;
+
+    // Copy metadata for later CPU PD computation
+    p.C_combined.resize(total * n_meta);
+    std::memcpy(p.C_combined.data(), meta_y, p.count_y * n_meta * 4);
+
+    // Assign SVM pointers
+    p.svm_C_in = svm->svm_C_in;
+    p.svm_PY = svm->svm_PY;
+    p.svm_sub_cnt = svm->svm_sub_cnt;
+    p.svm_sub_off = svm->svm_sub_off;
+    p.svm_LR = svm->svm_LR;
+    p.svm_PD_match = svm->svm_PD_match;
+    p.svm_num_matches = svm->svm_num_matches;
+
+    // Write C_in data to SVM buffer
+    if(svm->fine_grain) {
+        // Fine-grain: use SVM map/unmap as memory barrier (even though fine-grain)
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_C_in, p.count_y * n_meta * 4, 0, nullptr, nullptr);
+        std::memcpy(p.svm_C_in, meta_y, p.count_y * n_meta * 4);
+        clEnqueueSVMUnmap(q, p.svm_C_in, 0, nullptr, nullptr);
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_sub_cnt, num_sub * 4, 0, nullptr, nullptr);
+        std::memset(p.svm_sub_cnt, 0, num_sub * 4);
+        clEnqueueSVMUnmap(q, p.svm_sub_cnt, 0, nullptr, nullptr);
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_WRITE, p.svm_num_matches, 4, 0, nullptr, nullptr);
+        std::memset(p.svm_num_matches, 0, 4);
+        clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
+    } else {
+        // Coarse-grain: map, write, unmap
+        svm->map(p.svm_C_in, p.count_y * n_meta * 4, CL_MAP_WRITE);
+        std::memcpy(p.svm_C_in, meta_y, p.count_y * n_meta * 4);
+        svm->unmap(p.svm_C_in);
+        svm->map(p.svm_sub_cnt, num_sub * 4, CL_MAP_WRITE);
+        std::memset(p.svm_sub_cnt, 0, num_sub * 4);
+        svm->unmap(p.svm_sub_cnt);
+        svm->map(p.svm_num_matches, 4, CL_MAP_WRITE);
+        std::memset(p.svm_num_matches, 0, 4);
+        svm->unmap(p.svm_num_matches);
+    }
+
+    // Step 2: Scatter kernel — use SVM pointer as arg
+    uint32_t total_u32 = total;
+    uint32_t max_bs2_u32 = max_bs2;
+    cl_mem null_mem = nullptr;
+    clSetKernelArgSVMPointer(active_plotter.k_scatter2, 0, p.svm_PY);
+    clSetKernelArgSVMPointer(active_plotter.k_scatter2, 1, p.svm_sub_cnt);
+    clSetKernelArg(active_plotter.k_scatter2, 2, sizeof(cl_mem), &null_mem);
+    clSetKernelArgSVMPointer(active_plotter.k_scatter2, 3, p.svm_C_in);
+    clSetKernelArg(active_plotter.k_scatter2, 4, sizeof(uint32_t), &total_u32);
+    clSetKernelArg(active_plotter.k_scatter2, 5, sizeof(uint32_t), &max_bs2_u32);
+    size_t scatter_global = total;
+    if(scatter_global % 64) scatter_global = ((scatter_global / 64) + 1) * 64;
+    clEnqueueNDRangeKernel(q, active_plotter.k_scatter2, 1, nullptr, &scatter_global, nullptr, 0, nullptr, nullptr);
+
+    // Step 3: Prefix sum (Module A: GPU)
+    p.num_sub_u32 = (uint32_t)num_sub;
+    if(get_opt_config().gpu_prefix_sum && active_plotter.prefix_sum_kernel) {
+        clSetKernelArgSVMPointer(active_plotter.prefix_sum_kernel, 0, p.svm_sub_cnt);
+        clSetKernelArgSVMPointer(active_plotter.prefix_sum_kernel, 1, p.svm_sub_off);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 2, sizeof(uint32_t) * (num_sub + 1), nullptr);
+        clSetKernelArg(active_plotter.prefix_sum_kernel, 3, sizeof(uint32_t), &p.num_sub_u32);
+        size_t ps_global = num_sub, ps_local = num_sub;
+        clEnqueueNDRangeKernel(q, active_plotter.prefix_sum_kernel, 1, nullptr, &ps_global, &ps_local, 0, nullptr, nullptr);
+    }
+
+    // Step 4: Sort
+    p.max_bs_sort = max_bs2;
+    uint32_t max_bs_sort = p.max_bs_sort;
+    clSetKernelArgSVMPointer(active_plotter.k_simple_sort, 0, p.svm_PY);
+    clSetKernelArgSVMPointer(active_plotter.k_simple_sort, 1, p.svm_sub_cnt);
+    clSetKernelArg(active_plotter.k_simple_sort, 2, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_simple_sort, 3, sizeof(uint32_t), &p.num_sub_u32);
+    size_t sort_g[2] = {256, (size_t)num_sub}, sort_l[2] = {256, 1};
+    clEnqueueNDRangeKernel(q, active_plotter.k_simple_sort, 2, nullptr, sort_g, sort_l, 0, nullptr, nullptr);
+
+    // Step 5: Match
+    uint32_t max_total = total * 4;
+    uint32_t write_pd = 0;
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 0, p.svm_LR);
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 1, p.svm_PD_match);
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 2, p.svm_num_matches);
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 3, p.svm_PY);
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 4, p.svm_sub_cnt);
+    clSetKernelArgSVMPointer(active_plotter.k_match_p1, 5, p.svm_sub_off);
+    clSetKernelArg(active_plotter.k_match_p1, 6, sizeof(uint32_t), &p.num_sub_u32);
+    clSetKernelArg(active_plotter.k_match_p1, 7, sizeof(uint32_t), &max_bs_sort);
+    clSetKernelArg(active_plotter.k_match_p1, 8, sizeof(uint32_t), &max_total);
+    clSetKernelArg(active_plotter.k_match_p1, 9, sizeof(uint32_t), &write_pd);
+    int groups_per_sub = (max_bs2 + 127) / 128;
+    size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
+    clEnqueueNDRangeKernel(q, active_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+
+    // Read match count (blocking — need it to proceed)
+    clFinish(q);  // ensure match kernel completed
+    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_num_matches, 4, 0, nullptr, nullptr);
+    p.gpu_matches = *(uint32_t*)p.svm_num_matches;
+    clEnqueueSVMUnmap(q, p.svm_num_matches, 0, nullptr, nullptr);
+
+    p.skip = false;
+    return p;
+}
+
+void submit_hash_svm(BucketPending& p, MemBucketStore& src)
+{
+    if(p.skip) return;
+    
+    OCL_Plotter& active_plotter = *p.active_plotter;
+    SVMPool* svm = p.active_svm;
+    cl_command_queue& q = p.q;
+    const int n_meta = p.n_meta;
+    int y = p.y, table = p.table;
+    
+    if(p.gpu_matches == 0) {
+        p.zero_matches = true;
+        return;
+    }
+    
+    // Read LR pairs from SVM
+    clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_LR, p.gpu_matches * 8, 0, nullptr, nullptr);
+    p.LR_filtered.resize(p.gpu_matches * 2);
+    std::memcpy(p.LR_filtered.data(), p.svm_LR, p.gpu_matches * 8);
+    clEnqueueSVMUnmap(q, p.svm_LR, 0, nullptr, nullptr);
+    
+    // Compute PD
+    p.bucket_offset = 0;
+    for(int b = 0; b < y; b++) p.bucket_offset += src.counts[b];
+    p.num_filt = p.LR_filtered.size() / 2;
+    p.pd_data.resize(p.num_filt * 2);
+    for(uint32_t i = 0; i < p.num_filt; i++) {
+        p.pd_data[i * 2] = p.bucket_offset + p.LR_filtered[i * 2];
+        p.pd_data[i * 2 + 1] = p.bucket_offset + p.LR_filtered[i * 2 + 1];
+    }
+    
+    // X pairs for table 2
+    if(table == 2) {
+        const std::vector<uint32_t>& x_vals = src.x_values[y];
+        for(uint32_t i = 0; i < p.num_filt; i++) {
+            uint32_t left_local = p.LR_filtered[i * 2];
+            uint32_t right_local = p.LR_filtered[i * 2 + 1];
+            uint32_t left_x = (left_local < x_vals.size()) ? x_vals[left_local] : 0;
+            uint32_t right_x = (right_local < x_vals.size()) ? x_vals[right_local] : 0;
+            p.xp_flat.push_back(left_x);
+            p.xp_flat.push_back(right_x);
+        }
+    }
+    
+    p.num_matches = p.gpu_matches;
+    
+    if(get_opt_config().gpu_meta_extract) {
+        // Assign SVM buffers for gather/hash
+        p.svm_L_gathered = svm->svm_L_gathered;
+        p.svm_R_gathered = svm->svm_R_gathered;
+        p.svm_Y_hash = svm->svm_Y_hash;
+        p.svm_M_hash = svm->svm_M_hash;
+        
+        uint32_t num_m = (uint32_t)p.num_matches;
+        uint32_t num_total = p.total;
+        uint32_t n_meta_u32 = (uint32_t)n_meta;
+        
+        // Gather kernel
+        clSetKernelArgSVMPointer(active_plotter.gather_meta_kernel, 0, p.svm_C_in);
+        clSetKernelArgSVMPointer(active_plotter.gather_meta_kernel, 1, p.svm_LR);
+        clSetKernelArgSVMPointer(active_plotter.gather_meta_kernel, 2, p.svm_L_gathered);
+        clSetKernelArgSVMPointer(active_plotter.gather_meta_kernel, 3, p.svm_R_gathered);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 4, sizeof(uint32_t), &num_m);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 5, sizeof(uint32_t), &num_total);
+        clSetKernelArg(active_plotter.gather_meta_kernel, 6, sizeof(uint32_t), &n_meta_u32);
+        size_t gather_global = p.num_matches, gather_local = 64;
+        if(gather_global % gather_local) gather_global = ((gather_global / gather_local) + 1) * gather_local;
+        clEnqueueNDRangeKernel(q, active_plotter.gather_meta_kernel, 1, nullptr, &gather_global, &gather_local, 0, nullptr, nullptr);
+        
+        // Hash kernel
+        uint32_t kmask = KMASK;
+        clSetKernelArgSVMPointer(active_plotter.table_hash_kernel, 0, p.svm_L_gathered);
+        clSetKernelArgSVMPointer(active_plotter.table_hash_kernel, 1, p.svm_R_gathered);
+        clSetKernelArgSVMPointer(active_plotter.table_hash_kernel, 2, p.svm_Y_hash);
+        clSetKernelArgSVMPointer(active_plotter.table_hash_kernel, 3, p.svm_M_hash);
+        clSetKernelArg(active_plotter.table_hash_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(active_plotter.table_hash_kernel, 5, sizeof(uint32_t), &num_m);
+        size_t hash_global = p.num_matches, hash_local = 64;
+        if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
+        clEnqueueNDRangeKernel(q, active_plotter.table_hash_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
+        clFinish(q);
+        
+        // Read Y + M from SVM
+        p.Y_out.resize(p.num_matches);
+        p.M_out.resize(p.num_matches * MY_N_META);
+        clFinish(q);  // ensure hash kernel completed
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_Y_hash, p.num_matches * 4, 0, nullptr, nullptr);
+        std::memcpy(p.Y_out.data(), p.svm_Y_hash, p.num_matches * 4);
+        clEnqueueSVMUnmap(q, p.svm_Y_hash, 0, nullptr, nullptr);
+        clEnqueueSVMMap(q, CL_TRUE, CL_MAP_READ, p.svm_M_hash, p.num_matches * MY_N_META * 4, 0, nullptr, nullptr);
+        std::memcpy(p.M_out.data(), p.svm_M_hash, p.num_matches * MY_N_META * 4);
+        clEnqueueSVMUnmap(q, p.svm_M_hash, 0, nullptr, nullptr);
+    } else {
+        // CPU-extract path
+        std::vector<uint32_t> L_meta_flat(p.num_matches * n_meta);
+        std::vector<uint32_t> R_meta_flat(p.num_matches * n_meta);
+        for(size_t i = 0; i < p.num_matches; i++) {
+            uint32_t P1 = p.LR_filtered[i * 2];
+            uint32_t P2 = p.LR_filtered[i * 2 + 1];
+            for(int j = 0; j < n_meta; j++) {
+                L_meta_flat[i * n_meta + j] = p.C_combined[P1 * n_meta + j];
+                R_meta_flat[i * n_meta + j] = p.C_combined[P2 * n_meta + j];
+            }
+        }
+        active_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, p.Y_out, p.M_out, KMASK);
+    }
+}
+
+void collect_bucket_svm(BucketPending& p, MemBucketStore& dst)
+{
+    if(p.skip || p.zero_matches) return;
+    
+    const int n_meta = p.n_meta;
+    const int shift = p.shift;
+    int table = p.table;
+    
+    // Distribute to dst store (same as collect_bucket_pipeline)
+    std::vector<std::vector<uint32_t>> dst_batch(dst.num_buckets);
+    std::vector<std::vector<uint32_t>> dst_pd_batch(dst.num_buckets);
+    std::vector<std::vector<uint32_t>> dst_xp_batch(dst.num_buckets);
+    
+    for(uint32_t i = 0; i < p.num_filt; i++) {
+        uint32_t bucket = p.Y_out[i] >> shift;
+        if(bucket >= (uint32_t)dst.num_buckets) bucket = dst.num_buckets - 1;
+        for(int j = 0; j < n_meta; j++)
+            dst_batch[bucket].push_back(p.M_out[i * n_meta + j]);
+        dst_pd_batch[bucket].push_back(p.pd_data[i * 2]);
+        dst_pd_batch[bucket].push_back(p.pd_data[i * 2 + 1]);
+        if(table == 2 && i * 2 + 1 < p.xp_flat.size()) {
+            dst_xp_batch[bucket].push_back(p.xp_flat[i * 2]);
+            dst_xp_batch[bucket].push_back(p.xp_flat[i * 2 + 1]);
+        }
+    }
+    for(int b = 0; b < dst.num_buckets; b++) {
+        if(dst_batch[b].empty()) continue;
+        uint32_t cnt = dst_batch[b].size() / n_meta;
+        dst.append(b, dst_batch[b].data(), cnt);
+        dst.append_pd(b, dst_pd_batch[b].data(), cnt);
+        if(table == 2 && !dst_xp_batch[b].empty()) {
+            dst.append_x_pairs(b, dst_xp_batch[b].data(), cnt);
+        }
+    }
+}
+
 void compute_f2_f9_chunked(
     OCL_Plotter& plotter,
     MemBucketStore& store,
@@ -2518,7 +2813,30 @@ void compute_f2_f9_chunked(
     // Module C: Initialize buffer pool(s) if enabled
     BufferPool bufpool;
     std::vector<BufferPool> multi_bufpools;
-    if(get_opt_config().bufpool) {
+    
+    // Module H: Initialize SVM pool(s) if enabled
+    SVMPool svm_pool;
+    std::vector<SVMPool> multi_svm_pools;
+    if(get_opt_config().svm) {
+        int logbuckets2 = KSIZE - LOGBUCKETS - 9;
+        int num_sub = 1 << logbuckets2;
+        int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
+        
+        if(g_num_gpus > 1 && g_plotters.size() > 1) {
+            multi_svm_pools.resize(g_num_gpus);
+            for(int g = 0; g < g_num_gpus; g++) {
+                multi_svm_pools[g].init(g_plotters[g]->context, g_plotters[g]->queue, g_plotters[g]->device,
+                                       max_bucket_size, n_meta, num_sub, max_bs2);
+                g_svmpools.push_back(&multi_svm_pools[g]);
+            }
+        } else {
+            svm_pool.init(plotter.context, plotter.queue, plotter.device,
+                         max_bucket_size, n_meta, num_sub, max_bs2);
+            g_svmpools.push_back(&svm_pool);
+        }
+    }
+    
+    if(get_opt_config().bufpool && !get_opt_config().svm) {
         int logbuckets2 = KSIZE - LOGBUCKETS - 9;
         int num_sub = 1 << logbuckets2;
         int max_bs2 = std::max(1024, (int)(((uint64_t)4 << KSIZE) / (1 << LOGBUCKETS) / num_sub));
@@ -2554,7 +2872,28 @@ void compute_f2_f9_chunked(
         auto tt0 = my_time_ms();
         dst.clear();
         
-        if(g_num_gpus > 1 && g_plotters.size() > 1 && get_opt_config().bufpool) {
+        if(get_opt_config().svm && g_svmpools.size() > 0) {
+            // Module H: SVM pipeline
+            for(int y = 0; y < num_buckets; y++) {
+                if(src.counts[y] == 0) continue;
+                
+                SVMPool* svm = (g_num_gpus > 1 && g_svmpools.size() > 1) ? 
+                    g_svmpools[y % g_num_gpus] : g_svmpools[0];
+                OCL_Plotter& active_pl = (g_num_gpus > 1 && g_plotters.size() > 1) ?
+                    *g_plotters[y % g_num_gpus] : plotter;
+                
+                BucketPending p = submit_bucket_svm(active_pl, src, y, t, svm);
+                submit_hash_svm(p, src);
+                collect_bucket_svm(p, dst);
+                cross_boundary_match(active_pl, src, dst, y, t);
+                
+                if(y % 32 == 0 || y == num_buckets - 1) {
+                    std::cerr << "\r[T" << t << "] Bucket " << (y+1) << "/" << num_buckets
+                              << " (" << (y+1)*100/num_buckets << "%) "
+                              << (my_time_ms() - tt0) / 1000.0 << "s" << std::flush;
+                }
+            }
+        } else if(g_num_gpus > 1 && g_plotters.size() > 1 && get_opt_config().bufpool) {
             // Module E v2: 2-wide pipeline — no threads, event-based overlap
             for(int y = 0; y < num_buckets; y += 2) {
                 bool have0 = (src.counts[y] > 0);
@@ -2681,11 +3020,18 @@ std::swap(src.x_values, dst.x_values);
     std::cout << "[CPU] F2-F9 done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
     
     // Module C: cleanup buffer pool
-    if(get_opt_config().bufpool) {
+    if(get_opt_config().bufpool && !get_opt_config().svm) {
         bufpool.cleanup();
         for(auto& bp : multi_bufpools) bp.cleanup();
         g_bufpool = nullptr;
         g_bufpools.clear();
+    }
+    
+    // Module H: cleanup SVM pool
+    if(get_opt_config().svm) {
+        svm_pool.cleanup();
+        for(auto& sp : multi_svm_pools) sp.cleanup();
+        g_svmpools.clear();
     }
 }
 
@@ -3160,6 +3506,7 @@ std::cerr << "  --opt-queues N  Module E: Multi-queue pipelining (N parallel buc
 std::cerr << "  --opt-bufpool   Module C: Pre-allocated reusable GPU buffers" << std::endl;
 std::cerr << "  --opt-zero-copy Module F: Pinned memory + map/unmap (zero-copy)" << std::endl;
 std::cerr << "  --opt-pinned   Module G: Pinned host memory (async DMA)" << std::endl;
+std::cerr << "  --opt-svm      Module H: Shared Virtual Memory (OpenCL 2.0)" << std::endl;
 std::cerr << "  --timing        Show per-step timing for first bucket of each table" << std::endl;
         std::cerr << "  --test          Run in test mode" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
@@ -3189,6 +3536,7 @@ else if(arg == "--timing") timing_detail = true;
 else if(arg == "--opt-bufpool") get_opt_config().bufpool = true;
 else if(arg == "--opt-zero-copy") get_opt_config().zero_copy = true;
 else if(arg == "--opt-pinned") get_opt_config().pinned = true;
+else if(arg == "--opt-svm") get_opt_config().svm = true;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--dump-pd") dump_pd = true;
         else if(arg == "--ramdisk" && i+1 < argc) {
