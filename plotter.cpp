@@ -1037,26 +1037,32 @@ void compute_full_pipeline(
                 size_t start = g * per_gpu;
                 size_t count = std::min(per_gpu, total_matches - start);
                 if(count == 0) break;
-                OCL_Plotter& active_pl = *g_plotters[g];
-                // Slice L_meta/R_meta for this GPU
-                std::vector<uint32_t> L_slice(L_meta_flat.begin() + start * MY_N_META,
-                                              L_meta_flat.begin() + (start + count) * MY_N_META);
-                std::vector<uint32_t> R_slice(R_meta_flat.begin() + start * MY_N_META,
-                                              R_meta_flat.begin() + (start + count) * MY_N_META);
-                std::vector<uint32_t> Y_slice, M_slice;
-                futs.push_back(std::async(std::launch::async, [&, g, start, count, &L_slice, &R_slice, &Y_slice, &M_slice]() {
-                    bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_L_gathered;
-                    if(use_svm_g) {
-                        active_pl.gpu_hash_table_svm(L_slice, R_slice, Y_slice, M_slice, KMASK,
-                            g_svmpools[g]->svm_L_gathered, g_svmpools[g]->svm_R_gathered,
-                            g_svmpools[g]->svm_Y_hash, g_svmpools[g]->svm_M_hash,
-                            g_svmpools[g]->fine_grain);
-                    } else {
-                        active_pl.gpu_hash_table(L_slice, R_slice, Y_slice, M_slice, KMASK);
+                // Use shared_ptr to keep slices alive across async boundary
+                auto L_slice = std::make_shared<std::vector<uint32_t>>(
+                    L_meta_flat.begin() + start * MY_N_META,
+                    L_meta_flat.begin() + (start + count) * MY_N_META);
+                auto R_slice = std::make_shared<std::vector<uint32_t>>(
+                    R_meta_flat.begin() + start * MY_N_META,
+                    R_meta_flat.begin() + (start + count) * MY_N_META);
+                auto Y_slice = std::make_shared<std::vector<uint32_t>>();
+                auto M_slice = std::make_shared<std::vector<uint32_t>>();
+                futs.push_back(std::async(std::launch::async, [&, g, start, count, L_slice, R_slice, Y_slice, M_slice]() {
+                    try {
+                        bool use_svm_g = get_opt_config().svm && g < (int)g_svmpools.size() && g_svmpools[g]->svm_L_gathered;
+                        if(use_svm_g) {
+                            g_plotters[g]->gpu_hash_table_svm(*L_slice, *R_slice, *Y_slice, *M_slice, KMASK,
+                                g_svmpools[g]->svm_L_gathered, g_svmpools[g]->svm_R_gathered,
+                                g_svmpools[g]->svm_Y_hash, g_svmpools[g]->svm_M_hash,
+                                g_svmpools[g]->fine_grain);
+                        } else {
+                            g_plotters[g]->gpu_hash_table(*L_slice, *R_slice, *Y_slice, *M_slice, KMASK);
+                        }
+                        std::memcpy(Y_results.data() + start, Y_slice->data(), count * sizeof(uint32_t));
+                        std::memcpy(M_results.data() + start * MY_N_META, M_slice->data(), count * MY_N_META * sizeof(uint32_t));
+                    } catch(const std::exception& e) {
+                        std::cerr << "[Hash] GPU " << g << " error: " << e.what() << std::endl;
+                        throw;
                     }
-                    // Copy results into the right position
-                    std::memcpy(Y_results.data() + start, Y_slice.data(), count * sizeof(uint32_t));
-                    std::memcpy(M_results.data() + start * MY_N_META, M_slice.data(), count * MY_N_META * sizeof(uint32_t));
                 }));
             }
             for(auto& f : futs) f.wait();
