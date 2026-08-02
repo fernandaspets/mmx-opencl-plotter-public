@@ -1132,15 +1132,16 @@ void compute_full_pipeline(
     if(use_gpu_resident) {
         cl_int err;
         // Both buffers must have the SAME max capacity (they get swapped!)
-        // Max entries = initial_entries * 3/2 + 256 (tables can grow slightly)
         size_t max_entries = (size_t)(entries.size() * 3 / 2 + 256);
         size_t m_size = max_entries * MY_N_META * sizeof(uint32_t);
-        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-            M_curr_flat.size() * sizeof(uint32_t), (void*)M_curr_flat.data(), &err);
-        // Re-allocate M_curr_gpu with max size (not just initial size)
-        if(M_curr_gpu) clReleaseMemObject(M_curr_gpu);
-        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-            m_size, (void*)M_curr_flat.data(), &err);
+        // Allocate with max size, but only copy initial data (rest is uninitialized)
+        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
+            m_size, nullptr, &err);
+        if(err == CL_SUCCESS) {
+            // Upload only the initial M_curr data
+            clEnqueueWriteBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
+                M_curr_flat.size() * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
+        }
         M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
             m_size, nullptr, &err);
         if(err != CL_SUCCESS) {
