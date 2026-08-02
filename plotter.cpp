@@ -1333,7 +1333,8 @@ void compute_full_pipeline(
         size_t total_matches = 0;
         for(int ti = 0; ti < nthreads; ti++) total_matches += thread_lr[ti].size();
         
-        std::cerr << "[T" << t << "] " << total_matches << " matches. Hashing...            \r" << std::flush;
+        auto t_match_end = my_time_ms();
+        std::cerr << "[T" << t << "] " << total_matches << " matches (" << (t_match_end - t_sorted) << "ms). Hashing...            \r" << std::flush;
         
         auto t_meta_start = my_time_ms();
         
@@ -1356,6 +1357,7 @@ void compute_full_pipeline(
             }
         }
         auto t_flatten_lr = my_time_ms();
+        if(t == 4) std::cerr << "[T" << t << "] match=" << (t_match_end - t_sorted) << "ms flatten=" << (t_flatten_lr - t_meta_start) << "ms" << std::flush;
         
         // GPU hash — GPU-resident M_curr (Module I)
         // M_curr stays on GPU, only upload LR_pairs, only download Y_out
@@ -1371,12 +1373,12 @@ void compute_full_pipeline(
                 LR_flat[i * 2 + 1] = entries[sorted_R].second;
             }
             auto t_gpu_start = my_time_ms();
-            uint32_t num_total = (uint32_t)entries.size();  // current table's entry count (M_curr_gpu has this many entries)
+            uint32_t num_total = (uint32_t)entries.size();
             gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
                 KMASK, num_total);
-            clFinish(gpu_plotter.queue);  // ensure kernel completed before swap
+            clFinish(gpu_plotter.queue);
             auto t_gpu_end = my_time_ms();
-            if(t >= 2 && t <= 3) std::cerr << "[T" << t << "] GPU hash: " << (t_gpu_end - t_gpu_start) << "ms (resident)    \r" << std::flush;
+            if(t == 4) std::cerr << "[T" << t << "] lr_flat_build=" << (t_gpu_start - t_flatten_lr) << "ms gpu_hash=" << (t_gpu_end - t_gpu_start) << "ms" << std::flush;
             
             // Swap: M_curr_gpu ↔ M_out_gpu (no data transfer!)
             std::swap(M_curr_gpu, M_out_gpu);
@@ -1450,9 +1452,10 @@ void compute_full_pipeline(
                 total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
         // Radix sort matches by Y — O(n) instead of O(n log n)
+        auto t_sort_start = my_time_ms();
         radix_sort_pairs(matches, KSIZE);
-        // Build entries_map[t]: sorted_idx -> original match_idx
-        // Merge entries_map[t] + PD[t] build into a single pass (saves one loop over 67M entries)
+        auto t_sort_end = my_time_ms();
+        // Build entries_map[t] + PD[t] in single pass
         entries_map[t] = std::vector<uint32_t>(matches.size());
         plot.PD.resize(MY_N_TABLE + 1);
         plot.PD[t].resize(matches.size());
@@ -1464,6 +1467,8 @@ void compute_full_pipeline(
             uint32_t sorted_R = LR[t][match_idx].second;
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
         }
+        auto t_pd_end = my_time_ms();
+        if(t == 4) std::cerr << "[T" << t << "] sort_matches=" << (t_sort_end - t_sort_start) << "ms build_pd=" << (t_pd_end - t_sort_end) << "ms" << std::flush;
         std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries (sorted order)" << std::flush;
         // entries already sorted — next table iteration skips the sort
         entries = std::move(matches);
