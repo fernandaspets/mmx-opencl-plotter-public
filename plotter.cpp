@@ -381,7 +381,7 @@ public:
                 clSetKernelArg(gen_mem_kernel, 3, sizeof(uint32_t), &count);
                 clSetKernelArg(gen_mem_kernel, 4, sizeof(uint32_t), &sub_x_base);
                 clEnqueueNDRangeKernel(queue, gen_mem_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
-                clFinish(queue);  // Finish before next kernel to prevent TDR
+                
             }
             
             // Kernel 2: calc_mem_hash
@@ -1178,47 +1178,23 @@ void compute_full_pipeline(
         
         std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
         
-        // Radix sort by Y (bucket sort — O(n) instead of O(n log n))
-        // Use LOGBUCKETS bits for bucketing, then sort within buckets
+        // Parallel sort by Y (faster than radix + per-bucket sort)
+        __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
+            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        
+        // Build bucket counts for matching (entries are now sorted by Y)
         const int log_buckets = std::min(LOGBUCKETS, KSIZE - 1);
-        const uint32_t bucket_mask = (1u << log_buckets) - 1;
         const int shift = KSIZE - log_buckets;
         const size_t num_buckets = 1u << log_buckets;
         
-        // Count entries per bucket
         std::vector<uint32_t> bucket_counts(num_buckets, 0);
         for(size_t i = 0; i < n; i++) {
-            uint32_t bucket = entries[i].first >> shift;
-            bucket_counts[std::min(bucket, (uint32_t)num_buckets - 1)]++;
+            bucket_counts[std::min(entries[i].first >> shift, (uint32_t)num_buckets - 1)]++;
         }
-        
-        // Compute bucket offsets (prefix sum)
         std::vector<uint32_t> bucket_offsets(num_buckets + 1, 0);
         for(size_t i = 0; i < num_buckets; i++) {
             bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
         }
-        
-        // Scatter entries into buckets (stable within bucket)
-        std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(n);
-        std::vector<uint32_t> write_pos(num_buckets);
-        for(size_t i = 0; i < num_buckets; i++) write_pos[i] = bucket_offsets[i];
-        for(size_t i = 0; i < n; i++) {
-            uint32_t bucket = std::min(entries[i].first >> shift, (uint32_t)num_buckets - 1);
-            sorted_entries[write_pos[bucket]++] = entries[i];
-        }
-        
-        // Sort within each bucket in parallel (small buckets — fast)
-        std::cerr << "[T" << t << "] Sorting buckets...                        \r" << std::flush;
-        #pragma omp parallel for schedule(dynamic, 4)
-        for(size_t b = 0; b < num_buckets; b++) {
-            uint32_t start = bucket_offsets[b];
-            uint32_t count = bucket_counts[b];
-            if(count > 1) {
-                std::sort(sorted_entries.begin() + start, 
-                          sorted_entries.begin() + start + count, sort_func);
-            }
-        }
-        entries = std::move(sorted_entries);
         
         auto t_sorted = my_time_ms();
         std::cerr << "[T" << t << "] Sorted in " << (t_sorted - t_table) / 1000.0 << "s. Matching...     \r" << std::flush;
@@ -1413,6 +1389,7 @@ void compute_full_pipeline(
     }
     
 // Reorder PD[2..8] by sorted position so PD[t][sorted_pos] gives the right entry.
+    auto t_pd_reorder_start = my_time_ms();
     #pragma omp parallel for schedule(dynamic, 1)
     for(int t = 2; t <= 8; t++) {
         auto old_pd = std::move(plot.PD[t]);
@@ -1426,6 +1403,9 @@ void compute_full_pipeline(
             }
         }
     }
+    
+    auto t_pd_reorder_end = my_time_ms();
+    std::cerr << "[Final] PD reorder: " << (t_pd_reorder_end - t_pd_reorder_start) << "ms    \r" << std::flush;
     
     // Final sort using radix sort (same as table sort)
     auto t_final_start = my_time_ms();
@@ -1503,6 +1483,7 @@ void compute_full_pipeline(
     std::cerr << "[Final] sort=" << (t_sort_done-t_final_start) << "ms copy=" << (t_copy_done-t_sort_done) << "ms pd9=" << (t_pd9_done-t_copy_done) << "ms    \r" << std::flush;
     
     // X pairs: compute in match order, then reorder by sorted position
+    auto t_xpairs_start = my_time_ms();
     {
         std::vector<std::pair<uint32_t, uint32_t>> x_match_order(LR[2].size());
         #pragma omp parallel for schedule(static)
@@ -1520,6 +1501,8 @@ void compute_full_pipeline(
                 plot.X_pairs[sorted_pos] = x_match_order[match_idx];
             }
         }
+    auto t_xpairs_end = my_time_ms();
+    std::cerr << "[Final] X_pairs: " << (t_xpairs_end - t_xpairs_start) << "ms    \r" << std::flush;
     }
 }
 
