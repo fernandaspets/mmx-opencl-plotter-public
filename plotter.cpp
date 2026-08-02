@@ -319,7 +319,7 @@ public:
     // SAFETY: Uses fixed SUB_BATCH = 16384 to keep VRAM < 72MB per sub-batch
     // and prevent Windows TDR (kernel finishes in < 0.01s per sub-batch).
     // Loops over the input in sub-batches, writing results incrementally.
-    static constexpr uint32_t WARP_SUB_BATCH = 16384;  // 16384 entries = 72MB VRAM
+    static constexpr uint32_t WARP_SUB_BATCH = 65536;  // 65536 entries = 288MB VRAM (safe without SVM pool)
     
     void compute_f1_warp_batch(
         const std::vector<uint32_t>& X_values,
@@ -1413,10 +1413,13 @@ void compute_full_pipeline(
     }
     
 // Reorder PD[2..8] by sorted position so PD[t][sorted_pos] gives the right entry.
+    #pragma omp parallel for schedule(dynamic, 1)
     for(int t = 2; t <= 8; t++) {
         auto old_pd = std::move(plot.PD[t]);
         plot.PD[t].resize(old_pd.size());
-        for(size_t sorted_pos = 0; sorted_pos < entries_map[t].size() && sorted_pos < old_pd.size(); sorted_pos++) {
+        size_t pd_count = std::min(entries_map[t].size(), old_pd.size());
+        #pragma omp parallel for schedule(static)
+        for(size_t sorted_pos = 0; sorted_pos < pd_count; sorted_pos++) {
             uint32_t match_idx = entries_map[t][sorted_pos];
             if(match_idx < old_pd.size()) {
                 plot.PD[t][sorted_pos] = old_pd[match_idx];
@@ -1509,7 +1512,9 @@ void compute_full_pipeline(
             x_match_order[k] = {entries_map[1][sorted_L], entries_map[1][sorted_R]};
         }
         plot.X_pairs.resize(x_match_order.size());
-        for(size_t sorted_pos = 0; sorted_pos < entries_map[2].size() && sorted_pos < x_match_order.size(); sorted_pos++) {
+        size_t xp_count = std::min(entries_map[2].size(), x_match_order.size());
+        #pragma omp parallel for schedule(static)
+        for(size_t sorted_pos = 0; sorted_pos < xp_count; sorted_pos++) {
             uint32_t match_idx = entries_map[2][sorted_pos];
             if(match_idx < x_match_order.size()) {
                 plot.X_pairs[sorted_pos] = x_match_order[match_idx];
