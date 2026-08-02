@@ -36,6 +36,7 @@
 #include "opt_config.h"
 #include "buffer_pool.h"
 #include "pipeline.h"
+#include "bitmap_match.h"
 #include "svm_pool.h"
 
 // Forward declarations for globals defined later
@@ -1572,7 +1573,8 @@ void compute_full_pipeline(
     const std::vector<uint32_t>& Y_in,
     const std::vector<uint32_t>& M_in,
     PlotData& plot,
-    OCL_Plotter& gpu_plotter)
+    OCL_Plotter& gpu_plotter,
+    bool use_bitmap = false)
 {
     const uint32_t kmask = KMASK;
     
@@ -1654,6 +1656,112 @@ void compute_full_pipeline(
     for(int t = 2; t <= MY_N_TABLE; t++) {
         auto t_table = my_time_ms();
         const size_t n = entries.size();
+        
+        // ================================================================
+        // BITMAP MATCHING PATH (eliminates sort + match + flatten + lr_flat_build)
+        // ================================================================
+        if(use_bitmap) {
+            std::vector<std::pair<uint32_t, uint32_t>> lr_pairs;
+            std::vector<std::pair<uint32_t, uint32_t>> sorted_entries_bm;
+            std::vector<uint32_t> inv_map;
+            
+            bitmap_match(entries, lr_pairs, sorted_entries_bm, inv_map, KSIZE);
+            
+            size_t total_matches = lr_pairs.size();
+            auto t_bm_end = my_time_ms();
+            std::cerr << "[T" << t << "] " << total_matches << " matches (" << (t_bm_end - t_table) << "ms bitmap). Hashing...            \r" << std::flush;
+            
+            // Update entries to sorted order for PD build later
+            entries = std::move(sorted_entries_bm);
+            
+            // GPU hash — use lr_pairs directly as LR_flat (orig_L, orig_R)
+            std::vector<uint32_t> Y_results;
+            std::vector<uint32_t> M_results;
+            if(use_gpu_resident && total_matches > 0) {
+                std::vector<uint32_t> LR_flat(total_matches * 2);
+                #pragma omp parallel for schedule(static)
+                for(size_t i = 0; i < total_matches; i++) {
+                    LR_flat[i * 2] = lr_pairs[i].first;
+                    LR_flat[i * 2 + 1] = lr_pairs[i].second;
+                }
+                uint32_t num_total = (uint32_t)n;
+                gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
+                    KMASK, num_total);
+                clFinish(gpu_plotter.queue);
+                std::swap(M_curr_gpu, M_out_gpu);
+            } else if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
+                std::vector<uint32_t> LR_flat(total_matches * 2);
+                for(size_t i = 0; i < total_matches; i++) {
+                    LR_flat[i * 2] = lr_pairs[i].first;
+                    LR_flat[i * 2 + 1] = lr_pairs[i].second;
+                }
+                gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
+                M_curr_flat = std::move(M_results);
+            } else {
+                // CPU fallback hash
+                std::vector<uint32_t> L_meta(total_matches * MY_N_META);
+                std::vector<uint32_t> R_meta(total_matches * MY_N_META);
+                for(size_t i = 0; i < total_matches; i++) {
+                    for(int j = 0; j < MY_N_META; j++) {
+                        L_meta[i * MY_N_META + j] = M_curr_flat[lr_pairs[i].first * MY_N_META + j];
+                        R_meta[i * MY_N_META + j] = M_curr_flat[lr_pairs[i].second * MY_N_META + j];
+                    }
+                }
+                gpu_plotter.gpu_hash_table(L_meta, R_meta, Y_results, M_results, KMASK);
+                M_curr_flat = std::move(M_results);
+            }
+            
+            if(total_matches == 0) throw std::runtime_error("zero matches at table " + std::to_string(t));
+            
+            // Build matches vector and sort by Y (needed for PD)
+            std::vector<std::pair<uint32_t, uint32_t>> matches(total_matches);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < total_matches; i++) {
+                matches[i] = {Y_results[i], (uint32_t)i};
+            }
+            
+            // Convert LR pairs from original positions to sorted positions
+            // (for compatibility with PD and X_pairs build which expect sorted positions)
+            LR[t].resize(total_matches);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < total_matches; i++) {
+                LR[t][i] = {inv_map[lr_pairs[i].first], inv_map[lr_pairs[i].second]};
+            }
+            entries_map[t-1] = std::vector<uint32_t>(entries.size());
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < entries.size(); k++) {
+                entries_map[t-1][k] = entries[k].second;
+            }
+            
+            radix_sort_pairs(matches, KSIZE);
+            
+            // Build PD — LR[t] already in sorted positions (converted above)
+            entries_map[t] = std::vector<uint32_t>(matches.size());
+            plot.PD.resize(MY_N_TABLE + 1);
+            plot.PD[t].resize(matches.size());
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < matches.size(); k++) {
+                uint32_t match_idx = matches[k].second;
+                uint32_t sorted_L = LR[t][match_idx].first;
+                uint32_t sorted_R = LR[t][match_idx].second;
+                entries_map[t][k] = match_idx;
+                plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
+            }
+            
+            plot.num_entries[t] = matches.size();
+            
+            // Build entries for next table (sorted by Y)
+            entries.resize(matches.size());
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < matches.size(); k++) {
+                entries[k] = matches[k];  // (Y, index into M_next)
+            }
+            
+            auto t_end = my_time_ms();
+            std::cout << "[T" << t << "] " << matches.size() << " entries ("
+                      << (t_end - t_table) / 1000.0 << "s)                    " << std::endl;
+            continue;  // Skip original sort+match+flatten+hash+PD
+        }
         
         // For t==2, entries come unsorted from F1 — need to sort.
         // For t>2, entries are already sorted from the previous table's match sort.
@@ -4598,6 +4706,7 @@ int main(int argc, char** argv)
     bool use_ramdisk = false;
     bool use_chunked = false;
     bool use_gpu_res = false;
+    bool use_bitmap = false;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
@@ -4637,6 +4746,7 @@ std::cerr << "  --timing        Show per-step timing for first bucket of each ta
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
         else if(arg == "--gpu-res") use_gpu_res = true;
+        else if(arg == "--bitmap") use_bitmap = true;
 else if(arg == "--no-yield") gpu_yield = false;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
 else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
@@ -4947,7 +5057,7 @@ std::vector<std::vector<PDEntry>> pd_all;
     for(size_t i = 0; i < X_values.size(); i++) X_values[i] = (uint32_t)i;
     
     PlotData plot;
-    compute_full_pipeline(X_values, Y_all, M_all, plot, plotter);
+    compute_full_pipeline(X_values, Y_all, M_all, plot, plotter, use_bitmap);
     
     if(dump_pd) {
         for(int t = 2; t <= MY_N_TABLE; t++) {
