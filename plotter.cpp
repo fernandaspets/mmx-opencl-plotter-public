@@ -4590,6 +4590,7 @@ bool timing_detail = false;
 
 int main(int argc, char** argv)
 {
+    auto total_start = my_time_ms();
     std::string output_dir = "./";  // default: current directory
     std::string plot_name;
     bool test_mode = false;
