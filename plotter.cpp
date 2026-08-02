@@ -1849,6 +1849,7 @@ void compute_gpu_bulk(
             std::cerr << std::endl;
         }
         
+        std::cerr << "  Step 2 start" << std::flush;
         // Step 2: GPU match — direct pairing using sort counts/offsets
         // Each work-item processes one Y value (2^K work-items)
         size_t gs_match = ((size_t)num_bins + 255) / 256 * 256;
@@ -1864,8 +1865,10 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_match_sorted, 7, sizeof(cl_mem), &match_count);
         clSetKernelArg(gpu_plotter.k_match_sorted, 8, sizeof(uint32_t), &kmask_u32);
         clSetKernelArg(gpu_plotter.k_match_sorted, 9, sizeof(uint32_t), &max_matches_u32);
+        std::cerr << "  match kernel launching..." << std::flush;
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_sorted, 1, nullptr, &gs_match, nullptr, 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
+        std::cerr << " done." << std::endl;
         
         // Read match count
         uint32_t num_matches = 0;
@@ -1897,12 +1900,18 @@ void compute_gpu_bulk(
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.hash_lr_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
         
-        // Download LR_sorted and Y_L for PD build (will sort at the end)
+        // Download LR_sorted, Y_L, and pos_sorted (for T2 X_pairs) for PD build
         if(num_matches > 0) {
             std::vector<uint32_t> lr_sorted_host(num_matches * 2);
             std::vector<uint32_t> y_l_host(num_matches);
             clEnqueueReadBuffer(gpu_plotter.queue, LR_sorted, CL_TRUE, 0, num_matches * 2 * 4, lr_sorted_host.data(), 0, nullptr, nullptr);
             clEnqueueReadBuffer(gpu_plotter.queue, Y_L_buf, CL_TRUE, 0, num_matches * 4, y_l_host.data(), 0, nullptr, nullptr);
+            // For T2: also download pos_sorted (F1 indices) for X_pairs
+            std::vector<uint32_t> pos_t_host;
+            if(t == 2) {
+                pos_t_host.resize(total_entries);
+                clEnqueueReadBuffer(gpu_plotter.queue, pos_buf[1], CL_TRUE, 0, total_entries * 4, pos_t_host.data(), 0, nullptr, nullptr);
+            }
             LR_all[t].resize(num_matches);
             std::vector<uint32_t> Y_L_all_t(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
@@ -1913,12 +1922,23 @@ void compute_gpu_bulk(
             std::vector<std::pair<uint32_t, uint32_t>> match_indices(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {Y_L_all_t[i], i};
             radix_sort_pairs(match_indices, KSIZE);
-            // Reorder LR_all[t] by sorted order
+            // Reorder LR_all[t] by sorted order and save pos_t for X_pairs
             std::vector<std::pair<uint32_t, uint32_t>> LR_sorted_order(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_sorted_order[i] = LR_all[t][match_indices[i].second];
             }
             LR_all[t] = std::move(LR_sorted_order);
+            // For T2: build X_pairs from pos_sorted and sorted LR
+            if(t == 2 && !pos_t_host.empty()) {
+                plot.X_pairs.resize(num_matches);
+                for(uint32_t i = 0; i < num_matches; i++) {
+                    uint32_t sorted_L = LR_sorted_order[i].first;
+                    uint32_t sorted_R = LR_sorted_order[i].second;
+                    if(sorted_L < pos_t_host.size() && sorted_R < pos_t_host.size())
+                        plot.X_pairs[i] = {pos_t_host[sorted_L], pos_t_host[sorted_R]};
+                    else std::cerr << "X_pairs OOB: sorted_L=" << sorted_L << " sorted_R=" << sorted_R << " pos_size=" << pos_t_host.size() << std::endl;
+                }
+            }
         }
         
         // Swap: Y_buf[0] = Y_out (for next table's sort), M_curr = M_out
