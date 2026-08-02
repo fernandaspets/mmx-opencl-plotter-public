@@ -1332,11 +1332,11 @@ void compute_full_pipeline(
         }
         // else: M_curr_flat stays stale. Final step will download from GPU.
         
-        // Build matches vector (Y, index into M_next)
-        std::vector<std::pair<uint32_t, uint32_t>> matches;
-        matches.reserve(total_matches);
+        // Build matches vector (Y, index into M_next) — parallel
+        std::vector<std::pair<uint32_t, uint32_t>> matches(total_matches);
+        #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < total_matches; i++) {
-            matches.emplace_back(Y_results[i], (uint32_t)i);
+            matches[i] = {Y_results[i], (uint32_t)i};
         }
         
         std::vector<std::pair<uint32_t, uint32_t>> lr_pairs = std::move(all_lr);
@@ -1346,8 +1346,9 @@ void compute_full_pipeline(
         }
         
         LR[t] = std::move(lr_pairs);
-        // Save the entries mapping: sorted_idx -> original_idx
+        // Save the entries mapping: sorted_idx -> original_idx (parallel)
         entries_map[t-1] = std::vector<uint32_t>(entries.size());
+        #pragma omp parallel for schedule(static)
         for(size_t k = 0; k < entries.size(); k++) {
             entries_map[t-1][k] = entries[k].second;
         }
@@ -1356,6 +1357,7 @@ void compute_full_pipeline(
         // delta = sorted_R - sorted_L - 1 (always >= 0 since sorted_R > sorted_L)
         plot.PD.resize(MY_N_TABLE + 1);
         plot.PD[t].resize(matches.size());
+        #pragma omp parallel for schedule(static)
         for(size_t k = 0; k < matches.size(); k++) {
             uint32_t sorted_L = LR[t][k].first;
             uint32_t sorted_R = LR[t][k].second;
