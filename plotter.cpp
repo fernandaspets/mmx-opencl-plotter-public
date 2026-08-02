@@ -1537,6 +1537,7 @@ static void compute_gpu_resident(
     }
     
     // Set num_entries for write_plot
+    plot.num_entries.resize(n_table + 1);
     for(int t = 1; t <= n_table; t++) {
         plot.num_entries[t] = lr_count_per_table[t];
     }
