@@ -129,6 +129,71 @@ namespace mmx { namespace pos {
 extern std::pair<uint32_t, uint32_t> encode_symbol(const uint8_t sym);
 } }
 
+// Parallel LSD radix sort for (Y, index) pairs by Y.
+// Much faster than comparison sort for large arrays: O(n * passes) vs O(n log n).
+// For k26 (26-bit Y): 4 passes of 8-bit radix = O(4n) vs O(n*26).
+static void radix_sort_pairs(std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t ksize) {
+    const size_t n = entries.size();
+    if(n <= 1) return;
+    
+    const int nthreads = omp_get_max_threads();
+    const int num_passes = (ksize + 7) / 8;  // e.g. k26 → 4 passes
+    
+    std::vector<std::pair<uint32_t, uint32_t>> temp(n);
+    
+    for(int pass = 0; pass < num_passes; pass++) {
+        const uint32_t shift = pass * 8;
+        const uint32_t mask = (pass == num_passes - 1) ? ((1u << (ksize - shift)) - 1) : 0xFF;
+        const int num_bins = (pass == num_passes - 1) ? (1u << (ksize - shift)) : 256;
+        if(num_bins <= 0) break;
+        
+        // Per-thread histograms
+        std::vector<std::vector<uint32_t>> thread_hists(nthreads, std::vector<uint32_t>(num_bins, 0));
+        
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n; i++) {
+            int ti = omp_get_thread_num();
+            uint32_t digit = (entries[i].first >> shift) & mask;
+            thread_hists[ti][digit]++;
+        }
+        
+        // Global histogram (prefix sum across threads)
+        std::vector<uint32_t> global_hist(num_bins, 0);
+        for(int ti = 0; ti < nthreads; ti++)
+            for(int b = 0; b < num_bins; b++)
+                global_hist[b] += thread_hists[ti][b];
+        
+        // Exclusive prefix sum → global offsets
+        std::vector<uint32_t> global_offset(num_bins, 0);
+        uint32_t sum = 0;
+        for(int b = 0; b < num_bins; b++) {
+            global_offset[b] = sum;
+            sum += global_hist[b];
+        }
+        
+        // Per-thread starting offsets (prefix sum of per-thread counts across threads)
+        std::vector<std::vector<uint32_t>> thread_offsets(nthreads, std::vector<uint32_t>(num_bins));
+        for(int b = 0; b < num_bins; b++) {
+            uint32_t off = global_offset[b];
+            for(int ti = 0; ti < nthreads; ti++) {
+                thread_offsets[ti][b] = off;
+                off += thread_hists[ti][b];
+            }
+        }
+        
+        // Scatter (stable: entries processed in order within each thread)
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n; i++) {
+            int ti = omp_get_thread_num();
+            uint32_t digit = (entries[i].first >> shift) & mask;
+            uint32_t pos = thread_offsets[ti][digit]++;
+            temp[pos] = entries[i];
+        }
+        
+        std::swap(entries, temp);
+    }
+}
+
 // Bit writer for park encoding
 // Fast bit writer: writes value into buf at bit_offset, num_bits wide.
 // buf must be pre-allocated to sufficient size. Little-endian bit order (bit 0 = LSB of first byte).
@@ -1178,9 +1243,8 @@ void compute_full_pipeline(
         }
         
         if(t == 2) {
-            std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
-            __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
-                __gnu_parallel::parallel_tag(omp_get_max_threads()));
+            std::cerr << "[T" << t << "] Sorting " << n << " entries (radix)...               \r" << std::flush;
+            radix_sort_pairs(entries, KSIZE);
         }
         
         // Build bucket counts for matching (entries are now sorted by Y)
@@ -1373,8 +1437,8 @@ void compute_full_pipeline(
             clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
                 total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
-        __gnu_parallel::sort(matches.begin(), matches.end(), sort_func,
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        // Radix sort matches by Y — O(n) instead of O(n log n)
+        radix_sort_pairs(matches, KSIZE);
         // Build entries_map[t]: sorted_idx -> original match_idx
         entries_map[t] = std::vector<uint32_t>(matches.size());
         #pragma omp parallel for schedule(static)
