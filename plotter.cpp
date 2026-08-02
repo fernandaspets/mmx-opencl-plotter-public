@@ -1127,7 +1127,7 @@ void compute_full_pipeline(
     
     // Module I: GPU-resident M_curr — upload once, swap buffers between tables
     // Eliminates 3.6GB PCIe transfer per table (M_curr upload + M_out download)
-    bool use_gpu_resident = false;
+    bool use_gpu_resident = gpu_plotter.hash_lr_kernel != nullptr;
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
     if(use_gpu_resident) {
         cl_int err;
@@ -1338,12 +1338,10 @@ void compute_full_pipeline(
                 }
                 gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
             }
-            M_curr_flat = std::move(M_results);
         }
         
+        // In fallback mode, update M_curr_flat from M_results.
         // In resident mode, M_results is empty (M_out stays on GPU).
-        // M_curr_flat is NOT updated on CPU — we don't need it until Final step.
-        // In fallback mode, M_results has the data and we update M_curr_flat.
         if(!use_gpu_resident) {
             M_curr_flat = std::move(M_results);
         }
