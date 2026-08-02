@@ -1175,7 +1175,7 @@ static void compute_gpu_resident(
     const int shift_l1 = KSIZE - log_b;
     
     const uint32_t entries_per_l1 = total / num_l1;
-    const uint32_t max_bs = entries_per_l1 * 3 / 2 + 256;
+    const uint32_t max_bs = entries_per_l1 * 2 + 512;
     const uint32_t avg_sub = entries_per_l1 / num_sub;
     const uint32_t max_bs2 = std::max(1024u, avg_sub * 3 / 2 + 256);
     
