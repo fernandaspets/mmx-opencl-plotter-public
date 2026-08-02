@@ -319,7 +319,7 @@ public:
     // SAFETY: Uses fixed SUB_BATCH = 16384 to keep VRAM < 72MB per sub-batch
     // and prevent Windows TDR (kernel finishes in < 0.01s per sub-batch).
     // Loops over the input in sub-batches, writing results incrementally.
-    static constexpr uint32_t WARP_SUB_BATCH = 65536;  // 65536 entries = 288MB VRAM (safe without SVM pool)
+    static constexpr uint32_t WARP_SUB_BATCH = 131072;  // 65536 entries = 288MB VRAM (safe without SVM pool)
     
     void compute_f1_warp_batch(
         const std::vector<uint32_t>& X_values,
@@ -1407,38 +1407,12 @@ void compute_full_pipeline(
     auto t_pd_reorder_end = my_time_ms();
     std::cerr << "[Final] PD reorder: " << (t_pd_reorder_end - t_pd_reorder_start) << "ms    \r" << std::flush;
     
-    // Final sort using radix sort (same as table sort)
+    // Final sort using parallel sort
     auto t_final_start = my_time_ms();
     std::cerr << "[Final] Sorting " << entries.size() << " entries...           \r" << std::flush;
     {
-        const int log_buckets = std::min(LOGBUCKETS, KSIZE - 1);
-        const size_t num_buckets = 1u << log_buckets;
-        const int shift = KSIZE - log_buckets;
-        
-        std::vector<uint32_t> bucket_counts(num_buckets, 0);
-        for(size_t i = 0; i < entries.size(); i++) {
-            bucket_counts[std::min(entries[i].first >> shift, (uint32_t)num_buckets - 1)]++;
-        }
-        std::vector<uint32_t> bucket_offsets(num_buckets + 1, 0);
-        for(size_t i = 0; i < num_buckets; i++)
-            bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
-        
-        std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(entries.size());
-        std::vector<uint32_t> write_pos(num_buckets);
-        for(size_t i = 0; i < num_buckets; i++) write_pos[i] = bucket_offsets[i];
-        for(size_t i = 0; i < entries.size(); i++) {
-            uint32_t b = std::min(entries[i].first >> shift, (uint32_t)num_buckets - 1);
-            sorted_entries[write_pos[b]++] = entries[i];
-        }
-        
-        #pragma omp parallel for schedule(dynamic, 4)
-        for(size_t b = 0; b < num_buckets; b++) {
-            uint32_t start = bucket_offsets[b];
-            uint32_t count = bucket_counts[b];
-            if(count > 1)
-                std::sort(sorted_entries.begin() + start, sorted_entries.begin() + start + count, sort_func);
-        }
-        entries = std::move(sorted_entries);
+        __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
+            __gnu_parallel::parallel_tag(omp_get_max_threads()));
     }
     
     auto t_sort_done = my_time_ms();
