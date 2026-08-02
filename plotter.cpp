@@ -1214,15 +1214,11 @@ void compute_full_pipeline(
             if(count == 0) continue;
             
             // Match within this bucket — store SORTED indices
-            // Optimized: find the first YL+1 using binary search, then scan forward
             for(uint32_t x = start; x < start + count; x++) {
                 const auto YL = entries[x].first;
-                const auto target = YL + 1;
-                // Skip if next entry is same Y (no Y+1 match possible within same-Y group)
-                if(x + 1 < start + count && entries[x + 1].first == YL) continue;
-                // Scan forward for YL+1 matches
-                for(uint32_t y = x + 1; y < start + count && entries[y].first <= target; y++) {
-                    if(entries[y].first == target) {
+                for(uint32_t y = x + 1; y < start + count && entries[y].first <= YL + 1; y++) {
+                    if(entries[y].first == YL + 1) {
+                        // Store sorted positions, not original indices
                         thread_lr[ti].emplace_back(x, y);
                     }
                 }
