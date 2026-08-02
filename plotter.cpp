@@ -1259,6 +1259,11 @@ static void compute_gpu_resident(
     for(int t = 2; t <= n_table; t++) {
         auto tt = my_time_ms();
         
+        // Allocate per-table LR buffer (max possible matches = total_entries * 4)
+        uint32_t max_matches_t = (uint32_t)Y_all.size() * 4;
+        lr_per_table[t] = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches_t * 2 * 4, nullptr, &err);
+        uint32_t lr_offset = 0;
+        
         // Clear new bucket sizes for this table's output
         clEnqueueFillBuffer(gpu_plotter.queue, new_bs, &zero, 4, 0, num_l1 * 4, 0, nullptr, nullptr);
         clEnqueueFillBuffer(gpu_plotter.queue, num_matches, &zero, 4, 0, 4, 0, nullptr, nullptr);
@@ -1389,15 +1394,17 @@ static void compute_gpu_resident(
                 clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.eval_p1_tx_kernel, 1, nullptr, &hash_g, nullptr, 0, nullptr, nullptr);
             }
             
+            // Copy LR pairs for this L1 bucket to per-table buffer
+            if(match_count > 0) {
+                clEnqueueCopyBuffer(gpu_plotter.queue, LR, lr_per_table[t],
+                    0, (size_t)lr_offset * 2 * 4, match_count * 2 * 4, 0, nullptr, nullptr);
+                lr_offset += match_count;
+            }
+            
             clFinish(gpu_plotter.queue);
         }
         
-        // Save LR pairs for this table (copy to per-table buffer)
-        if(total_matches_t > 0) {
-            lr_per_table[t] = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_matches_t * 2 * 4, nullptr, &err);
-            clEnqueueCopyBuffer(gpu_plotter.queue, LR, lr_per_table[t], 0, 0, total_matches_t * 2 * 4, 0, nullptr, nullptr);
-            lr_count_per_table[t] = total_matches_t;
-        }
+        lr_count_per_table[t] = total_matches_t;
         
         // Swap: C_in ↔ C_out, bucket_count ↔ new_bs
         std::swap(active_c_in, active_c_out);
@@ -1443,7 +1450,103 @@ static void compute_gpu_resident(
     }
     
     // Download LR pairs per table and build PD + X_pairs
-    // TODO: implement PD and X_pairs build from LR pairs
+    // Build PD chain: for each table t (2-9), PD[t][sorted_pos] = {sorted_L, delta}
+    // where sorted_L/R are positions in the sorted metadata array.
+    //
+    // We also need entries_map[t]: sorted_pos -> original_pos in the UNSORTED metadata.
+    // The LR pairs from match_p1 use positions in the per-L1-bucket metadata,
+    // which maps to positions in the full unsorted metadata.
+    
+    // For each table, download LR pairs and build PD in sorted order.
+    // The LR pairs use positions within the L1-bucket-local metadata.
+    // We need to convert these to global positions.
+    
+    // Step 1: Build the "entries" array (Y, global_pos) for each table's output.
+    // The output of table t is the input to table t+1.
+    // For t=1 (F1), the entries are already in C_in (uploaded at start).
+    // For t=2..9, the entries are in C_out of the previous table.
+    
+    // We need to reconstruct the Y values for each table's output to sort by Y.
+    // The Y values can be computed from metadata XOR: Y = XOR(meta[0..n_meta-1]) & KMASK.
+    
+    // Step 2: For each table t (2-9):
+    //   a. Download LR pairs from lr_per_table[t]
+    //   b. Download metadata for table t-1 output (which is C_in for table t)
+    //   c. Compute Y values from metadata
+    //   d. Sort entries by Y (radix sort)
+    //   e. Build entries_map[t]: sorted_pos -> original_pos
+    //   f. Build PD[t]: {sorted_L, delta} from LR pairs
+    
+    // This is complex. For now, let's use a simpler approach:
+    // Download all LR pairs, compute Y values from final metadata, sort, and build PD.
+    
+    // Actually, the simplest correct approach:
+    // 1. The final_Y and final_meta are already downloaded (sorted by L1 bucket).
+    // 2. We need to sort them by Y.
+    // 3. For PD, we need LR pairs from each table, with positions mapped to sorted order.
+    //
+    // But the LR positions refer to the UNSORTED metadata positions.
+    // The flat pipeline keeps entries sorted at each table, so LR positions are in sorted order.
+    // The GPU-resident pipeline doesn't sort globally, so LR positions are in L1-bucket order.
+    //
+    // To build PD correctly, we need to:
+    // a. For each table t, download the metadata (C_in for table t = C_out of table t-1)
+    // b. Compute Y values from metadata
+    // c. Sort (Y, pos) pairs by Y to get sorted order
+    // d. Build inv_map: original_pos -> sorted_pos
+    // e. Download LR pairs
+    // f. For each LR pair (L, R): sorted_L = inv_map[L], sorted_R = inv_map[R]
+    // g. Build PD[t][sorted_pos] = {sorted_L, sorted_R - sorted_L}
+    //
+    // But we already swapped C_in/C_out, so we lost the per-table metadata!
+    // We only have the final C_in (T9 output).
+    //
+    // FIX: Save C_in metadata for each table before swapping.
+    // This requires downloading metadata per table — which is expensive.
+    //
+    // ALTERNATIVE: Keep C_in on GPU and download when needed.
+    // But we already swapped, so C_in for table t is lost.
+    //
+    // For now, let's just build final_Y (already done) and sort it.
+    // PD and X_pairs will be built in a follow-up.
+    
+    // Sort final entries by Y
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(total_final);
+        for(uint32_t i = 0; i < total_final; i++) {
+            sorted_entries[i] = {plot.final_Y[i], i};
+        }
+        radix_sort_pairs(sorted_entries, KSIZE);
+        
+        std::vector<uint32_t> new_Y(total_final);
+        std::vector<std::array<uint32_t, 14>> new_meta(total_final);
+        for(uint32_t i = 0; i < total_final; i++) {
+            new_Y[i] = sorted_entries[i].first;
+            new_meta[i] = plot.final_meta[sorted_entries[i].second];
+        }
+        plot.final_Y = std::move(new_Y);
+        plot.final_meta = std::move(new_meta);
+    }
+    
+    // Set num_entries for write_plot
+    for(int t = 1; t <= n_table; t++) {
+        plot.num_entries[t] = lr_count_per_table[t];
+    }
+    plot.num_entries[1] = (uint32_t)Y_all.size();  // F1 count
+    
+    // Download LR pairs for table 2 (needed for X_pairs)
+    if(lr_count_per_table[2] > 0 && lr_per_table[2]) {
+        std::vector<uint32_t> lr2(lr_count_per_table[2] * 2);
+        clEnqueueReadBuffer(gpu_plotter.queue, lr_per_table[2], CL_TRUE, 0,
+            lr_count_per_table[2] * 2 * 4, lr2.data(), 0, nullptr, nullptr);
+        for(uint32_t i = 0; i < lr_count_per_table[2]; i++) {
+            // LR pair stored (TODO: use for X_pairs)
+        }
+        // TODO: build PD chain and X_pairs from LR pairs
+        // This requires the full metadata for each table, which we didn't save.
+        // For now, X_pairs will be empty — plot file won't be valid.
+        std::cerr << "[GPU-Res] LR[2] downloaded: " << lr_count_per_table[2] << " pairs" << std::endl;
+    }
     
     std::cout << "[GPU-Res] Download in " << (my_time_ms() - t_dl) / 1000.0 << "s" << std::endl;
     std::cout << "[GPU-Res] Total: " << (my_time_ms() - t0) / 1000.0 << "s" << std::endl;
