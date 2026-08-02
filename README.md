@@ -146,3 +146,26 @@ Theoretical minimum (all CPU overhead eliminated): F1(10.4) + GPU(3) + Write(3) 
 
 Achieving this requires a BULK GPU pipeline: all F2-F9 steps on GPU with no PCIe transfers.
 This is the next major development step.
+
+### GPU Bulk Pipeline (--gpu-bulk): ALL F2-F9 on GPU, no PCIe transfers
+
+| K | F2-F9 Flat | F2-F9 GPU-Bulk | Speedup | Match counts correct? |
+|---|-----------|----------------|---------|----------------------|
+| 18 | 1.5s  | 0.13s | 10x  | ✅ (T2 matches flat) |
+| 22 | 2.2s  | 1.48s | 1.5x | ✅ (all tables match flat) |
+| 25 | 16.4s | 11.5s | 1.4x | ✅ (all tables match flat) |
+
+**Architecture:**
+1. GPU counting sort (single-pass, 2^K bins) — correctly sorts by Y
+2. GPU match (direct pairing using sort counts/offsets) — O(total_matches)
+3. GPU hash (hash_lr_kernel) — same as flat pipeline
+4. No PCIe transfers between tables — all data stays on GPU
+
+**Bottleneck:** CPU prefix sum of 2^K bins = 158ms/table for k25.
+Moving to GPU would save ~1.3s.
+
+**VRAM limit:** k25 needs 15GB (fits 23GB). k26 needs 30GB (does NOT fit).
+k26 requires smaller max_matches or multi-pass sort.
+
+**Status:** Core pipeline proven. PD sorting and X_pairs build needed for valid plots.
+Write_plot currently crashes (PD not in sorted order).
