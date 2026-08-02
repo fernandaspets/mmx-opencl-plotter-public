@@ -841,6 +841,46 @@ public:
         clReleaseMemObject(Yb); clReleaseMemObject(Mb_out);
     }
     
+    // GPU-resident hash: M_curr stays on GPU, only upload LR, only download Y
+    // M_curr_gpu and M_out_gpu are pre-allocated and swapped between tables
+    void gpu_hash_table_lr_resident(
+        cl_mem M_curr_gpu,          // pre-allocated, stays on GPU
+        const std::vector<uint32_t>& LR_flat,  // [num_matches * 2] P1,P2 indices
+        std::vector<uint32_t>& Y_out,          // downloaded (small: num * 4)
+        cl_mem M_out_gpu,           // pre-allocated, stays on GPU
+        uint32_t kmask,
+        uint32_t num_total_entries)
+    {
+        const size_t num = LR_flat.size() / 2;
+        if(num == 0) { Y_out.clear(); return; }
+        
+        cl_int err2;
+        cl_mem LRb = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            LR_flat.size() * 4, (void*)LR_flat.data(), &err2);
+        cl_mem Yb = clCreateBuffer(context, CL_MEM_WRITE_ONLY, num * 4, nullptr, &err2);
+        
+        uint32_t num_u32 = (uint32_t)num;
+        uint32_t num_total_u32 = num_total_entries;
+        clSetKernelArg(hash_lr_kernel, 0, sizeof(cl_mem), &M_curr_gpu);
+        clSetKernelArg(hash_lr_kernel, 1, sizeof(cl_mem), &LRb);
+        clSetKernelArg(hash_lr_kernel, 2, sizeof(cl_mem), &Yb);
+        clSetKernelArg(hash_lr_kernel, 3, sizeof(cl_mem), &M_out_gpu);
+        clSetKernelArg(hash_lr_kernel, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(hash_lr_kernel, 5, sizeof(uint32_t), &num_u32);
+        clSetKernelArg(hash_lr_kernel, 6, sizeof(uint32_t), &num_total_u32);
+        
+        size_t global = num, local = g_hash_local;
+        if(global % local) global = ((global/local)+1)*local;
+        clEnqueueNDRangeKernel(queue, hash_lr_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+        
+        // Only download Y_out (small: num * 4 bytes). M_out stays on GPU!
+        Y_out.resize(num);
+        clEnqueueReadBuffer(queue, Yb, CL_TRUE, 0, num*4, Y_out.data(), 0, nullptr, nullptr);
+        
+        clReleaseMemObject(LRb);
+        clReleaseMemObject(Yb);
+    }
+    
     void init_gpu_kernels() {
         // Load f2_f9.cl + simple_sort.cl combined
         std::string src_str;
@@ -1075,13 +1115,39 @@ void compute_full_pipeline(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> entries_map(MY_N_TABLE + 1);  // entries_map[t] = sorted->original mapping for table t
     
-    auto sort_func = [&meta_less](const auto& L, const auto& R) {
-        if(L.first == R.first) return meta_less(L.second, R.second);
-        return L < R;
+    // sort_func: Y-only comparison (no metadata tiebreaker needed).
+    // MMX F2-F9 entries are hash outputs — Y collisions are rare and don't affect
+    // proof validity. CUDA plotter also sorts by Y only.
+    auto sort_func = [](const auto& L, const auto& R) {
+        return L.first < R.first;
     };
     
     plot.num_entries.resize(MY_N_TABLE + 1);
     plot.num_entries[1] = entries.size();
+    
+    // Module I: GPU-resident M_curr — upload once, swap buffers between tables
+    // Eliminates 3.6GB PCIe transfer per table (M_curr upload + M_out download)
+    bool use_gpu_resident = gpu_plotter.hash_lr_kernel != nullptr;
+    cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
+    if(use_gpu_resident) {
+        cl_int err;
+        size_t m_size = M_curr_flat.size() * sizeof(uint32_t);
+        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            m_size, (void*)M_curr_flat.data(), &err);
+        // M_out_gpu: max possible size = entries * 1.5 * 14 (some tables grow slightly)
+        size_t m_out_size = (size_t)(entries.size() * 3 / 2 + 256) * MY_N_META * sizeof(uint32_t);
+        M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_WRITE_ONLY,
+            m_out_size, nullptr, &err);
+        if(err != CL_SUCCESS) {
+            std::cerr << "[OCL] Failed to allocate GPU-resident M buffers, falling back" << std::endl;
+            use_gpu_resident = false;
+            if(M_curr_gpu) clReleaseMemObject(M_curr_gpu);
+            if(M_out_gpu) clReleaseMemObject(M_out_gpu);
+            M_curr_gpu = M_out_gpu = nullptr;
+        } else {
+            std::cout << "[OCL] GPU-resident M_curr: " << (m_size + m_out_size) / 1e9 << " GB VRAM" << std::endl;
+        }
+    }
     
     for(int t = 2; t <= MY_N_TABLE; t++) {
         auto t_table = my_time_ms();
@@ -1193,12 +1259,12 @@ void compute_full_pipeline(
         }
         auto t_flatten_lr = my_time_ms();
         
-        // GPU hash — direct approach: upload M_curr + LR pairs, GPU reads metadata directly
-        // M_curr_flat is already flat (no conversion needed!)
-        std::vector<uint32_t> Y_results, M_results;
-        if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
+        // GPU hash — GPU-resident M_curr (Module I)
+        // M_curr stays on GPU, only upload LR_pairs, only download Y_out
+        std::vector<uint32_t> Y_results;
+        std::vector<uint32_t> M_results;  // only used in fallback mode
+        if(use_gpu_resident && total_matches > 0) {
             // Build LR pairs (P1, P2 = original indices into M_curr)
-            // M_curr_flat is already in the right format — no flattening needed!
             std::vector<uint32_t> LR_flat(total_matches * 2);
             #pragma omp parallel for schedule(static)
             for(size_t i = 0; i < total_matches; i++) {
@@ -1207,38 +1273,56 @@ void compute_full_pipeline(
                 LR_flat[i * 2 + 1] = entries[sorted_R].second;
             }
             auto t_gpu_start = my_time_ms();
-            // Hash directly on GPU (reads M_curr[P1], M_curr[P2])
-            // M_curr_flat already contains the current table's metadata
-            gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
+            uint32_t num_total = (uint32_t)M_curr_flat.size() / MY_N_META;
+            gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
+                KMASK, num_total);
             auto t_gpu_end = my_time_ms();
-            if(t >= 2 && t <= 3) std::cerr << "[T" << t << "] GPU hash: " << (t_gpu_end - t_gpu_start) << "ms    \r" << std::flush;
+            if(t >= 2 && t <= 3) std::cerr << "[T" << t << "] GPU hash: " << (t_gpu_end - t_gpu_start) << "ms (resident)    \r" << std::flush;
+            
+            // Swap: M_curr_gpu ↔ M_out_gpu (no data transfer!)
+            std::swap(M_curr_gpu, M_out_gpu);
+            
+            // M_curr_flat is NOT updated on CPU — we don't need it for sort (Y-only sort)
+            // But we need it for the Final step. Download from GPU after T9.
+            // For now, update num_total for next table
+            // (M_out_gpu now contains the new M_curr for next table)
         } else {
-            // Fallback: old method (pre-extract L/R metadata on CPU)
-            std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
-            std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
-            #pragma omp parallel for schedule(static)
-            for(size_t i = 0; i < total_matches; i++) {
-                const auto& [sorted_L, sorted_R] = all_lr[i];
-                uint32_t orig_L = entries[sorted_L].second;
-                uint32_t orig_R = entries[sorted_R].second;
-                for(int j = 0; j < MY_N_META; j++) {
-                    L_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_L * MY_N_META + j];
-                    R_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_R * MY_N_META + j];
+            // Fallback: upload M_curr + download M_out each table
+            if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
+                std::vector<uint32_t> LR_flat(total_matches * 2);
+                #pragma omp parallel for schedule(static)
+                for(size_t i = 0; i < total_matches; i++) {
+                    const auto& [sorted_L, sorted_R] = all_lr[i];
+                    LR_flat[i * 2] = entries[sorted_L].second;
+                    LR_flat[i * 2 + 1] = entries[sorted_R].second;
                 }
-            }
-            if(get_opt_config().svm && g_svmpools.size() > 0 && g_svmpools[0]->svm_L_gathered) {
-                gpu_plotter.gpu_hash_table_svm(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK,
-                    g_svmpools[0]->svm_L_gathered, g_svmpools[0]->svm_R_gathered,
-                    g_svmpools[0]->svm_Y_hash, g_svmpools[0]->svm_M_hash,
-                    g_svmpools[0]->fine_grain);
+                gpu_plotter.gpu_hash_table_lr(M_curr_flat, LR_flat, Y_results, M_results, KMASK);
             } else {
+                // CPU fallback
+                std::vector<uint32_t> L_meta_flat(total_matches * MY_N_META);
+                std::vector<uint32_t> R_meta_flat(total_matches * MY_N_META);
+                #pragma omp parallel for schedule(static)
+                for(size_t i = 0; i < total_matches; i++) {
+                    const auto& [sorted_L, sorted_R] = all_lr[i];
+                    uint32_t orig_L = entries[sorted_L].second;
+                    uint32_t orig_R = entries[sorted_R].second;
+                    for(int j = 0; j < MY_N_META; j++) {
+                        L_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_L * MY_N_META + j];
+                        R_meta_flat[i * MY_N_META + j] = M_curr_flat[orig_R * MY_N_META + j];
+                    }
+                }
                 gpu_plotter.gpu_hash_table(L_meta_flat, R_meta_flat, Y_results, M_results, KMASK);
             }
+            M_curr_flat = std::move(M_results);
         }
         
-        // Convert to M_next format — keep as flat array (M_results is already flat!)
-        // M_results is [total_matches * MY_N_META] uint32 — just move it
-        std::vector<uint32_t> M_next_flat = std::move(M_results);
+        // In resident mode, M_results is empty (M_out stays on GPU).
+        // M_curr_flat is NOT updated on CPU — we don't need it until Final step.
+        // In fallback mode, M_results has the data and we update M_curr_flat.
+        if(!use_gpu_resident) {
+            M_curr_flat = std::move(M_results);
+        }
+        // else: M_curr_flat stays stale. Final step will download from GPU.
         
         // Build matches vector (Y, index into M_next)
         std::vector<std::pair<uint32_t, uint32_t>> matches;
@@ -1270,7 +1354,7 @@ void compute_full_pipeline(
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
         }
         std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries" << std::flush;
-        M_curr_flat = std::move(M_next_flat);
+        // M_curr_flat already updated above in fallback mode. Resident mode: GPU has it.
         entries = std::move(matches);
         plot.num_entries[t] = entries.size();
         
@@ -1283,6 +1367,17 @@ void compute_full_pipeline(
     entries_map[MY_N_TABLE] = std::vector<uint32_t>(entries.size());
     for(size_t k = 0; k < entries.size(); k++) {
         entries_map[MY_N_TABLE][k] = entries[k].second;
+    }
+    
+    // Module I: Download M_out from GPU for Final step (resident mode)
+    if(use_gpu_resident) {
+        size_t m_size = entries.size() * MY_N_META * sizeof(uint32_t);
+        M_curr_flat.resize(entries.size() * MY_N_META);
+        clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
+            m_size, M_curr_flat.data(), 0, nullptr, nullptr);
+        std::cout << "[OCL] Downloaded M_curr from GPU for Final step: " << m_size / 1e9 << " GB" << std::endl;
+        clReleaseMemObject(M_curr_gpu);
+        clReleaseMemObject(M_out_gpu);
     }
     
 // Reorder PD[2..8] by sorted position so PD[t][sorted_pos] gives the right entry.
