@@ -1230,15 +1230,14 @@ void compute_full_pipeline(
                 uint32_t next_count = bucket_counts[b + 1];
                 if(next_count > 0) {
                     uint32_t last_Y = entries[start + count - 1].first;
-                    for(uint32_t x = start + count - 1; x >= start; x--) {
+                    for(int64_t x = (int64_t)start + count - 1; x >= (int64_t)start; x--) {
                         const auto YL = entries[x].first;
                         if(YL < last_Y) break;
                         for(uint32_t y = next_start; y < next_start + next_count && entries[y].first <= YL + 1; y++) {
                             if(entries[y].first == YL + 1) {
-                                thread_lr[ti].emplace_back(x, y);
+                                thread_lr[ti].emplace_back((uint32_t)x, y);
                             }
                         }
-                        if(x == start) break;	// prevent uint32_t underflow infinite loop
                     }
                 }
             }
