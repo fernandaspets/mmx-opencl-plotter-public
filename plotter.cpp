@@ -1131,13 +1131,18 @@ void compute_full_pipeline(
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
     if(use_gpu_resident) {
         cl_int err;
-        size_t m_size = M_curr_flat.size() * sizeof(uint32_t);
-        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        // Both buffers must have the SAME max capacity (they get swapped!)
+        // Max entries = initial_entries * 3/2 + 256 (tables can grow slightly)
+        size_t max_entries = (size_t)(entries.size() * 3 / 2 + 256);
+        size_t m_size = max_entries * MY_N_META * sizeof(uint32_t);
+        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+            M_curr_flat.size() * sizeof(uint32_t), (void*)M_curr_flat.data(), &err);
+        // Re-allocate M_curr_gpu with max size (not just initial size)
+        if(M_curr_gpu) clReleaseMemObject(M_curr_gpu);
+        M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
             m_size, (void*)M_curr_flat.data(), &err);
-        // M_out_gpu: max possible size = entries * 1.5 * 14 (some tables grow slightly)
-        size_t m_out_size = (size_t)(entries.size() * 3 / 2 + 256) * MY_N_META * sizeof(uint32_t);
-        M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_WRITE_ONLY,
-            m_out_size, nullptr, &err);
+        M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
+            m_size, nullptr, &err);
         if(err != CL_SUCCESS) {
             std::cerr << "[OCL] Failed to allocate GPU-resident M buffers, falling back" << std::endl;
             use_gpu_resident = false;
@@ -1295,6 +1300,7 @@ void compute_full_pipeline(
             uint32_t num_total = (uint32_t)entries.size();  // current table's entry count (M_curr_gpu has this many entries)
             gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
                 KMASK, num_total);
+            clFinish(gpu_plotter.queue);  // ensure kernel completed before swap
             auto t_gpu_end = my_time_ms();
             if(t >= 2 && t <= 3) std::cerr << "[T" << t << "] GPU hash: " << (t_gpu_end - t_gpu_start) << "ms (resident)    \r" << std::flush;
             
