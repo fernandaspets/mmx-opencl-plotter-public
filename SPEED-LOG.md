@@ -1,57 +1,43 @@
 # OpenCL Plotter Speed Log
 
-## Current Best Results
+## Current Best Results (NO --opt-svm needed, cl_mem only)
 
-### k22 (4M entries)
-| Platform | Time | Pass | 
-|----------|------|------|
-| AMD 7900 XTX 1GPU | **4.63s** | 97.5% (312/320) |
-| NVIDIA P40 1GPU | **9.14s** | 97.5% (312/320) |
-| NVIDIA P40 2GPU | ~17s | 97.5% (overhead > gain at k22) |
-| CUDA reference | 1.52s | ~100% |
+### All K Sizes
+| K | Entries | AMD 7900 XTX | NVIDIA P40 | Pass (AMD) | Pass (NVIDIA) | VRAM (NVIDIA) |
+|---|---------|-------------|------------|------------|---------------|---------------|
+| 22 | 4M | **4.63s** | **9.13s** | 97.5% | 97.5% | ~200MB |
+| 23 | 8M | **8.57s** | **17.59s** | 94.06% | 94.06% | ~400MB |
+| 24 | 16M | **18.0s** | **32.65s** | 96.25% | 96.25% | 222MB |
+| 25 | 32M | **41.81s** | **67.06s** | 100.625% | 100.625% | 4MB idle |
+| 22 CUDA ref | 4M | — | 1.52s | — | ~100% | — |
 
-### k23 (8M entries)
-| Platform | Time | Pass |
-|----------|------|------|
-| AMD 7900 XTX 1GPU | **9.35s** | 94.06% (301/320) |
-| NVIDIA P40 1GPU | **17.46s** | 94.06% (301/320) |
-| CUDA reference | ~3s | ~100% |
+## Key VRAM Fix
+SVM pool was allocated (7.31GB for k24!) but never used.
+Fixed: only allocate if hash_lr_kernel is unavailable.
+NVIDIA k24 VRAM: 22GB → 222MB (99% reduction!)
+This means we can safely plot much larger k sizes on 24GB GPUs.
 
-## Optimization History (k23 AMD)
-| Version | Time | What changed |
-|---------|------|--------------|
+## Optimization History (k23 AMD: 18.4s → 8.57s = 53% reduction)
+| Optimization | Time | What |
+|-------------|------|------|
 | Chunked SVM baseline | 18.4s | Starting point |
 | FLAT pipeline | 15.1s | 48 kernel launches vs 12,288 |
-| Skip dedup entirely | 14.6s | No meta sort + re-sort (saves 3s) |
-| Warp-parallel F1 | 15.0s→13.0s | F1: 6.2s → 1.7s (32 threads/entry) |
-| hash_table_lr | 13.0s | GPU reads M_curr directly (skip CPU extraction) |
-| **Flat M_curr** | **9.35s** | Eliminate 3 memory copies per table (saves 2.4s) |
+| Skip dedup | 14.6s | No meta sort (duplicates never occur) |
+| Warp-parallel F1 | 13.0s | F1: 6.2s → 1.7s (32 threads/entry) |
+| hash_table_lr | 13.0s | GPU reads M_curr directly |
+| **Flat M_curr** | **9.35s** | Eliminate memory copies |
+| Parallel final copy | **8.57s** | OpenMP parallel copy |
+| Skip SVM pool | 8.57s | Saves 7GB VRAM (no speed change) |
 
-## k23 AMD Breakdown (9.35s)
-| Phase | Time | % |
-|-------|------|---|
-| F1 (warp-parallel) | 1.65s | 18% |
-| F2-F9 (8 tables) | ~6.0s | 64% |
-| Final (sort+copy+PD9) | ~1.7s | 18% |
+## Architecture
+3-kernel F1 pipeline (warp-parallel):
+1. gen_mem_array_v2: 1 WI/entry → key + mem to global (16K sub-batch, 72MB VRAM)
+2. calc_mem_hash_warp: 32 WI/entry → shared mem + manual tree reduction
+3. scatter_f1_v2: 1 WI/entry → final SHA-512 → Y, M
 
-## Key Optimizations
-1. **Warp-parallel F1**: 32 work-items per entry, manual tree reduction (F1 3.5x faster)
-2. **hash_table_lr**: GPU reads M_curr directly via P1/P2 indices (no CPU meta extraction)
-3. **Flat M_curr**: Keep metadata as flat uint32 array (eliminate array<->flat conversions)
-4. **Skip dedup**: MMX F2-F9 never produces duplicates (verified, CUDA also skips)
-5. **FLAT pipeline**: Process all entries in one kernel launch per table (no per-bucket overhead)
-6. **SVM**: Fine-grain zero-copy on AMD (no cl_mem for hash buffers)
-
-### k24 (16M entries)
-| Platform | Time | Pass |
-|----------|------|------|
-| AMD 7900 XTX 1GPU | **18.2s** | 96.25% (308/320) |
-| NVIDIA P40 1GPU | **33.6s** | 96.25% (308/320) |
-| CUDA reference | ~6s | ~100% |
-
-## k24 AMD Breakdown (18.2s)
-| Phase | Time | % |
-|-------|------|---|
-| F1 (warp-parallel) | 3.4s | 19% |
-| F2-F9 (8 tables) | 13.3s | 73% |
-| Final (sort+copy+PD9) | 1.5s | 8% |
+F2-F9 flat pipeline:
+- CPU radix sort + match (OpenMP parallel)
+- GPU hash_table_lr: reads M_curr directly via P1/P2 indices (no CPU extraction)
+- Flat M_curr array (no array<->flat conversions)
+- Skip dedup (never any duplicates)
+- Parallel final copy (OpenMP)
