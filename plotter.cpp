@@ -1269,11 +1269,17 @@ static void compute_gpu_resident(
             num_l1 * 4, counts.data(), 0, nullptr, nullptr);
         
         uint32_t total_matches_t = 0;
+        uint32_t match_count_before = 0;
         
         for(int y = 0; y < num_l1; y++) {
             if(y == 0 || y % 16 == 0) std::cerr << "\r  L1 bucket " << y << "/" << num_l1 << "..." << std::flush;
             uint32_t count_y = counts[y];
             if(count_y == 0) continue;
+            
+            // Clear num_matches for this L1 bucket (so eval_p1_tx only processes current matches)
+            clEnqueueFillBuffer(gpu_plotter.queue, num_matches, &zero, 4, 0, 4, 0, nullptr, nullptr);
+            clFinish(gpu_plotter.queue);
+            match_count_before = 0;
             
             // Copy L1 bucket metadata from active_c_in to tmp_c (GPU-to-GPU copy)
             size_t src_off = (size_t)y * max_bs * n_meta * 4;
@@ -1333,9 +1339,9 @@ static void compute_gpu_resident(
             int groups_per_sub = (max_bs2 + 127) / 128;
             size_t match_g[2] = {(size_t)(128 * groups_per_sub), (size_t)num_sub}, match_l[2] = {128, 1};
             clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_p1, 2, nullptr, match_g, match_l, 0, nullptr, nullptr);
+            clFinish(gpu_plotter.queue);  // ensure match done before reading count
             
-            // eval_p1_tx: hash LR pairs → C_out (scattered to new L1 buckets)
-            // Read match count
+            // Read match count for THIS L1 bucket (num_matches was cleared, so this is the count)
             uint32_t match_count = 0;
             clEnqueueReadBuffer(gpu_plotter.queue, num_matches, CL_TRUE, 0, 4, &match_count, 0, nullptr, nullptr);
             total_matches_t += match_count;
