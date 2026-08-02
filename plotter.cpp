@@ -1739,26 +1739,29 @@ void compute_gpu_bulk(
     cl_int err;
     int zero = 0;
     
-    // Y buffer: double-buffered for sort
+    // Y buffer: double-buffered for sort (use max_matches for safety)
     cl_mem Y_buf[2] = {
-        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err),
-        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err)
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 4, nullptr, &err),
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 4, nullptr, &err)
     };
     // pos buffer: double-buffered for sort (stores original positions)
     cl_mem pos_buf[2] = {
-        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err),
-        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err)
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 4, nullptr, &err),
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 4, nullptr, &err)
     };
     // LR buffers: orig (for hash) and sorted (for PD)
     cl_mem LR_orig = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
     cl_mem LR_sorted = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
     cl_mem match_count = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
     
-    // M_curr and M_out: double-buffered, stay on GPU
-    cl_mem M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-        total_entries * n_meta * 4, (void*)M_all.data(), &err);
+    // M_curr and M_out: double-buffered, stay on GPU (allocate for max_matches)
+    cl_mem M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
+        max_matches * n_meta * 4, nullptr, &err);
     cl_mem M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
-        total_entries * n_meta * 4, nullptr, &err);
+        max_matches * n_meta * 4, nullptr, &err);
+    
+    // Upload F1 metadata (only total_entries worth, not max_matches)
+    clEnqueueWriteBuffer(gpu_plotter.queue, M_curr_gpu, CL_FALSE, 0, total_entries * n_meta * 4, M_all.data(), 0, nullptr, nullptr);
     
     // Upload F1 Y values and positions
     clEnqueueWriteBuffer(gpu_plotter.queue, Y_buf[0], CL_FALSE, 0, total_entries * 4, Y_all.data(), 0, nullptr, nullptr);
@@ -1817,6 +1820,7 @@ void compute_gpu_bulk(
         auto t_prefix_end = my_time_ms();
         
         // Scatter to sorted positions
+        if(t == 2) { uint32_t dbg[10]; clEnqueueReadBuffer(gpu_plotter.queue, counts, CL_TRUE, 0, 40, dbg, 0, nullptr, nullptr); std::cerr << "  counts[0..9]: "; for(int i=0;i<10;i++) std::cerr << dbg[i] << " "; std::cerr << std::endl; }
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 1, sizeof(cl_mem), &pos_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 2, sizeof(cl_mem), &Y_buf[1]);
