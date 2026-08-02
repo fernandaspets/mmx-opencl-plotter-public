@@ -958,6 +958,125 @@ public:
         clReleaseMemObject(Yb);
     }
     
+    
+    // GPU bucket sort: sort (Y, val) pairs by Y using multiple radix passes on GPU
+    // Replaces CPU radix_sort_pairs — saves ~230ms/table for k25
+    cl_kernel k_bucket_count = nullptr;
+    cl_kernel k_bucket_scatter = nullptr;
+    cl_program bucket_sort_program = nullptr;
+    
+    void init_bucket_sort() {
+        if(k_bucket_count) return;  // already initialized
+        std::string kernel_path = "bucket_sort.cl";
+        FILE* bf = fopen(kernel_path.c_str(), "r");
+        if(!bf) { std::cerr << "[OCL] Cannot open " << kernel_path << std::endl; return; }
+        fseek(bf, 0, SEEK_END); size_t bsz = ftell(bf); fseek(bf, 0, SEEK_SET);
+        char* bsrc = new char[bsz+1]; size_t brd = fread(bsrc, 1, bsz, bf); bsrc[bsz] = 0; fclose(bf);
+        std::string src(bsrc, bsz);
+        delete[] bsrc;
+        const char* src_c = src.c_str();
+        size_t src_len = src.size();
+        cl_int err;
+        bucket_sort_program = clCreateProgramWithSource(context, 1, &src_c, &src_len, &err);
+        err = clBuildProgram(bucket_sort_program, 1, &device, nullptr, nullptr, nullptr);
+        if(err != CL_SUCCESS) {
+            char log[4096]; clGetProgramBuildInfo(bucket_sort_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+            std::cerr << "[OCL] bucket_sort.cl build log: " << log << std::endl;
+            return;
+        }
+        k_bucket_count = clCreateKernel(bucket_sort_program, "bucket_count", &err);
+        k_bucket_scatter = clCreateKernel(bucket_sort_program, "bucket_scatter", &err);
+        std::cout << "[OCL] Bucket sort kernels loaded" << std::endl;
+    }
+    
+    void gpu_bucket_sort(
+        std::vector<uint32_t>& Y_inout,
+        std::vector<uint32_t>& val_inout,
+        uint32_t ksize)
+    {
+        const size_t n = Y_inout.size();
+        if(n <= 1) return;
+        
+        const int BITS_PER_PASS = 8;
+        const int num_passes = (ksize + BITS_PER_PASS - 1) / BITS_PER_PASS;
+        
+        // Upload to GPU
+        cl_int err;
+        cl_mem Y_buf[2] = {
+            clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, n*4, Y_inout.data(), &err),
+            clCreateBuffer(context, CL_MEM_READ_WRITE, n*4, nullptr, &err)
+        };
+        cl_mem val_buf[2] = {
+            clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, n*4, val_inout.data(), &err),
+            clCreateBuffer(context, CL_MEM_READ_WRITE, n*4, nullptr, &err)
+        };
+        
+        for(int pass = 0; pass < num_passes; pass++) {
+            const uint32_t shift = pass * BITS_PER_PASS;
+            const uint32_t mask = (pass == num_passes - 1) ? ((1u << (ksize - shift)) - 1) : 0xFF;
+            const uint32_t num_bins = (pass == num_passes - 1) ? (1u << (ksize - shift)) : 256;
+            if(num_bins == 0) break;
+            
+            cl_mem counts = clCreateBuffer(context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            cl_mem offsets = clCreateBuffer(context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            cl_mem atomic_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            
+            // Zero counts
+            int zero = 0;
+            clEnqueueFillBuffer(queue, counts, &zero, 4, 0, num_bins * 4, 0, nullptr, nullptr);
+            clEnqueueFillBuffer(queue, atomic_buf, &zero, 4, 0, num_bins * 4, 0, nullptr, nullptr);
+            
+            // Count
+            uint32_t n_u32 = (uint32_t)n;
+            uint32_t shift_u32 = shift;
+            uint32_t mask_u32 = mask;
+            uint32_t num_bins_u32 = num_bins;
+            clSetKernelArg(k_bucket_count, 0, sizeof(cl_mem), &Y_buf[pass % 2]);
+            clSetKernelArg(k_bucket_count, 1, sizeof(cl_mem), &counts);
+            clSetKernelArg(k_bucket_count, 2, sizeof(uint32_t), &shift_u32);
+            clSetKernelArg(k_bucket_count, 3, sizeof(uint32_t), &mask_u32);
+            clSetKernelArg(k_bucket_count, 4, sizeof(uint32_t), &num_bins_u32);
+            clSetKernelArg(k_bucket_count, 5, sizeof(uint32_t), &n_u32);
+            size_t gs = ((n + 255) / 256) * 256;
+            clEnqueueNDRangeKernel(queue, k_bucket_count, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+            
+            // Prefix sum on CPU (small: 256 bins)
+            std::vector<uint32_t> h_counts(num_bins);
+            clEnqueueReadBuffer(queue, counts, CL_TRUE, 0, num_bins * 4, h_counts.data(), 0, nullptr, nullptr);
+            std::vector<uint32_t> h_offsets(num_bins);
+            uint32_t sum = 0;
+            for(uint32_t b = 0; b < num_bins; b++) {
+                h_offsets[b] = sum;
+                sum += h_counts[b];
+            }
+            clEnqueueWriteBuffer(queue, offsets, CL_FALSE, 0, num_bins * 4, h_offsets.data(), 0, nullptr, nullptr);
+            clEnqueueWriteBuffer(queue, atomic_buf, CL_FALSE, 0, num_bins * 4, h_offsets.data(), 0, nullptr, nullptr);
+            
+            // Scatter
+            clSetKernelArg(k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[pass % 2]);
+            clSetKernelArg(k_bucket_scatter, 1, sizeof(cl_mem), &val_buf[pass % 2]);
+            clSetKernelArg(k_bucket_scatter, 2, sizeof(cl_mem), &Y_buf[(pass + 1) % 2]);
+            clSetKernelArg(k_bucket_scatter, 3, sizeof(cl_mem), &val_buf[(pass + 1) % 2]);
+            clSetKernelArg(k_bucket_scatter, 4, sizeof(cl_mem), &offsets);
+            clSetKernelArg(k_bucket_scatter, 5, sizeof(cl_mem), &atomic_buf);
+            clSetKernelArg(k_bucket_scatter, 6, sizeof(uint32_t), &shift_u32);
+            clSetKernelArg(k_bucket_scatter, 7, sizeof(uint32_t), &mask_u32);
+            clSetKernelArg(k_bucket_scatter, 8, sizeof(uint32_t), &n_u32);
+            clEnqueueNDRangeKernel(queue, k_bucket_scatter, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+            
+            clReleaseMemObject(counts);
+            clReleaseMemObject(offsets);
+            clReleaseMemObject(atomic_buf);
+        }
+        
+        // Download sorted result
+        clEnqueueReadBuffer(queue, Y_buf[num_passes % 2], CL_TRUE, 0, n * 4, Y_inout.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(queue, val_buf[num_passes % 2], CL_TRUE, 0, n * 4, val_inout.data(), 0, nullptr, nullptr);
+        
+        clReleaseMemObject(Y_buf[0]); clReleaseMemObject(Y_buf[1]);
+        clReleaseMemObject(val_buf[0]); clReleaseMemObject(val_buf[1]);
+    }
+    
     void init_gpu_kernels() {
         // Load f2_f9.cl + simple_sort.cl combined
         std::string src_str;
@@ -1574,7 +1693,8 @@ void compute_full_pipeline(
     const std::vector<uint32_t>& M_in,
     PlotData& plot,
     OCL_Plotter& gpu_plotter,
-    bool use_bitmap = false)
+    bool use_bitmap = false,
+    bool use_gpu_sort = false)
 {
     const uint32_t kmask = KMASK;
     
@@ -1733,7 +1853,22 @@ void compute_full_pipeline(
                 entries_map[t-1][k] = entries[k].second;
             }
             
-            radix_sort_pairs(matches, KSIZE);
+            if(use_gpu_sort && gpu_plotter.k_bucket_count) {
+                std::vector<uint32_t> Y_arr(matches.size());
+                std::vector<uint32_t> val_arr(matches.size());
+                #pragma omp parallel for schedule(static)
+                for(size_t k = 0; k < matches.size(); k++) {
+                    Y_arr[k] = matches[k].first;
+                    val_arr[k] = matches[k].second;
+                }
+                gpu_plotter.gpu_bucket_sort(Y_arr, val_arr, KSIZE);
+                #pragma omp parallel for schedule(static)
+                for(size_t k = 0; k < matches.size(); k++) {
+                    matches[k] = {Y_arr[k], val_arr[k]};
+                }
+            } else {
+                radix_sort_pairs(matches, KSIZE);
+            }
             
             // Build PD — LR[t] already in sorted positions (converted above)
             entries_map[t] = std::vector<uint32_t>(matches.size());
@@ -1969,9 +2104,24 @@ void compute_full_pipeline(
             clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
                 total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
-        // Radix sort matches by Y — O(n) instead of O(n log n)
+        // Sort matches by Y
         auto t_sort_start = my_time_ms();
-        radix_sort_pairs(matches, KSIZE);
+        if(use_gpu_sort && gpu_plotter.k_bucket_count) {
+            std::vector<uint32_t> Y_arr(matches.size());
+            std::vector<uint32_t> val_arr(matches.size());
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < matches.size(); k++) {
+                Y_arr[k] = matches[k].first;
+                val_arr[k] = matches[k].second;
+            }
+            gpu_plotter.gpu_bucket_sort(Y_arr, val_arr, KSIZE);
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < matches.size(); k++) {
+                matches[k] = {Y_arr[k], val_arr[k]};
+            }
+        } else {
+            radix_sort_pairs(matches, KSIZE);
+        }
         auto t_sort_end = my_time_ms();
         // Build entries_map[t] + PD[t] in single pass
         entries_map[t] = std::vector<uint32_t>(matches.size());
@@ -4707,6 +4857,7 @@ int main(int argc, char** argv)
     bool use_chunked = false;
     bool use_gpu_res = false;
     bool use_bitmap = false;
+    bool use_gpu_sort = false;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
@@ -4747,6 +4898,7 @@ std::cerr << "  --timing        Show per-step timing for first bucket of each ta
         else if(arg == "--chunked") use_chunked = true;
         else if(arg == "--gpu-res") use_gpu_res = true;
         else if(arg == "--bitmap") use_bitmap = true;
+        else if(arg == "--gpu-sort") use_gpu_sort = true;
 else if(arg == "--no-yield") gpu_yield = false;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
 else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
@@ -5057,7 +5209,8 @@ std::vector<std::vector<PDEntry>> pd_all;
     for(size_t i = 0; i < X_values.size(); i++) X_values[i] = (uint32_t)i;
     
     PlotData plot;
-    compute_full_pipeline(X_values, Y_all, M_all, plot, plotter, use_bitmap);
+    if(use_gpu_sort) plotter.init_bucket_sort();
+    compute_full_pipeline(X_values, Y_all, M_all, plot, plotter, use_bitmap, use_gpu_sort);
     
     if(dump_pd) {
         for(int t = 2; t <= MY_N_TABLE; t++) {
