@@ -105,3 +105,44 @@ See `docs/ARCHITECTURE.md` for pipeline details.
 ## License
 
 MIT (see LICENSE file if present). Based on madMAx43v3r's mmx-cuda-plotter.
+
+### Updated Speeds (with warp-parallel F1 + GPU-resident M_curr)
+
+| K | Entries | AMD 7900 XTX | NVIDIA P40 | Pass |
+|---|---------|-------------|------------|------|
+| 20 | 1M  | 0.8s  | 1.3s  | 96.9% |
+| 22 | 4M  | 2.5s  | 4.2s  | 97.5% |
+| 25 | 32M | 18.7s | ~30s  | 100.25% |
+| 26 | 64M | 36.4s | ~60s  | 100%+ |
+
+k25 improvement: 41.81s → 18.7s (55% reduction, target was 15-20s ✅)
+k26 improvement: ~70s → 36.4s (~48% reduction, approximately halved ✅)
+
+### Optimization Experiments
+
+1. **GPU-resident pipeline** (--gpu-res): F2-F9 on GPU per-L1-bucket.
+   Works but O(2^k) kernel launches don't scale. Good for timing, no valid plot.
+
+2. **Bitmap matching** (--bitmap): counting sort + bitmap match.
+   21% faster for k22 (3.3s vs 4.2s). Slower for k25 (30.8s vs 18.7s).
+   Counting sort is O(2^k) with cache misses on large pos_map.
+
+3. **GPU bucket sort** (--gpu-sort): replace CPU radix sort with GPU bucket sort.
+   Works correctly but PCIe transfers (512MB/table) negate GPU speedup.
+   Same speed as CPU radix sort.
+
+4. **Indirect radix sort**: tested, 5x SLOWER due to random Y access.
+
+### Remaining Optimization Path
+
+To further reduce k26 below 36.4s:
+- F1: 10.4s (SHA-512 compute bound, hard to optimize)
+- F2-F9 CPU overhead: ~26s (match + flatten + lr_flat_build + sort_matches + build_pd)
+- GPU hash: ~3s
+- Write: ~4.9s
+- Final: ~2.6s
+
+Theoretical minimum (all CPU overhead eliminated): F1(10.4) + GPU(3) + Write(3) + Final(1) = 17.4s
+
+Achieving this requires a BULK GPU pipeline: all F2-F9 steps on GPU with no PCIe transfers.
+This is the next major development step.
