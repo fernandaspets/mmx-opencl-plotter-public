@@ -1127,7 +1127,7 @@ void compute_full_pipeline(
     
     // Module I: GPU-resident M_curr — upload once, swap buffers between tables
     // Eliminates 3.6GB PCIe transfer per table (M_curr upload + M_out download)
-    bool use_gpu_resident = gpu_plotter.hash_lr_kernel != nullptr;
+    bool use_gpu_resident = false;
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
     if(use_gpu_resident) {
         cl_int err;
@@ -1150,7 +1150,7 @@ void compute_full_pipeline(
             if(M_out_gpu) clReleaseMemObject(M_out_gpu);
             M_curr_gpu = M_out_gpu = nullptr;
         } else {
-            std::cout << "[OCL] GPU-resident M_curr: " << (m_size + m_out_size) / 1e9 << " GB VRAM" << std::endl;
+            std::cout << "[OCL] GPU-resident M_curr: " << 2.0 * m_size / 1e9 << " GB VRAM" << std::endl;
         }
     }
     
