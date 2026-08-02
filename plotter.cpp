@@ -1512,11 +1512,13 @@ static void compute_gpu_resident(
     
     // Sort final entries by Y
     {
+        std::cerr << "[GPU-Res] Sorting " << total_final << " final entries..." << std::endl;
         std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(total_final);
         for(uint32_t i = 0; i < total_final; i++) {
             sorted_entries[i] = {plot.final_Y[i], i};
         }
         radix_sort_pairs(sorted_entries, KSIZE);
+        std::cerr << "[GPU-Res] Sort done, rebuilding arrays..." << std::endl;
         
         std::vector<uint32_t> new_Y(total_final);
         std::vector<std::array<uint32_t, 14>> new_meta(total_final);
