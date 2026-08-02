@@ -1168,19 +1168,20 @@ void compute_full_pipeline(
         auto t_table = my_time_ms();
         const size_t n = entries.size();
         
-        // Only download M_curr for sort if using metadata sort (NVIDIA).
-        // AMD uses Y-only sort — no download needed (saves 1.8GB/table for k25!).
-        if(use_gpu_resident && use_meta_sort && t > 2) {
+        // For t==2, entries come unsorted from F1 — need to sort.
+        // For t>2, entries are already sorted from the previous table's match sort.
+        // For NVIDIA metadata sort at t==2, download M_curr for tiebreaker.
+        if(use_gpu_resident && use_meta_sort && t == 2) {
             M_curr_flat.resize(n * MY_N_META);
             clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
                 n * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
         
-        std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
-        
-        // Parallel sort by Y (faster than radix + per-bucket sort)
-        __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        if(t == 2) {
+            std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
+            __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
+                __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        }
         
         // Build bucket counts for matching (entries are now sorted by Y)
         const int log_buckets = std::min(LOGBUCKETS, KSIZE - 1);
@@ -1352,19 +1353,35 @@ void compute_full_pipeline(
         for(size_t k = 0; k < entries.size(); k++) {
             entries_map[t-1][k] = entries[k].second;
         }
-        // Save PD for EVERY entry in this table (in MATCH ORDER)
-        // Store SORTED positions (index into sorted entries of previous table)
-        // delta = sorted_R - sorted_L - 1 (always >= 0 since sorted_R > sorted_L)
+        // Sort matches by Y NOW (so entries are pre-sorted for next table)
+        // and build PD in SORTED order — eliminates PD reorder at end.
+        // For NVIDIA metadata sort: download new M_curr (M_out after swap) for tiebreaker.
+        if(use_gpu_resident && use_meta_sort) {
+            M_curr_flat.resize(total_matches * MY_N_META);
+            clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
+                total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
+        }
+        __gnu_parallel::sort(matches.begin(), matches.end(), sort_func,
+            __gnu_parallel::parallel_tag(omp_get_max_threads()));
+        // Build entries_map[t]: sorted_idx -> original match_idx
+        entries_map[t] = std::vector<uint32_t>(matches.size());
+        #pragma omp parallel for schedule(static)
+        for(size_t k = 0; k < matches.size(); k++) {
+            entries_map[t][k] = matches[k].second;
+        }
+        // Save PD in SORTED order: for each sorted_pos k, match_idx = matches[k].second
+        // PD[t][k] = {LR[t][match_idx].first, LR[t][match_idx].second - LR[t][match_idx].first}
         plot.PD.resize(MY_N_TABLE + 1);
         plot.PD[t].resize(matches.size());
         #pragma omp parallel for schedule(static)
         for(size_t k = 0; k < matches.size(); k++) {
-            uint32_t sorted_L = LR[t][k].first;
-            uint32_t sorted_R = LR[t][k].second;
+            uint32_t match_idx = matches[k].second;
+            uint32_t sorted_L = LR[t][match_idx].first;
+            uint32_t sorted_R = LR[t][match_idx].second;
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
         }
-        std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries" << std::flush;
-        // M_curr_flat already updated above in fallback mode. Resident mode: GPU has it.
+        std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries (sorted order)" << std::flush;
+        // entries already sorted — next table iteration skips the sort
         entries = std::move(matches);
         plot.num_entries[t] = entries.size();
         
@@ -1375,9 +1392,7 @@ void compute_full_pipeline(
     
     // Save entries_map[9] (table 9 mapping: sorted_idx -> original_idx)
     entries_map[MY_N_TABLE] = std::vector<uint32_t>(entries.size());
-    for(size_t k = 0; k < entries.size(); k++) {
-        entries_map[MY_N_TABLE][k] = entries[k].second;
-    }
+    // entries_map[9] already built in the per-table loop (sorted order)
     
     // Module I: Download M_out from GPU for Final step (resident mode)
     if(use_gpu_resident) {
@@ -1390,91 +1405,43 @@ void compute_full_pipeline(
         clReleaseMemObject(M_out_gpu);
     }
     
-// Reorder PD[2..8] by sorted position so PD[t][sorted_pos] gives the right entry.
-    auto t_pd_reorder_start = my_time_ms();
-    #pragma omp parallel for schedule(dynamic, 1)
-    for(int t = 2; t <= 8; t++) {
-        auto old_pd = std::move(plot.PD[t]);
-        plot.PD[t].resize(old_pd.size());
-        size_t pd_count = std::min(entries_map[t].size(), old_pd.size());
-        #pragma omp parallel for schedule(static)
-        for(size_t sorted_pos = 0; sorted_pos < pd_count; sorted_pos++) {
-            uint32_t match_idx = entries_map[t][sorted_pos];
-            if(match_idx < old_pd.size()) {
-                plot.PD[t][sorted_pos] = old_pd[match_idx];
-            }
-        }
-    }
-    
-    auto t_pd_reorder_end = my_time_ms();
-    std::cerr << "[Final] PD reorder: " << (t_pd_reorder_end - t_pd_reorder_start) << "ms    \r" << std::flush;
-    
-    // Final sort using parallel sort
+    // PD[2..9] already in sorted order (built in per-table loop) — NO REORDER NEEDED!
+    // entries already sorted (from T9 match sort) — NO FINAL SORT NEEDED!
+    // Just copy directly to final arrays.
     auto t_final_start = my_time_ms();
-    std::cerr << "[Final] Sorting " << entries.size() << " entries...           \r" << std::flush;
-    {
-        __gnu_parallel::sort(entries.begin(), entries.end(), sort_func,
-            __gnu_parallel::parallel_tag(omp_get_max_threads()));
-    }
-    
-    auto t_sort_done = my_time_ms();
-    
-    // Skip dedup — MMX F2-F9 never produces duplicate entries (verified).
-    // The CUDA plotter also has no dedup step.
-    // Entries are already sorted by Y from the radix sort above.
-    // Just copy directly — saves ~5s for k23 (meta sort + re-sort of 8M entries).
-    // Parallelized: pre-allocate and fill with OpenMP.
-    std::cerr << "[Final] Copying " << entries.size() << " entries (no dedup needed)...  \r" << std::flush;
+    std::cerr << "[Final] Copying " << entries.size() << " entries (pre-sorted)...  \r" << std::flush;
     {
         const size_t ne = entries.size();
         plot.final_Y.resize(ne);
         plot.final_meta.resize(ne);
-        final_indices.resize(ne);
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < ne; i++) {
             plot.final_Y[i] = entries[i].first;
             std::memcpy(plot.final_meta[i].data(), &M_curr_flat[entries[i].second * MY_N_META], 14 * sizeof(uint32_t));
-            final_indices[i] = entries[i].second;
         }
     }
     
     auto t_copy_done = my_time_ms();
     std::cout << "[Final] " << plot.final_Y.size() << " entries          " << std::endl;
+    std::cerr << "[Final] copy=" << (t_copy_done-t_final_start) << "ms (no sort, no PD reorder needed)    \r" << std::flush;
     
-    // No re-sort needed — entries are already in Y-sorted order from radix sort!
-    
-    // PD[9] reorder: entries are Y-sorted, but PD[9] is in match order.
-    // final_indices[i] = entries[i].second = match-order index.
-    // Reorder PD[9] to match Y-sorted order.
-    {
-        auto old_pd9 = std::move(plot.PD[9]);
-        plot.PD[9].resize(final_indices.size());
-        #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < final_indices.size(); i++) {
-            plot.PD[9][i] = old_pd9[final_indices[i]];
-        }
-    }
-    
-    auto t_pd9_done = my_time_ms();
-    std::cerr << "[Final] sort=" << (t_sort_done-t_final_start) << "ms copy=" << (t_copy_done-t_sort_done) << "ms pd9=" << (t_pd9_done-t_copy_done) << "ms    \r" << std::flush;
-    
-    // X pairs: compute in match order, then reorder by sorted position
+    // X pairs: build in sorted order directly (no reorder needed)
+    // PD[t] is in sorted order, entries_map[t] is sorted->original.
+    // For X_pairs, we need entries_map[1][sorted_L] and entries_map[1][sorted_R]
+    // where sorted_L/R are from LR[2][match_idx].
+    // Since PD[2] is in sorted order, PD[2][sorted_pos] = {sorted_L, delta}.
+    // match_idx = entries_map[2][sorted_pos].
     auto t_xpairs_start = my_time_ms();
     {
-        std::vector<std::pair<uint32_t, uint32_t>> x_match_order(LR[2].size());
-        #pragma omp parallel for schedule(static)
-        for(size_t k = 0; k < LR[2].size(); k++) {
-            uint32_t sorted_L = LR[2][k].first;
-            uint32_t sorted_R = LR[2][k].second;
-            x_match_order[k] = {entries_map[1][sorted_L], entries_map[1][sorted_R]};
-        }
-        plot.X_pairs.resize(x_match_order.size());
-        size_t xp_count = std::min(entries_map[2].size(), x_match_order.size());
+        plot.X_pairs.resize(LR[2].size());
+        size_t xp_count = std::min(entries_map[2].size(), plot.X_pairs.size());
         #pragma omp parallel for schedule(static)
         for(size_t sorted_pos = 0; sorted_pos < xp_count; sorted_pos++) {
             uint32_t match_idx = entries_map[2][sorted_pos];
-            if(match_idx < x_match_order.size()) {
-                plot.X_pairs[sorted_pos] = x_match_order[match_idx];
+            if(match_idx < LR[2].size()) {
+                uint32_t sorted_L = LR[2][match_idx].first;
+                uint32_t sorted_R = LR[2][match_idx].second;
+                plot.X_pairs[sorted_pos] = {entries_map[1][sorted_L], entries_map[1][sorted_R]};
             }
         }
     auto t_xpairs_end = my_time_ms();
