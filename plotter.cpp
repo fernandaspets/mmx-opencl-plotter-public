@@ -1118,14 +1118,7 @@ void compute_full_pipeline(
     // sort_func: Y comparison with metadata tiebreaker.
     // The metadata tiebreaker is ESSENTIAL — without it, matching produces wrong
     // LR pairs on some GPUs (NVIDIA), causing all-same-Y outputs at T4.
-    auto meta_less = [&M_curr_flat](uint32_t a, uint32_t b) {
-        const uint32_t* pa = &M_curr_flat[a * MY_N_META];
-        const uint32_t* pb = &M_curr_flat[b * MY_N_META];
-        for(int j = 0; j < MY_N_META; j++) {
-            if(pa[j] != pb[j]) return pa[j] < pb[j];
-        }
-        return false;
-    };
+    // meta_less was already defined above (line ~1099).
     auto sort_func = [&meta_less](const auto& L, const auto& R) {
         if(L.first == R.first) return meta_less(L.second, R.second);
         return L.first < R.first;
