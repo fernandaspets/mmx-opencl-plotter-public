@@ -4180,6 +4180,7 @@ int main(int argc, char** argv)
     bool test_mode = false;
     uint64_t test_limit = 0;
     bool use_ramdisk = false;
+    bool use_hybrid = false;
     bool use_chunked = false;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
@@ -4189,7 +4190,8 @@ int main(int argc, char** argv)
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --k N           Set plot k-size (default: 26)" << std::endl;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for plotting, then copy to output_dir" << std::endl;
-        std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+, uses more total RAM but less per-chunk)" << std::endl;
+    std::cerr << "  --chunked       Use per-bucket chunked pipeline (for k29+)" << std::endl;
+        std::cerr << "  --hybrid        Hybrid: flat F1 + chunked F2-F9 (GPU sort+match)" << std::endl;
 std::cerr << "  --no-yield      Disable GPU display yield (for headless systems)" << std::endl;
 std::cerr << "  --device N      Select GPU device index (default: 0)" << std::endl;
 std::cerr << "  --opt-gpu-meta  Module B: GPU metadata extraction (skip CPU extract+reupload)" << std::endl;
@@ -4219,6 +4221,7 @@ std::cerr << "  --timing        Show per-step timing for first bucket of each ta
         else if(arg == "--limit" && i+1 < argc) test_limit = std::stoull(argv[++i]);
         else if(arg == "--k" && i+1 < argc) { KSIZE = std::stoi(argv[++i]); XBITS = KSIZE; }
         else if(arg == "--chunked") use_chunked = true;
+        else if(arg == "--hybrid")  use_hybrid = true;
 else if(arg == "--no-yield") gpu_yield = false;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
 else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
