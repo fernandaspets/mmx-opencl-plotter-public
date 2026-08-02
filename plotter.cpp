@@ -1199,6 +1199,15 @@ void compute_full_pipeline(
         auto t_sorted = my_time_ms();
         std::cerr << "[T" << t << "] Sorted in " << (t_sorted - t_table) / 1000.0 << "s. Matching...     \r" << std::flush;
         
+        // Debug: print max bucket size
+        {
+            uint32_t max_count = 0, max_b = 0;
+            for(size_t b = 0; b < num_buckets; b++) {
+                if(bucket_counts[b] > max_count) { max_count = bucket_counts[b]; max_b = b; }
+            }
+            std::cerr << "[T" << t << "] max_bucket=" << max_count << " (bucket " << max_b << "/" << num_buckets << ")    \r" << std::flush;
+        }
+        
         // Parallel matching: each thread handles a range of buckets
         // Y and Y+1 are always in the same or adjacent bucket
         const int nthreads = std::min(omp_get_max_threads(), (int)num_buckets);
