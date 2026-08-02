@@ -51,7 +51,7 @@ std::vector<OCL_Plotter*> g_plotters;
 std::vector<BufferPool*> g_bufpools;
 std::vector<SVMPool*> g_svmpools;
 int g_num_gpus = 1;
-int g_hash_local = 256;  // work-group size for hash kernels
+int g_hash_local = 256;  // default for AMD (256); NVIDIA auto-detected to 64
 std::mutex g_dst_mutex;  // protects dst store writes in multi-GPU mode
 
 // SVM helper: set SVM pointer as kernel arg
@@ -713,6 +713,17 @@ public:
     cl_program f2f9_program = nullptr;
     
     void init_table_hash() {
+        // Auto-detect GPU vendor: NVIDIA needs smaller work-group for register spilling
+        char hash_dev_vendor[256] = {};
+        clGetDeviceInfo(this->device, CL_DEVICE_VENDOR, sizeof(hash_dev_vendor), hash_dev_vendor, nullptr);
+        bool hash_is_nvidia = strstr(hash_dev_vendor, "NVIDIA") != nullptr;
+        if(hash_is_nvidia) {
+            g_hash_local = 64;
+            std::cout << "[OCL] GPU is NVIDIA, using hash work-group size 64 (more regs per thread)" << std::endl;
+        } else {
+            g_hash_local = 256;
+            std::cout << "[OCL] GPU is AMD, using hash work-group size 256" << std::endl;
+        }
         std::string kernel_path = "table_hash.cl";
         FILE* f = fopen(kernel_path.c_str(), "r");
         if(!f) throw std::runtime_error("Cannot open " + kernel_path);
