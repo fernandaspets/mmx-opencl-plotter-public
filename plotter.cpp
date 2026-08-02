@@ -1115,12 +1115,21 @@ void compute_full_pipeline(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> entries_map(MY_N_TABLE + 1);  // entries_map[t] = sorted->original mapping for table t
     
-    // sort_func: Y-only comparison. Uses stable_sort to preserve match order
-    // for entries with same Y. This is deterministic and doesn't need M_curr.
-    // Stable order = hash output order = match order from previous table.
-    auto sort_func = [&meta_less](const auto& L, const auto& R) {
-        if(L.first == R.first) return meta_less(L.second, R.second); return L.first < R.first;
+    // sort_func: Y-only comparison for AMD (fast, no M_curr download needed).
+    // NVIDIA needs metadata tiebreaker (Y-only sort produces wrong LR pairs).
+    // Detect GPU vendor to choose the right approach.
+    char dev_vendor[256] = {};
+    clGetDeviceInfo(gpu_plotter.device, CL_DEVICE_VENDOR, sizeof(dev_vendor), dev_vendor, nullptr);
+    bool is_nvidia = strstr(dev_vendor, "NVIDIA") != nullptr;
+    bool use_meta_sort = is_nvidia;  // NVIDIA needs metadata tiebreaker
+    
+    // Use a single sort_func with runtime check.
+    // Can't use ternary with different lambda types, so wrap in a function object.
+    auto sort_func = [&meta_less, use_meta_sort](const auto& L, const auto& R) {
+        if(L.first == R.first && use_meta_sort) return meta_less(L.second, R.second);
+        return L.first < R.first;
     };
+    std::cout << "[OCL] Sort: " << (use_meta_sort ? "Y+metadata (NVIDIA)" : "Y-only (AMD)") << std::endl;
     
     plot.num_entries.resize(MY_N_TABLE + 1);
     plot.num_entries[1] = entries.size();
@@ -1159,10 +1168,9 @@ void compute_full_pipeline(
         auto t_table = my_time_ms();
         const size_t n = entries.size();
         
-        // In resident mode: download M_curr from GPU for the sort comparator.
-        // Transfer size: n * 14 * 4 bytes. For k22: 224MB (~14ms PCIe).
-        // For k25: 1.8GB (~112ms PCIe) — still much less than uploading 3.6GB per table.
-        if(use_gpu_resident && t > 2) {
+        // Only download M_curr for sort if using metadata sort (NVIDIA).
+        // AMD uses Y-only sort — no download needed (saves 1.8GB/table for k25!).
+        if(use_gpu_resident && use_meta_sort && t > 2) {
             M_curr_flat.resize(n * MY_N_META);
             clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
                 n * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
