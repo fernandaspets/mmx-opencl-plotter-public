@@ -1115,10 +1115,19 @@ void compute_full_pipeline(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> entries_map(MY_N_TABLE + 1);  // entries_map[t] = sorted->original mapping for table t
     
-    // sort_func: Y-only comparison (no metadata tiebreaker needed).
-    // MMX F2-F9 entries are hash outputs — Y collisions are rare and don't affect
-    // proof validity. CUDA plotter also sorts by Y only.
-    auto sort_func = [](const auto& L, const auto& R) {
+    // sort_func: Y comparison with metadata tiebreaker.
+    // The metadata tiebreaker is ESSENTIAL — without it, matching produces wrong
+    // LR pairs on some GPUs (NVIDIA), causing all-same-Y outputs at T4.
+    auto meta_less = [&M_curr_flat](uint32_t a, uint32_t b) {
+        const uint32_t* pa = &M_curr_flat[a * MY_N_META];
+        const uint32_t* pb = &M_curr_flat[b * MY_N_META];
+        for(int j = 0; j < MY_N_META; j++) {
+            if(pa[j] != pb[j]) return pa[j] < pb[j];
+        }
+        return false;
+    };
+    auto sort_func = [&meta_less](const auto& L, const auto& R) {
+        if(L.first == R.first) return meta_less(L.second, R.second);
         return L.first < R.first;
     };
     
@@ -1152,6 +1161,15 @@ void compute_full_pipeline(
     for(int t = 2; t <= MY_N_TABLE; t++) {
         auto t_table = my_time_ms();
         const size_t n = entries.size();
+        
+        // In resident mode: download M_curr from GPU for the sort comparator.
+        // Small transfer (n * 14 * 4 bytes) — negligible vs the 3.6GB we save.
+        if(use_gpu_resident && t > 2) {
+            M_curr_flat.resize(n * MY_N_META);
+            clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
+                n * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
+        }
+        
         std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
         
         // Radix sort by Y (bucket sort — O(n) instead of O(n log n))
