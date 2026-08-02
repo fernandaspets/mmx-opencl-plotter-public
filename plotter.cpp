@@ -4925,6 +4925,15 @@ std::vector<std::vector<PDEntry>> pd_all;
         auto t1 = my_time_ms();
         std::cout << "[GPU-Res] F2-F9 done in " << (t1 - t0) / 1000.0 << " sec" << std::endl;
         
+        // For now, skip write_plot (PD/X_pairs not yet built)
+        // TODO: build PD from LR pairs and write valid plot file
+        if(plot.PD.empty()) {
+            std::cout << "[GPU-Res] Skipping write_plot (PD not built yet)" << std::endl;
+            std::cout << "[GPU-Res] final_Y=" << plot.final_Y.size() << " entries" << std::endl;
+            std::cout << "[Done] Total time: " << (my_time_ms() - total_start) / 1000.0 << " sec" << std::endl;
+            return 0;
+        }
+        
         // Write plot file
         std::cout << "\n[Plot] Writing plot file..." << std::endl;
         write_plot(plot_path, plot_id, farmer_key, plot, true);
