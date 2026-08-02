@@ -1282,7 +1282,7 @@ void compute_full_pipeline(
                 LR_flat[i * 2 + 1] = entries[sorted_R].second;
             }
             auto t_gpu_start = my_time_ms();
-            uint32_t num_total = (uint32_t)M_curr_flat.size() / MY_N_META;
+            uint32_t num_total = (uint32_t)entries.size();  // current table's entry count (M_curr_gpu has this many entries)
             gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
                 KMASK, num_total);
             auto t_gpu_end = my_time_ms();
