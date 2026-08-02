@@ -5089,7 +5089,9 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     // Write plot file
     std::cout << "\n[Plot] Writing plot file..." << std::endl;
+    auto t_write_start = my_time_ms();
     write_plot(plot_path, plot_id, farmer_key, plot, true);
+    std::cout << "[Plot] Write time: " << (my_time_ms() - t_write_start) / 1000.0 << " sec" << std::endl;
     
     // If using ramdisk, copy plot to final destination
     if(use_ramdisk && !final_dir.empty()) {
