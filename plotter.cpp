@@ -1261,11 +1261,23 @@ void compute_full_pipeline(
         
         auto t_meta_start = my_time_ms();
         
-        // Flatten LR pairs
-        std::vector<std::pair<uint32_t, uint32_t>> all_lr;
-        all_lr.reserve(total_matches);
-        for(int ti = 0; ti < nthreads; ti++) {
-            for(const auto& p : thread_lr[ti]) all_lr.push_back(p);
+        // Flatten LR pairs — pre-allocated with thread offsets (parallel)
+        std::vector<std::pair<uint32_t, uint32_t>> all_lr(total_matches);
+        {
+            std::vector<size_t> thread_offsets(nthreads);
+            size_t offset = 0;
+            for(int ti = 0; ti < nthreads; ti++) {
+                thread_offsets[ti] = offset;
+                offset += thread_lr[ti].size();
+            }
+            #pragma omp parallel for schedule(static)
+            for(int ti = 0; ti < nthreads; ti++) {
+                const auto& src = thread_lr[ti];
+                size_t off = thread_offsets[ti];
+                for(size_t i = 0; i < src.size(); i++) {
+                    all_lr[off + i] = src[i];
+                }
+            }
         }
         auto t_flatten_lr = my_time_ms();
         
