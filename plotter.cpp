@@ -1441,18 +1441,14 @@ void compute_full_pipeline(
         // Radix sort matches by Y — O(n) instead of O(n log n)
         radix_sort_pairs(matches, KSIZE);
         // Build entries_map[t]: sorted_idx -> original match_idx
+        // Merge entries_map[t] + PD[t] build into a single pass (saves one loop over 67M entries)
         entries_map[t] = std::vector<uint32_t>(matches.size());
-        #pragma omp parallel for schedule(static)
-        for(size_t k = 0; k < matches.size(); k++) {
-            entries_map[t][k] = matches[k].second;
-        }
-        // Save PD in SORTED order: for each sorted_pos k, match_idx = matches[k].second
-        // PD[t][k] = {LR[t][match_idx].first, LR[t][match_idx].second - LR[t][match_idx].first}
         plot.PD.resize(MY_N_TABLE + 1);
         plot.PD[t].resize(matches.size());
         #pragma omp parallel for schedule(static)
         for(size_t k = 0; k < matches.size(); k++) {
             uint32_t match_idx = matches[k].second;
+            entries_map[t][k] = match_idx;
             uint32_t sorted_L = LR[t][match_idx].first;
             uint32_t sorted_R = LR[t][match_idx].second;
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
