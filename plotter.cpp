@@ -1118,8 +1118,8 @@ void compute_full_pipeline(
     // sort_func: Y-only comparison. Uses stable_sort to preserve match order
     // for entries with same Y. This is deterministic and doesn't need M_curr.
     // Stable order = hash output order = match order from previous table.
-    auto sort_func = [](const auto& L, const auto& R) {
-        return L.first < R.first;
+    auto sort_func = [&meta_less](const auto& L, const auto& R) {
+        if(L.first == R.first) return meta_less(L.second, R.second); return L.first < R.first;
     };
     
     plot.num_entries.resize(MY_N_TABLE + 1);
@@ -1127,7 +1127,7 @@ void compute_full_pipeline(
     
     // Module I: GPU-resident M_curr — upload once, swap buffers between tables
     // Eliminates 3.6GB PCIe transfer per table (M_curr upload + M_out download)
-    bool use_gpu_resident = gpu_plotter.hash_lr_kernel != nullptr;
+    bool use_gpu_resident = false;
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
     if(use_gpu_resident) {
         cl_int err;
@@ -1433,7 +1433,7 @@ void compute_full_pipeline(
             uint32_t start = bucket_offsets[b];
             uint32_t count = bucket_counts[b];
             if(count > 1)
-                std::stable_sort(sorted_entries.begin() + start, sorted_entries.begin() + start + count, sort_func);
+                std::sort(sorted_entries.begin() + start, sorted_entries.begin() + start + count, sort_func);
         }
         entries = std::move(sorted_entries);
     }
