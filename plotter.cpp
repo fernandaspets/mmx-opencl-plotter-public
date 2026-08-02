@@ -1206,7 +1206,8 @@ void compute_full_pipeline(
     if(use_gpu_resident) {
         cl_int err;
         // Both buffers must have the SAME max capacity (they get swapped!)
-        size_t max_entries = (size_t)(entries.size() * 3 / 2 + 256);
+        // 1.1x is enough: entries grow <2% per table (67M→67.8M for k26)
+        size_t max_entries = (size_t)(entries.size() * 11 / 10 + 256);
         size_t m_size = max_entries * MY_N_META * sizeof(uint32_t);
         // Allocate with max size, but only copy initial data (rest is uninitialized)
         M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
