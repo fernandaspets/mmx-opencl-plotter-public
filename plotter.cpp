@@ -963,6 +963,8 @@ public:
     // Replaces CPU radix_sort_pairs — saves ~230ms/table for k25
     cl_kernel k_bucket_count = nullptr;
     cl_kernel k_bucket_scatter = nullptr;
+    cl_kernel k_match_sorted = nullptr;
+    cl_program match_program = nullptr;
     cl_program bucket_sort_program = nullptr;
     
     void init_bucket_sort() {
@@ -978,7 +980,7 @@ public:
         size_t src_len = src.size();
         cl_int err;
         bucket_sort_program = clCreateProgramWithSource(context, 1, &src_c, &src_len, &err);
-        err = clBuildProgram(bucket_sort_program, 1, &device, nullptr, nullptr, nullptr);
+        err = clBuildProgram(bucket_sort_program, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
         if(err != CL_SUCCESS) {
             char log[4096]; clGetProgramBuildInfo(bucket_sort_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
             std::cerr << "[OCL] bucket_sort.cl build log: " << log << std::endl;
@@ -1075,6 +1077,30 @@ public:
         
         clReleaseMemObject(Y_buf[0]); clReleaseMemObject(Y_buf[1]);
         clReleaseMemObject(val_buf[0]); clReleaseMemObject(val_buf[1]);
+    }
+    
+    
+    void init_match_kernel() {
+        if(k_match_sorted) return;
+        std::string kernel_path = "gpu_match.cl";
+        FILE* mf = fopen(kernel_path.c_str(), "r");
+        if(!mf) { std::cerr << "[OCL] Cannot open " << kernel_path << std::endl; return; }
+        fseek(mf, 0, SEEK_END); size_t msz = ftell(mf); fseek(mf, 0, SEEK_SET);
+        char* msrc = new char[msz+1]; size_t mrd = fread(msrc, 1, msz, mf); msrc[msz] = 0; fclose(mf);
+        std::string src(msrc, msz);
+        delete[] msrc;
+        const char* src_c = src.c_str();
+        size_t src_len = src.size();
+        cl_int err;
+        match_program = clCreateProgramWithSource(context, 1, &src_c, &src_len, &err);
+        err = clBuildProgram(match_program, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
+        if(err != CL_SUCCESS) {
+            char log[4096]; clGetProgramBuildInfo(match_program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+            std::cerr << "[OCL] gpu_match.cl build log: " << log << std::endl;
+            return;
+        }
+        k_match_sorted = clCreateKernel(match_program, "gpu_match_sorted", &err);
+        std::cout << "[OCL] GPU match kernel loaded" << std::endl;
     }
     
     void init_gpu_kernels() {
@@ -1285,6 +1311,7 @@ static void compute_gpu_resident(
     const hash_t& plot_id)
 {
     const int n_meta = MY_N_META;
+    size_t total_entries = Y_all.size();
     const int n_meta_out = MY_N_META_OUT;
     const int n_table = MY_N_TABLE;
     const int log_b = LOGBUCKETS;
@@ -1687,6 +1714,250 @@ static void compute_gpu_resident(
     clReleaseMemObject(new_bs); clReleaseMemObject(bucket_count);
     for(auto& lr : lr_per_table) if(lr) clReleaseMemObject(lr);
 }
+
+// ============================================================================
+// GPU BULK PIPELINE: all F2-F9 steps on GPU, no PCIe transfers between tables
+// ============================================================================
+void compute_gpu_bulk(
+    const std::vector<uint32_t>& Y_all,
+    const std::vector<uint32_t>& M_all,
+    PlotData& plot,
+    OCL_Plotter& gpu_plotter)
+{
+    const uint32_t kmask = KMASK;
+    const int n_meta = MY_N_META;
+    size_t total_entries = Y_all.size();
+    const int n_table = MY_N_TABLE;
+    
+    
+    // Max matches per table (upper bound: each entry can match ~2 times on average)
+    const size_t max_matches = total_entries * 4;
+    
+    std::cout << "[GPU-Bulk] Computing F2-F9 on GPU (bulk, no transfers)" << std::endl;
+    
+    // Allocate GPU buffers
+    cl_int err;
+    int zero = 0;
+    
+    // Y buffer: double-buffered for sort
+    cl_mem Y_buf[2] = {
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err),
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err)
+    };
+    // pos buffer: double-buffered for sort (stores original positions)
+    cl_mem pos_buf[2] = {
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err),
+        clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, total_entries * 4, nullptr, &err)
+    };
+    // LR buffers: orig (for hash) and sorted (for PD)
+    cl_mem LR_orig = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
+    cl_mem LR_sorted = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
+    cl_mem match_count = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
+    
+    // M_curr and M_out: double-buffered, stay on GPU
+    cl_mem M_curr_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+        total_entries * n_meta * 4, (void*)M_all.data(), &err);
+    cl_mem M_out_gpu = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE,
+        total_entries * n_meta * 4, nullptr, &err);
+    
+    // Upload F1 Y values and positions
+    clEnqueueWriteBuffer(gpu_plotter.queue, Y_buf[0], CL_FALSE, 0, total_entries * 4, Y_all.data(), 0, nullptr, nullptr);
+    // Initialize pos_sorted[i] = i (original position)
+    std::vector<uint32_t> init_pos(total_entries);
+    #pragma omp parallel for schedule(static)
+    for(size_t i = 0; i < total_entries; i++) init_pos[i] = (uint32_t)i;
+    clEnqueueWriteBuffer(gpu_plotter.queue, pos_buf[0], CL_FALSE, 0, total_entries * 4, init_pos.data(), 0, nullptr, nullptr);
+    clFinish(gpu_plotter.queue);
+    
+    auto t0 = my_time_ms();
+    
+    // Per-table LR storage (for PD build at the end)
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR_all(n_table + 1);
+    std::vector<uint32_t> match_counts(n_table + 1);
+    
+    for(int t = 2; t <= n_table; t++) {
+        auto tt = my_time_ms();
+        
+        // Step 1: GPU bucket sort Y_buf[0] → (Y_buf[1], pos_buf[1])
+        // 4 passes of 8-bit radix
+        int src = 0, dst = 1;
+        const int BITS_PER_PASS = 8;
+        const int num_passes = (KSIZE + BITS_PER_PASS - 1) / BITS_PER_PASS;
+        
+        for(int pass = 0; pass < num_passes; pass++) {
+            const uint32_t shift = pass * BITS_PER_PASS;
+            const uint32_t mask = (pass == num_passes - 1) ? ((1u << (KSIZE - shift)) - 1) : 0xFF;
+            const uint32_t num_bins = (pass == num_passes - 1) ? (1u << (KSIZE - shift)) : 256;
+            if(num_bins == 0) break;
+            
+            cl_mem counts = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            cl_mem offsets = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            cl_mem atomic_buf = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, num_bins * 4, nullptr, &err);
+            
+            clEnqueueFillBuffer(gpu_plotter.queue, counts, &zero, 4, 0, num_bins * 4, 0, nullptr, nullptr);
+            clEnqueueFillBuffer(gpu_plotter.queue, atomic_buf, &zero, 4, 0, num_bins * 4, 0, nullptr, nullptr);
+            clFinish(gpu_plotter.queue);  // ensure zeroed before count
+            
+            // Count
+            uint32_t n_u32 = (uint32_t)total_entries;
+            size_t gs = ((total_entries + 255) / 256) * 256;
+            clSetKernelArg(gpu_plotter.k_bucket_count, 0, sizeof(cl_mem), &Y_buf[src]);
+            clSetKernelArg(gpu_plotter.k_bucket_count, 1, sizeof(cl_mem), &counts);
+            clSetKernelArg(gpu_plotter.k_bucket_count, 2, sizeof(uint32_t), &shift);
+            clSetKernelArg(gpu_plotter.k_bucket_count, 3, sizeof(uint32_t), &mask);
+            clSetKernelArg(gpu_plotter.k_bucket_count, 4, sizeof(uint32_t), &num_bins);
+            clSetKernelArg(gpu_plotter.k_bucket_count, 5, sizeof(uint32_t), &n_u32);
+            clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_count, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+            // removed
+            
+            // Prefix sum on CPU
+            std::vector<uint32_t> h_counts(num_bins);
+            clEnqueueReadBuffer(gpu_plotter.queue, counts, CL_TRUE, 0, num_bins * 4, h_counts.data(), 0, nullptr, nullptr);
+            std::vector<uint32_t> h_offsets(num_bins);
+            uint32_t sum = 0;
+            for(uint32_t b = 0; b < num_bins; b++) { h_offsets[b] = sum; sum += h_counts[b]; }
+            clEnqueueWriteBuffer(gpu_plotter.queue, offsets, CL_FALSE, 0, num_bins * 4, h_offsets.data(), 0, nullptr, nullptr);
+            // atomic_buf already zeroed above
+            
+            // Scatter
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[src]);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 1, sizeof(cl_mem), &pos_buf[src]);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 2, sizeof(cl_mem), &Y_buf[dst]);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 3, sizeof(cl_mem), &pos_buf[dst]);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 4, sizeof(cl_mem), &offsets);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 5, sizeof(cl_mem), &atomic_buf);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 6, sizeof(uint32_t), &shift);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 7, sizeof(uint32_t), &mask);
+            clSetKernelArg(gpu_plotter.k_bucket_scatter, 8, sizeof(uint32_t), &n_u32);
+            clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_scatter, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+            clFinish(gpu_plotter.queue);  // ensure scatter done
+            
+            clReleaseMemObject(counts);
+            clReleaseMemObject(offsets);
+            clReleaseMemObject(atomic_buf);
+            std::swap(src, dst);
+        }
+        // After all passes, sorted data is in Y_buf[src], pos_buf[src]
+        
+        // DEBUG: check if sorted
+        if(t == 2) {
+            std::vector<uint32_t> dbg_y(std::min((size_t)20, total_entries));
+            clEnqueueReadBuffer(gpu_plotter.queue, Y_buf[src], CL_TRUE, 0, dbg_y.size() * 4, dbg_y.data(), 0, nullptr, nullptr);
+            std::cerr << "  Y_sorted[0..19]: ";
+            for(size_t i = 0; i < dbg_y.size(); i++) std::cerr << (dbg_y[i] & kmask) << " ";
+            std::cerr << std::endl;
+        }
+        
+        // Step 2: GPU match — scan sorted Y for Y+1 pairs
+        size_t gs_match = ((total_entries + 255) / 256) * 256;
+        clEnqueueFillBuffer(gpu_plotter.queue, match_count, &zero, 4, 0, 4, 0, nullptr, nullptr);
+        uint32_t kmask_u32 = kmask;
+        uint32_t max_matches_u32 = (uint32_t)max_matches;
+        uint32_t count_u32 = (uint32_t)total_entries;
+        clSetKernelArg(gpu_plotter.k_match_sorted, 0, sizeof(cl_mem), &Y_buf[src]);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 1, sizeof(cl_mem), &pos_buf[src]);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 2, sizeof(cl_mem), &LR_orig);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 3, sizeof(cl_mem), &LR_sorted);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 4, sizeof(cl_mem), &match_count);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 5, sizeof(uint32_t), &count_u32);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 6, sizeof(uint32_t), &kmask_u32);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 7, sizeof(uint32_t), &max_matches_u32);
+        clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_sorted, 1, nullptr, &gs_match, nullptr, 0, nullptr, nullptr);
+        
+        // Read match count
+        uint32_t num_matches = 0;
+        clEnqueueReadBuffer(gpu_plotter.queue, match_count, CL_TRUE, 0, 4, &num_matches, 0, nullptr, nullptr);
+        match_counts[t] = num_matches;
+        
+        // Step 3: GPU hash — hash LR_orig pairs → Y_out, M_out
+        // The hash_lr_kernel reads LR_flat as (P1, P2) = (orig_L, orig_R)
+        // We need to create a temporary LR_flat view that is just (orig_L, orig_R) without stride
+        // Actually, LR_orig already has (orig_L, orig_R) at stride 2. Perfect!
+        
+        // Allocate Y_out buffer for hash results
+        cl_mem Y_out = clCreateBuffer(gpu_plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err);
+        
+        uint32_t num_total_u32 = (uint32_t)total_entries;
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 0, sizeof(cl_mem), &M_curr_gpu);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_orig);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 2, sizeof(cl_mem), &Y_out);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 3, sizeof(cl_mem), &M_out_gpu);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 4, sizeof(uint32_t), &kmask_u32);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 5, sizeof(uint32_t), &num_matches);
+        clSetKernelArg(gpu_plotter.hash_lr_kernel, 6, sizeof(uint32_t), &num_total_u32);
+        size_t hash_global = num_matches;
+        size_t hash_local = g_hash_local;
+        if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
+        clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.hash_lr_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
+        
+        // Download LR_sorted for PD build (will do at the end)
+        if(num_matches > 0) {
+            std::vector<uint32_t> lr_sorted_host(num_matches * 2);
+            clEnqueueReadBuffer(gpu_plotter.queue, LR_sorted, CL_TRUE, 0, num_matches * 2 * 4, lr_sorted_host.data(), 0, nullptr, nullptr);
+            LR_all[t].resize(num_matches);
+            for(uint32_t i = 0; i < num_matches; i++) {
+                LR_all[t][i] = {lr_sorted_host[i * 2], lr_sorted_host[i * 2 + 1]};
+            }
+        }
+        
+        // Swap: Y_buf[0] = Y_out (for next table's sort), M_curr = M_out
+        clEnqueueCopyBuffer(gpu_plotter.queue, Y_out, Y_buf[0], 0, 0, num_matches * 4, 0, nullptr, nullptr);
+        clReleaseMemObject(Y_out);
+        std::swap(M_curr_gpu, M_out_gpu);
+        
+        // Update total_entries for next table
+        total_entries = num_matches;  // Note: this shadows the outer variable
+        
+        auto t_end = my_time_ms();
+        std::cout << "[T" << t << "] " << num_matches << " matches (" << (t_end - tt) / 1000.0 << "s)" << std::endl;
+    }
+    
+    // Download final Y and M_curr from GPU
+    std::vector<uint32_t> final_Y(total_entries);
+    clEnqueueReadBuffer(gpu_plotter.queue, Y_buf[0], CL_TRUE, 0, total_entries * 4, final_Y.data(), 0, nullptr, nullptr);
+    std::vector<uint32_t> final_M(total_entries * n_meta);
+    clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0, total_entries * n_meta * 4, final_M.data(), 0, nullptr, nullptr);
+    
+    // Sort final entries by Y
+    std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(total_entries);
+    for(size_t i = 0; i < total_entries; i++) sorted_entries[i] = {final_Y[i], (uint32_t)i};
+    radix_sort_pairs(sorted_entries, KSIZE);
+    
+    // Build final_Y and final_meta
+    plot.final_Y.resize(total_entries);
+    plot.final_meta.resize(total_entries);
+    #pragma omp parallel for schedule(static)
+    for(size_t i = 0; i < total_entries; i++) {
+        plot.final_Y[i] = sorted_entries[i].first;
+        std::memcpy(plot.final_meta[i].data(), &final_M[sorted_entries[i].second * n_meta], n_meta * sizeof(uint32_t));
+    }
+    
+    // Build PD from LR_sorted pairs
+    plot.PD.resize(n_table + 1);
+    for(int t = 2; t <= n_table; t++) {
+        plot.PD[t].resize(match_counts[t]);
+        #pragma omp parallel for schedule(static)
+        for(size_t k = 0; k < match_counts[t]; k++) {
+            plot.PD[t][k] = {LR_all[t][k].first, LR_all[t][k].second - LR_all[t][k].first};
+        }
+    }
+    
+    // Set num_entries
+    plot.num_entries.resize(n_table + 1);
+    plot.num_entries[1] = Y_all.size();
+    for(int t = 2; t <= n_table; t++) plot.num_entries[t] = match_counts[t];
+    
+    // TODO: build X_pairs (needs entries_map chain)
+    
+    std::cout << "[GPU-Bulk] Done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
+    
+    // Cleanup
+    clReleaseMemObject(Y_buf[0]); clReleaseMemObject(Y_buf[1]);
+    clReleaseMemObject(pos_buf[0]); clReleaseMemObject(pos_buf[1]);
+    clReleaseMemObject(LR_orig); clReleaseMemObject(LR_sorted); clReleaseMemObject(match_count);
+    clReleaseMemObject(M_curr_gpu); clReleaseMemObject(M_out_gpu);
+}
+
 void compute_full_pipeline(
     const std::vector<uint32_t>& X_values,
     const std::vector<uint32_t>& Y_in,
@@ -4858,6 +5129,7 @@ int main(int argc, char** argv)
     bool use_gpu_res = false;
     bool use_bitmap = false;
     bool use_gpu_sort = false;
+    bool use_gpu_bulk = false;
     bool dump_pd = false;
     std::string final_dir;  // if set, copy plot here after writing to ramdisk
     
@@ -4899,6 +5171,7 @@ std::cerr << "  --timing        Show per-step timing for first bucket of each ta
         else if(arg == "--gpu-res") use_gpu_res = true;
         else if(arg == "--bitmap") use_bitmap = true;
         else if(arg == "--gpu-sort") use_gpu_sort = true;
+        else if(arg == "--gpu-bulk") use_gpu_bulk = true;
 else if(arg == "--no-yield") gpu_yield = false;
 else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
 else if(arg == "--opt-gpu-meta") get_opt_config().gpu_meta_extract = true;
@@ -5174,7 +5447,27 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     plotter.compute_all_f1(plot_id, Y_all, M_all, std::max((uint32_t)(1 << 20), (uint32_t)(1 << KSIZE)), test_mode, test_limit);
     
-    if(use_gpu_res) {
+    if(use_gpu_bulk) {
+        // GPU Bulk pipeline: all F2-F9 on GPU, no PCIe transfers
+        std::cout << "\n[GPU-Bulk] Computing F2-F9 on GPU (bulk)..." << std::endl;
+        plotter.init_bucket_sort();
+        plotter.init_match_kernel();
+        auto t0 = my_time_ms();
+        PlotData plot;
+        compute_gpu_bulk(Y_all, M_all, plot, plotter);
+        auto t1 = my_time_ms();
+        std::cout << "[GPU-Bulk] F2-F9 done in " << (t1 - t0) / 1000.0 << " sec" << std::endl;
+        
+        if(plot.PD.empty()) {
+            std::cout << "[GPU-Bulk] No PD built, skipping write_plot" << std::endl;
+            std::cout << "[Done] Total time: " << (my_time_ms() - total_start) / 1000.0 << " sec" << std::endl;
+            return 0;
+        }
+        std::cout << "\n[Plot] Writing plot file..." << std::endl;
+        auto t_write_start = my_time_ms();
+        write_plot(plot_path, plot_id, farmer_key, plot, true);
+        std::cout << "[Plot] Write time: " << (my_time_ms() - t_write_start) / 1000.0 << " sec" << std::endl;
+    } else if(use_gpu_res) {
         // GPU-Resident pipeline: F2-F9 entirely on GPU
         std::cout << "\n[GPU-Res] Computing F2-F9 on GPU (no CPU transfers)..." << std::endl;
         auto t0 = my_time_ms();
