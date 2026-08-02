@@ -1523,8 +1523,14 @@ static void compute_gpu_resident(
         std::vector<uint32_t> new_Y(total_final);
         std::vector<std::array<uint32_t, 14>> new_meta(total_final);
         for(uint32_t i = 0; i < total_final; i++) {
+            uint32_t orig_idx = sorted_entries[i].second;
+            if(orig_idx >= total_final) {
+                std::cerr << "[GPU-Res] ERROR: sorted_entries[" << i << "].second=" << orig_idx
+                          << " >= total_final=" << total_final << std::endl;
+                break;
+            }
             new_Y[i] = sorted_entries[i].first;
-            new_meta[i] = plot.final_meta[sorted_entries[i].second];
+            new_meta[i] = plot.final_meta[orig_idx];
         }
         plot.final_Y = std::move(new_Y);
         plot.final_meta = std::move(new_meta);
