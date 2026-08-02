@@ -1115,12 +1115,10 @@ void compute_full_pipeline(
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(MY_N_TABLE + 1);
     std::vector<std::vector<uint32_t>> entries_map(MY_N_TABLE + 1);  // entries_map[t] = sorted->original mapping for table t
     
-    // sort_func: Y comparison with metadata tiebreaker.
-    // The metadata tiebreaker is ESSENTIAL — without it, matching produces wrong
-    // LR pairs on some GPUs (NVIDIA), causing all-same-Y outputs at T4.
-    // meta_less was already defined above (line ~1099).
-    auto sort_func = [&meta_less](const auto& L, const auto& R) {
-        if(L.first == R.first) return meta_less(L.second, R.second);
+    // sort_func: Y-only comparison. Uses stable_sort to preserve match order
+    // for entries with same Y. This is deterministic and doesn't need M_curr.
+    // Stable order = hash output order = match order from previous table.
+    auto sort_func = [](const auto& L, const auto& R) {
         return L.first < R.first;
     };
     
@@ -1155,13 +1153,7 @@ void compute_full_pipeline(
         auto t_table = my_time_ms();
         const size_t n = entries.size();
         
-        // In resident mode: download M_curr from GPU for the sort comparator.
-        // Small transfer (n * 14 * 4 bytes) — negligible vs the 3.6GB we save.
-        if(use_gpu_resident && t > 2) {
-            M_curr_flat.resize(n * MY_N_META);
-            clEnqueueReadBuffer(gpu_plotter.queue, M_curr_gpu, CL_TRUE, 0,
-                n * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
-        }
+        // No M_curr download needed — using Y-only stable sort (doesn't need metadata)
         
         std::cerr << "[T" << t << "] Sorting " << n << " entries...               \r" << std::flush;
         
@@ -1441,7 +1433,7 @@ void compute_full_pipeline(
             uint32_t start = bucket_offsets[b];
             uint32_t count = bucket_counts[b];
             if(count > 1)
-                std::sort(sorted_entries.begin() + start, sorted_entries.begin() + start + count, sort_func);
+                std::stable_sort(sorted_entries.begin() + start, sorted_entries.begin() + start + count, sort_func);
         }
         entries = std::move(sorted_entries);
     }
