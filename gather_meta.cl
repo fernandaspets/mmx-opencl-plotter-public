@@ -1,36 +1,27 @@
 /*
- * gather_meta.cl — Module B variant 2: GPU gather kernel
+ * gather_meta.cl — GPU gather kernel for Final copy
  *
- * Gathers L_meta and R_meta from M_curr using LR pair indices.
- * This separates scattered reads (gather) from sequential reads (hash).
- * The hash_table_entries kernel then reads the gathered data sequentially.
+ * Reorders M_curr from match order to sorted order on GPU.
+ * Eliminates random-access CPU copy (5.3s for k27 → ~0.4s).
  *
- * This avoids the AMD codegen bug in hash_table_lr where scattered reads
- * and SHA-512 computation are interleaved in the same kernel.
+ * Each work-item processes one entry: reads M_curr[perm[i]*META] and writes to output[i*META].
  */
 
 __kernel void gather_meta(
-    __global const uint* M_curr,      // [num_total * N_META] all metadata
-    __global const uint* LR_pairs,     // [num_matches * 2] P1, P2 indices
-    __global uint* L_meta_out,         // [num_matches * N_META] gathered L metadata
-    __global uint* R_meta_out,         // [num_matches * N_META] gathered R metadata
-    const uint num_matches,
-    const uint num_total_entries,
-    const uint N_META)
+    __global const uint* M_curr,    // [num_entries * META] metadata in match order
+    __global const uint* perm,      // [num_entries] permutation: sorted_pos -> match_idx
+    __global uint* output,          // [num_entries * META] output in sorted order
+    const uint num_entries,
+    const uint META)                // 14
 {
     const uint gid = get_global_id(0);
-    if(gid >= num_matches) return;
+    if(gid >= num_entries) return;
     
-    uint P1 = LR_pairs[gid * 2];
-    uint P2 = LR_pairs[gid * 2 + 1];
+    const uint src_idx = perm[gid];
+    const uint src_offset = src_idx * META;
+    const uint dst_offset = gid * META;
     
-    // Bounds check (prevents out-of-bounds reads)
-    if(P1 >= num_total_entries) P1 = 0;
-    if(P2 >= num_total_entries) P2 = 0;
-    
-    // Gather L_meta and R_meta (scattered reads, sequential writes)
-    for(uint i = 0; i < N_META; i++) {
-        L_meta_out[gid * N_META + i] = M_curr[P1 * N_META + i];
-        R_meta_out[gid * N_META + i] = M_curr[P2 * N_META + i];
+    for(uint j = 0; j < META; j++) {
+        output[dst_offset + j] = M_curr[src_offset + j];
     }
 }
