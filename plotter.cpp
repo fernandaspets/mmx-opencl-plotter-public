@@ -1238,6 +1238,7 @@ void compute_full_pipeline(
                                 thread_lr[ti].emplace_back(x, y);
                             }
                         }
+                        if(x == start) break;	// prevent uint32_t underflow infinite loop
                     }
                 }
             }
