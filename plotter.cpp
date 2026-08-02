@@ -1157,6 +1157,103 @@ struct PlotData {
     std::vector<uint64_t> num_entries;
 };
 
+// Module J: GPU radix sort (standalone, non-member)
+// Uses gpu_sort_match.cl kernels to sort entries by Y on GPU.
+static void gpu_radix_sort(std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t ksize, OCL_Plotter& plotter) {
+    const size_t n = entries.size();
+    if(n <= 1) return;
+    
+    // Pack entries as uint64 (Y<<32 | index)
+    std::vector<uint64_t> packed(n);
+    #pragma omp parallel for schedule(static)
+    for(size_t i = 0; i < n; i++)
+        packed[i] = (uint64_t(entries[i].first) << 32) | entries[i].second;
+    
+    // Load kernels
+    std::string kpath = "gpu_sort_match.cl";
+    FILE* f = fopen(kpath.c_str(), "r");
+    if(!f) { std::cerr << "[GPU] gpu_sort_match.cl not found, using CPU sort" << std::endl; return; }
+    fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char* src = new char[sz+1]; fread(src, 1, sz, f); src[sz] = 0; fclose(f);
+    
+    cl_int err;
+    cl_program prog = clCreateProgramWithSource(plotter.context, 1, (const char**)&src, &sz, &err);
+    delete[] src;
+    err = clBuildProgram(prog, 1, &plotter.device, "-cl-std=CL1.2", nullptr, nullptr);
+    if(err != CL_SUCCESS) {
+        char log[4096]; clGetProgramBuildInfo(prog, plotter.device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+        std::cerr << "[GPU] gpu_sort_match.cl build failed: " << log << std::endl;
+        return;
+    }
+    
+    cl_kernel hist_knl = clCreateKernel(prog, "radix_histogram", &err);
+    cl_kernel scat_knl = clCreateKernel(prog, "radix_scatter", &err);
+    if(err != CL_SUCCESS) { std::cerr << "[GPU] sort kernels not found" << std::endl; return; }
+    
+    // Allocate GPU buffers
+    size_t buf_sz = n * sizeof(uint64_t);
+    cl_mem bufA = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, buf_sz, packed.data(), &err);
+    cl_mem bufB = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, buf_sz, nullptr, &err);
+    cl_mem hist = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 256 * 4, nullptr, &err);
+    cl_mem cnts = clCreateBuffer(plotter.context, CL_MEM_READ_WRITE, 256 * 4, nullptr, &err);
+    
+    uint32_t np = (ksize + 7) / 8;
+    uint32_t n32 = (uint32_t)n;
+    size_t gs = ((n + 255) / 256) * 256;
+    size_t ls = 256;
+    int zero = 0;
+    
+    auto t0 = my_time_ms();
+    
+    for(uint32_t pass = 0; pass < np; pass++) {
+        uint32_t shift = pass * 8;
+        
+        clEnqueueFillBuffer(plotter.queue, hist, &zero, 4, 0, 256*4, 0, nullptr, nullptr);
+        clFinish(plotter.queue);
+        
+        clSetKernelArg(hist_knl, 0, 8, &bufA);
+        clSetKernelArg(hist_knl, 1, 8, &hist);
+        clSetKernelArg(hist_knl, 2, 4, &n32);
+        clSetKernelArg(hist_knl, 3, 4, &shift);
+        clEnqueueNDRangeKernel(plotter.queue, hist_knl, 1, nullptr, &gs, &ls, 0, nullptr, nullptr);
+        clFinish(plotter.queue);
+        
+        // CPU prefix sum
+        std::vector<uint32_t> h(256);
+        clEnqueueReadBuffer(plotter.queue, hist, CL_TRUE, 0, 256*4, h.data(), 0, nullptr, nullptr);
+        uint32_t s = 0;
+        for(int i = 0; i < 256; i++) { uint32_t t = h[i]; h[i] = s; s += t; }
+        clEnqueueWriteBuffer(plotter.queue, cnts, CL_TRUE, 0, 256*4, h.data(), 0, nullptr, nullptr);
+        
+        clSetKernelArg(scat_knl, 0, 8, &bufA);
+        clSetKernelArg(scat_knl, 1, 8, &bufB);
+        clSetKernelArg(scat_knl, 2, 8, &cnts);
+        clSetKernelArg(scat_knl, 3, 4, &n32);
+        clSetKernelArg(scat_knl, 4, 4, &shift);
+        clEnqueueNDRangeKernel(plotter.queue, scat_knl, 1, nullptr, &gs, &ls, 0, nullptr, nullptr);
+        clFinish(plotter.queue);
+        
+        std::swap(bufA, bufB);
+    }
+    
+    clEnqueueReadBuffer(plotter.queue, bufA, CL_TRUE, 0, buf_sz, packed.data(), 0, nullptr, nullptr);
+    
+    // Unpack
+    #pragma omp parallel for schedule(static)
+    for(size_t i = 0; i < n; i++) {
+        entries[i].first = (uint32_t)(packed[i] >> 32);
+        entries[i].second = (uint32_t)(packed[i]);
+    }
+    
+    clReleaseMemObject(bufA); clReleaseMemObject(bufB);
+    clReleaseMemObject(hist); clReleaseMemObject(cnts);
+    clReleaseKernel(hist_knl); clReleaseKernel(scat_knl);
+    clReleaseProgram(prog);
+    
+    auto t1 = my_time_ms();
+    std::cerr << "[GPU] Radix sort: " << (t1-t0) << "ms    \r" << std::flush;
+}
+
 void compute_full_pipeline(
     const std::vector<uint32_t>& X_values,
     const std::vector<uint32_t>& Y_in,
@@ -1255,8 +1352,8 @@ void compute_full_pipeline(
         }
         
         if(t == 2) {
-            std::cerr << "[T" << t << "] Sorting " << n << " entries (radix)...               \r" << std::flush;
-            radix_sort_pairs(entries, KSIZE);
+            std::cerr << "[T" << t << "] Sorting " << n << " entries (GPU radix)...          \r" << std::flush;
+            gpu_radix_sort(entries, KSIZE, gpu_plotter);
         }
         
         // Build bucket counts for matching (entries are now sorted by Y)
