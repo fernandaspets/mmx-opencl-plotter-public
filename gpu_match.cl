@@ -1,15 +1,16 @@
 // GPU match kernel: direct pairing using sort counts/offsets
 // Each work-item processes one Y value and pairs all entries with Y to all with Y+1
-// Much faster than scanning: O(total_matches) instead of O(n * avg_bucket_size^2)
+// Outputs: LR_orig (for hash), LR_sorted (for PD), Y_L (for sorting PD)
 
 __kernel void gpu_match_sorted(
-    __global const uint* Y_sorted,      // sorted Y values (not needed if we use offsets)
+    __global const uint* Y_sorted,      // sorted Y values (not directly needed)
     __global const uint* pos_sorted,    // sorted positions (original indices into M_curr)
     __global const uint* counts,        // count per Y value (from counting sort)
     __global const uint* offsets,       // offset per Y value (from counting sort)
     __global uint* LR_orig,             // output: (orig_L, orig_R) per match — for GPU hash
     __global uint* LR_sorted,            // output: (sorted_L, sorted_R) per match — for PD
-    __global uint* match_count,          // output: total matches (atomic, must be zeroed)
+    __global uint* Y_L_out,             // output: Y value of left entry per match — for sorting PD
+    __global uint* match_count,         // output: total matches (atomic, must be zeroed)
     const uint kmask,
     const uint max_matches)
 {
@@ -41,6 +42,7 @@ __kernel void gpu_match_sorted(
                 LR_orig[pos * 2 + 1] = orig_R;
                 LR_sorted[pos * 2] = sorted_L;
                 LR_sorted[pos * 2 + 1] = sorted_R;
+                Y_L_out[pos] = Y;  // Y value of left entry for PD sorting
             }
         }
     }

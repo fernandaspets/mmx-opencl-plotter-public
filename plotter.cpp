@@ -1752,6 +1752,7 @@ void compute_gpu_bulk(
     // LR buffers: orig (for hash) and sorted (for PD)
     cl_mem LR_orig = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
     cl_mem LR_sorted = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 2 * 4, nullptr, &err);
+    cl_mem Y_L_buf = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, max_matches * 4, nullptr, &err);
     cl_mem match_count = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, 4, nullptr, &err);
     
     // M_curr and M_out: double-buffered, stay on GPU (allocate for max_matches)
@@ -1859,9 +1860,10 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_match_sorted, 3, sizeof(cl_mem), &offsets);  // offsets from sort
         clSetKernelArg(gpu_plotter.k_match_sorted, 4, sizeof(cl_mem), &LR_orig);
         clSetKernelArg(gpu_plotter.k_match_sorted, 5, sizeof(cl_mem), &LR_sorted);
-        clSetKernelArg(gpu_plotter.k_match_sorted, 6, sizeof(cl_mem), &match_count);
-        clSetKernelArg(gpu_plotter.k_match_sorted, 7, sizeof(uint32_t), &kmask_u32);
-        clSetKernelArg(gpu_plotter.k_match_sorted, 8, sizeof(uint32_t), &max_matches_u32);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 6, sizeof(cl_mem), &Y_L_buf);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 7, sizeof(cl_mem), &match_count);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 8, sizeof(uint32_t), &kmask_u32);
+        clSetKernelArg(gpu_plotter.k_match_sorted, 9, sizeof(uint32_t), &max_matches_u32);
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_sorted, 1, nullptr, &gs_match, nullptr, 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
         
@@ -1895,14 +1897,28 @@ void compute_gpu_bulk(
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.hash_lr_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
         
-        // Download LR_sorted for PD build (will do at the end)
+        // Download LR_sorted and Y_L for PD build (will sort at the end)
         if(num_matches > 0) {
             std::vector<uint32_t> lr_sorted_host(num_matches * 2);
+            std::vector<uint32_t> y_l_host(num_matches);
             clEnqueueReadBuffer(gpu_plotter.queue, LR_sorted, CL_TRUE, 0, num_matches * 2 * 4, lr_sorted_host.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(gpu_plotter.queue, Y_L_buf, CL_TRUE, 0, num_matches * 4, y_l_host.data(), 0, nullptr, nullptr);
             LR_all[t].resize(num_matches);
+            std::vector<uint32_t> Y_L_all_t(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_all[t][i] = {lr_sorted_host[i * 2], lr_sorted_host[i * 2 + 1]};
+                Y_L_all_t[i] = y_l_host[i];
             }
+            // Sort by Y_L for PD in sorted order
+            std::vector<std::pair<uint32_t, uint32_t>> match_indices(num_matches);
+            for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {Y_L_all_t[i], i};
+            radix_sort_pairs(match_indices, KSIZE);
+            // Reorder LR_all[t] by sorted order
+            std::vector<std::pair<uint32_t, uint32_t>> LR_sorted_order(num_matches);
+            for(uint32_t i = 0; i < num_matches; i++) {
+                LR_sorted_order[i] = LR_all[t][match_indices[i].second];
+            }
+            LR_all[t] = std::move(LR_sorted_order);
         }
         
         // Swap: Y_buf[0] = Y_out (for next table's sort), M_curr = M_out
@@ -1964,7 +1980,7 @@ void compute_gpu_bulk(
     // Cleanup
     clReleaseMemObject(Y_buf[0]); clReleaseMemObject(Y_buf[1]);
     clReleaseMemObject(pos_buf[0]); clReleaseMemObject(pos_buf[1]);
-    clReleaseMemObject(LR_orig); clReleaseMemObject(LR_sorted); clReleaseMemObject(match_count);
+    clReleaseMemObject(LR_orig); clReleaseMemObject(LR_sorted); clReleaseMemObject(Y_L_buf); clReleaseMemObject(match_count);
     clReleaseMemObject(M_curr_gpu); clReleaseMemObject(M_out_gpu);
 }
 
