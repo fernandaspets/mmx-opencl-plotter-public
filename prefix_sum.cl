@@ -41,3 +41,4 @@ __kernel void gpu_prefix_sum(
         output[gid + 1] = temp[gid];
     }
 }
+// GPU parallel prefix sum (Blelloch scan) — not used yet, placeholder
