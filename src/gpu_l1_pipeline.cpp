@@ -121,7 +121,7 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             clSetKernelArg(ks,2,4,&m2);clSetKernelArg(ks,3,4,&nsu);
             size_t sg[2]={256,(size_t)NS},sl[2]={256,1};
             clEnqueueNDRangeKernel(g.queue,ks,2,0,sg,sl,0,0,0);
-            uint32_t mt=(uint32_t)((size_t)cy*4),wp=(t>=3)?1:0;
+            uint32_t mt=(uint32_t)n*4,wp=(t>=3)?1:0;
             clSetKernelArg(km,0,8,&LR);clSetKernelArg(km,1,8,&PD);
             clSetKernelArg(km,2,8,&NM);clSetKernelArg(km,3,8,&PY);
             clSetKernelArg(km,4,8,&SC);clSetKernelArg(km,5,8,&SO);
