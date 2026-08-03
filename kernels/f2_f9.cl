@@ -201,7 +201,7 @@ __kernel void scatter_2(
         Y_i = Y_in[x];
     } else {
         for (int i = 0; i < N_META; i++) {
-            Y_i ^= C_in[(x + bucket_offset) * N_META + i];
+            Y_i ^= C_in[x * N_META + i];
         }
         Y_i &= KMASK;
     }
