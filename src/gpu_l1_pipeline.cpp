@@ -135,6 +135,8 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
         // Phase 2: ONE global eval using aCI + global LR indices
         uint32_t nmt=0;
         clEnqueueReadBuffer(g.queue,NM,CL_TRUE,0,4,&nmt,0,0,0);
+        // Write NM back to flush GPU cache (stale value bug workaround)
+        if(nmt>0) clEnqueueWriteBuffer(g.queue,NM,CL_FALSE,0,4,&nmt,0,0,0);
 
         if(nmt>0){
             uint32_t mx=MB,tu=(uint32_t)t,wy=0,wc=1,hp=(t>=3),hx=(t==2);
@@ -153,15 +155,6 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             size_t hg=((nmt+63)/64)*64;
             clEnqueueNDRangeKernel(g.queue,ke,1,0,&hg,0,0,0,0);
             g.finish();
-            if(t==2){
-                std::vector<uint32_t> nbv(NL),nb2(NL);
-                clEnqueueReadBuffer(g.queue,NB,CL_TRUE,0,NL*4,nbv.data(),0,0,0);
-                std::vector<uint32_t> co5(5*N_META);
-                clEnqueueReadBuffer(g.queue,aCO,CL_TRUE,0,5*N_META*4,co5.data(),0,0,0);
-                std::cout<<"[DBG] NB[0]="<<nbv[0]<<" C_out[0..4]:";
-                for(int di=0;di<5;di++)std::cout<<co5[di*N_META]<<" ";
-                std::cout<<"\n";
-            }
         }
 
         lrT[t].resize(nmt*2);pdT[t].resize(nmt);
