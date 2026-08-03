@@ -154,8 +154,14 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             clEnqueueNDRangeKernel(g.queue,ke,1,0,&hg,0,0,0,0);
             g.finish();
             if(t==2){
-                std::vector<uint32_t> nbv(NL);
+                std::vector<uint32_t> nbv(NL),nb2(NL);
                 clEnqueueReadBuffer(g.queue,NB,CL_TRUE,0,NL*4,nbv.data(),0,0,0);
+                // Also check C_out directly (first entry of bucket 0)
+                std::vector<uint32_t> co(14);
+                clEnqueueReadBuffer(g.queue,aCO,CL_TRUE,0,14*4,co.data(),0,0,0);
+                uint32_t ychk=0;
+                for(int di=0;di<14;di++){std::cout<<co[di]<<" ";ychk^=co[di];}
+                std::cout<<" | Y="<<(ychk&KM)<<"\n";
                 uint32_t bmax=0,bmaxi=0,sum=0,nz=0;
                 for(int di=0;di<NL;di++){if(nbv[di]>0)nz++;sum+=nbv[di];
                     if(nbv[di]>bmax){bmax=nbv[di];bmaxi=di;}}
