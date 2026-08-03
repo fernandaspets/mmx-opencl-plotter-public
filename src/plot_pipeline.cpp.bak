@@ -319,57 +319,110 @@ TableTiming PlotPipeline::process_table(
 
     // Extract L_meta, R_meta for GPU hash
     const size_t n_matches = matches.size();
-
-    std::vector<uint32_t> L_meta(n_matches * N_META);
-    std::vector<uint32_t> R_meta(n_matches * N_META);
-
-    #pragma omp parallel for schedule(static)
-    for(size_t i = 0; i < n_matches; i++) {
-        const auto& m = matches[i];
-        const auto& entry_L = entries[m.first];
-        const auto& entry_R = entries[m.second];
-        for(int j = 0; j < N_META; j++) {
-            L_meta[i * N_META + j] = entry_L.M[j];
-            R_meta[i * N_META + j] = entry_R.M[j];
-        }
-    }
-
     auto t3 = std::chrono::high_resolution_clock::now();
-    timing.extract_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-    // GPU hash — kmask is member variable
-    ensure_hash_buffers(n_matches);
-
-    cl_int err;
-    err = clEnqueueWriteBuffer(gpu.queue, hash_L_buf, CL_FALSE, 0,
-                               n_matches * N_META * sizeof(uint32_t), L_meta.data(), 0, nullptr, nullptr);
-    GPUDevice::check(err, "write L");
-    err = clEnqueueWriteBuffer(gpu.queue, hash_R_buf, CL_FALSE, 0,
-                               n_matches * N_META * sizeof(uint32_t), R_meta.data(), 0, nullptr, nullptr);
-    GPUDevice::check(err, "write R");
-
-    clSetKernelArg(k_table_hash, 0, sizeof(cl_mem), &hash_L_buf);
-    clSetKernelArg(k_table_hash, 1, sizeof(cl_mem), &hash_R_buf);
-    clSetKernelArg(k_table_hash, 2, sizeof(cl_mem), &hash_Y_buf);
-    clSetKernelArg(k_table_hash, 3, sizeof(cl_mem), &hash_M_buf);
-    clSetKernelArg(k_table_hash, 4, sizeof(uint32_t), &kmask);
-    uint32_t n_u32 = (uint32_t)n_matches;
-    clSetKernelArg(k_table_hash, 5, sizeof(uint32_t), &n_u32);
-
-    size_t local = 64;
-    size_t global = ((n_matches + local - 1) / local) * local;
-    err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
-    GPUDevice::check(err, "enqueue hash");
-    gpu.finish();
-
+    // GPU-resident path: hash using M_curr on GPU + LR indices
     std::vector<uint32_t> Y_out(n_matches);
-    std::vector<uint32_t> M_out(n_matches * N_META);
-    err = clEnqueueReadBuffer(gpu.queue, hash_Y_buf, CL_TRUE, 0,
-                              n_matches * sizeof(uint32_t), Y_out.data(), 0, nullptr, nullptr);
-    GPUDevice::check(err, "read Y");
-    err = clEnqueueReadBuffer(gpu.queue, hash_M_buf, CL_TRUE, 0,
-                              n_matches * N_META * sizeof(uint32_t), M_out.data(), 0, nullptr, nullptr);
-    GPUDevice::check(err, "read M");
+    std::vector<uint32_t> M_out;
+
+    if(use_gpu_resident && M_curr_gpu && M_out_gpu) {
+        // Build LR flat array on CPU (small: 2 uint32s per match)
+        std::vector<uint32_t> LR_flat(n_matches * 2);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            LR_flat[i * 2]     = (uint32_t)matches[i].first;
+            LR_flat[i * 2 + 1] = (uint32_t)matches[i].second;
+        }
+        if(LR_pairs) {
+            LR_pairs->resize(n_matches);
+            #pragma omp parallel for schedule(static)
+            for(size_t i = 0; i < n_matches; i++) {
+                (*LR_pairs)[i] = matches[i];
+            }
+        }
+
+        // Upload LR pairs (small: 2*uint32 per match, ~8MB for 1M matches)
+        cl_int err;
+        cl_mem LR_buf = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            n_matches * 2 * sizeof(uint32_t), (void*)LR_flat.data(), &err);
+        GPUDevice::check(err, "LR_buf");
+        cl_mem Y_buf = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY,
+            n_matches * sizeof(uint32_t), nullptr, &err);
+        GPUDevice::check(err, "Y_buf");
+
+        uint32_t num_total = (uint32_t)entries.size();
+        uint32_t num_u32 = (uint32_t)n_matches;
+        clSetKernelArg(k_table_hash_lr, 0, sizeof(cl_mem), &M_curr_gpu);
+        clSetKernelArg(k_table_hash_lr, 1, sizeof(cl_mem), &LR_buf);
+        clSetKernelArg(k_table_hash_lr, 2, sizeof(cl_mem), &Y_buf);
+        clSetKernelArg(k_table_hash_lr, 3, sizeof(cl_mem), &M_out_gpu);
+        clSetKernelArg(k_table_hash_lr, 4, sizeof(uint32_t), &kmask);
+        clSetKernelArg(k_table_hash_lr, 5, sizeof(uint32_t), &num_u32);
+        clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &num_total);
+
+        size_t local = 64;
+        size_t global = ((n_matches + local - 1) / local) * local;
+        err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash_lr, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+        GPUDevice::check(err, "enqueue hash_lr");
+        gpu.finish();
+
+        // Download only Y_out (small: 1 uint32 per match)
+        err = clEnqueueReadBuffer(gpu.queue, Y_buf, CL_TRUE, 0,
+            n_matches * sizeof(uint32_t), Y_out.data(), 0, nullptr, nullptr);
+        GPUDevice::check(err, "read Y");
+        clReleaseMemObject(LR_buf);
+        clReleaseMemObject(Y_buf);
+
+        // Swap M buffers for next table
+        std::swap(M_curr_gpu, M_out_gpu);
+    } else {
+        // Legacy path: extract L_meta/R_meta on CPU, upload to GPU
+        std::vector<uint32_t> L_meta(n_matches * N_META);
+        std::vector<uint32_t> R_meta(n_matches * N_META);
+
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            const auto& m = matches[i];
+            const auto& entry_L = entries[m.first];
+            const auto& entry_R = entries[m.second];
+            for(int j = 0; j < N_META; j++) {
+                L_meta[i * N_META + j] = entry_L.M[j];
+                R_meta[i * N_META + j] = entry_R.M[j];
+            }
+        }
+
+        // GPU hash via L_meta/R_meta (original path)
+        ensure_hash_buffers(n_matches);
+        cl_int err;
+        err = clEnqueueWriteBuffer(gpu.queue, hash_L_buf, CL_FALSE, 0,
+                                   n_matches * N_META * sizeof(uint32_t), L_meta.data(), 0, nullptr, nullptr);
+        GPUDevice::check(err, "write L");
+        err = clEnqueueWriteBuffer(gpu.queue, hash_R_buf, CL_FALSE, 0,
+                                   n_matches * N_META * sizeof(uint32_t), R_meta.data(), 0, nullptr, nullptr);
+        GPUDevice::check(err, "write R");
+
+        clSetKernelArg(k_table_hash, 0, sizeof(cl_mem), &hash_L_buf);
+        clSetKernelArg(k_table_hash, 1, sizeof(cl_mem), &hash_R_buf);
+        clSetKernelArg(k_table_hash, 2, sizeof(cl_mem), &hash_Y_buf);
+        clSetKernelArg(k_table_hash, 3, sizeof(cl_mem), &hash_M_buf);
+        clSetKernelArg(k_table_hash, 4, sizeof(uint32_t), &kmask);
+        uint32_t n_u32 = (uint32_t)n_matches;
+        clSetKernelArg(k_table_hash, 5, sizeof(uint32_t), &n_u32);
+
+        size_t local = 64;
+        size_t global = ((n_matches + local - 1) / local) * local;
+        err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+        GPUDevice::check(err, "enqueue hash");
+        gpu.finish();
+
+        M_out.resize(n_matches * N_META);
+        err = clEnqueueReadBuffer(gpu.queue, hash_Y_buf, CL_TRUE, 0,
+                                  n_matches * sizeof(uint32_t), Y_out.data(), 0, nullptr, nullptr);
+        GPUDevice::check(err, "read Y");
+        err = clEnqueueReadBuffer(gpu.queue, hash_M_buf, CL_TRUE, 0,
+                                  n_matches * N_META * sizeof(uint32_t), M_out.data(), 0, nullptr, nullptr);
+        GPUDevice::check(err, "read M");
+    }
 
     auto t4 = std::chrono::high_resolution_clock::now();
     timing.hash_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
@@ -383,6 +436,11 @@ TableTiming PlotPipeline::process_table(
             uint16_t delta = (uint16_t)(m.second - m.first - 1);
             (*pd_out)[i] = {m.first, delta};
         }
+    }
+
+    // For table 2: collect X pairs
+    if(x_values_orig) {
+        // We need to pass this out separately — the caller handles it
     }
 
     // Build next table entries with original indices
@@ -432,6 +490,19 @@ void PlotPipeline::run_full_pipeline(
     }
 
     result.table_entries.push_back(entries);
+
+    // Initialize GPU-resident hash if available
+    if(!k_table_hash_lr) {
+        init_hash_lr_kernel();
+    }
+    if(use_gpu_resident) {
+        ensure_gpu_resident_buffers(num_x);
+        cl_int err;
+        // Upload initial M_flat to M_curr_gpu
+        clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
+            num_x * N_META * sizeof(uint32_t), M_flat.data(), 0, nullptr, nullptr);
+        std::cout << "[OCL] GPU-resident M_curr: " << (2 * gpu_resident_capacity * N_META * sizeof(uint32_t)) / 1e9 << " GB VRAM" << std::endl;
+    }
 
     // F2-F9
     for(int t = 2; t <= N_TABLE; t++) {

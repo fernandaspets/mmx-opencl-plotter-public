@@ -87,8 +87,9 @@ public:
     // Returns timing info
     TableTiming process_table(
         std::vector<PlotEntry>& entries,
-        const std::vector<uint32_t>* x_values_orig = nullptr,  // for table 2 X pairs
-        std::vector<PDEntry>* pd_out = nullptr);
+        const std::vector<uint32_t>* x_values_orig,
+        std::vector<PDEntry>* pd_out,
+        std::vector<MatchPair>* LR_pairs = nullptr);
 
     // Run full pipeline with PD and X-pair collection
     void run_full_pipeline(
@@ -120,11 +121,20 @@ private:
     cl_mem hash_Y_buf = nullptr;
     cl_mem hash_M_buf = nullptr;
 
+    // GPU-resident M buffer management
+    cl_mem M_curr_gpu = nullptr;  // current metadata (read for hash)
+    cl_mem M_out_gpu = nullptr;   // output metadata (written by hash)
+    cl_kernel k_table_hash_lr = nullptr;
+    bool use_gpu_resident = false;
+    size_t gpu_resident_capacity = 0;
+
     size_t f1_buf_size = 0;
     size_t hash_buf_size = 0;
 
     void ensure_f1_buffers(size_t num_x);
     void ensure_hash_buffers(size_t num_matches);
+    void ensure_gpu_resident_buffers(size_t num_entries);
+    bool init_hash_lr_kernel();
     void load_kernels();
 };
 
