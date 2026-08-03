@@ -122,6 +122,14 @@ set_target_properties(test_pid_derive PROPERTIES
 )
 
 # === MAIN PLOTTER ===
-add_executable(mmx_opencl_plotter src/main.cpp ${GPU_SOURCES} src/plot_pipeline.cpp src/plot_writer.cpp src/gpu_manager.cpp src/multi_pipeline.cpp)
-target_include_directories(mmx_opencl_plotter PRIVATE src)
-target_link_libraries(mmx_opencl_plotter PRIVATE ${OpenCL_LIBRARIES} mmx_iface vnx_base_static)
+# Build per-ksize binaries matching reference convention
+set(PLOTTER_SOURCES src/main.cpp ${GPU_SOURCES} src/plot_pipeline.cpp src/plot_writer.cpp src/gpu_manager.cpp src/multi_pipeline.cpp)
+target_link_libraries(plot_writer PUBLIC mmx_iface vnx_base_static)
+
+foreach(KSIZE_VAL 18 20 22 24 25 26 29 30 31 32)
+    set(TARGET_NAME mmx_opencl_plot_k${KSIZE_VAL})
+    add_executable(${TARGET_NAME} ${PLOTTER_SOURCES})
+    target_include_directories(${TARGET_NAME} PRIVATE src)
+    target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES} mmx_iface vnx_base_static)
+    target_compile_definitions(${TARGET_NAME} PRIVATE KSIZE=${KSIZE_VAL})
+endforeach()

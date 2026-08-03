@@ -27,9 +27,9 @@ void PlotWriter::compute_header(
     // X pairs: two values per entry (X_L and X_R), each x2size bits
     header->park_bytes_x = cdiv(PARK_SIZE_X * x2size * 2, 8);
     header->park_bytes_meta = cdiv(PARK_SIZE_META * ksize * N_META_OUT, 8);
-    header->park_bytes_y = 4 + (uint32_t)std::ceil((PARK_SIZE_Y - 1) * MAX_AVG_YDELTA_BITS / 8.0);
+    header->park_bytes_y = 4 + (uint32_t)std::ceil((PARK_SIZE_Y - 1) * MAX_AVG_YDELTA_BITS * 1.2 / 8.0);
     header->park_bytes_pd = cdiv(PARK_SIZE_PD * ksize, 8)
-                          + (uint32_t)std::ceil(PARK_SIZE_PD * MAX_AVG_OFFSET_BITS / 8.0);
+                          + (uint32_t)std::ceil(PARK_SIZE_PD * MAX_AVG_OFFSET_BITS * 1.2 / 8.0);
 
     header->entry_bits_x = x2size;
     header->num_entries_y = num_entries;

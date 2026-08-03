@@ -16,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <ctime>
 #include <chrono>
 #include <fstream>
 #include <filesystem>
@@ -42,6 +43,10 @@ static std::string hex_str(const uint8_t* data, size_t len) {
 }
 
 int main(int argc, char** argv) {
+    // Silence unused function warning
+    (void)hex_str;
+
+    int ksize = KSIZE;
     std::string farmer_key_str;
     std::string contract_addr_str;
     std::vector<std::string> tmp_dirs;
@@ -81,8 +86,6 @@ int main(int argc, char** argv) {
         else if(arg == "-w" || arg == "--waitforcopy") { }
         else { std::cerr << "Unknown: " << arg << std::endl; return -2; }
     }
-
-    const int ksize = 26;
 
     if(show_version) {
         std::cout << "MMX OpenCL Plotter k" << ksize << " - " TOSTRING(GIT_COMMIT_HASH) << std::endl;
@@ -161,10 +164,24 @@ int main(int argc, char** argv) {
     }
 
     const uint64_t num_x = uint64_t(1) << ksize;
-    std::string plot_name = "mmx-" + plot_id.to_string() + "-k" + std::to_string(ksize)
-        + (ssd_mode ? "-ssd" : "") + ".plot";
+    // Build plot name matching reference convention:
+    // plot-mmx-<hdd|ssd>-k<ksize>-c<C>[-nft<prefix>]-<date>-<plot_id>
+    time_t now = time(nullptr);
+    char date_buf[32];
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d-%H-%M", localtime(&now));
+    
+    std::string nft_tag;
+    if(is_nft) {
+        std::string cstr = contract_addr_str;
+        nft_tag = "-nft" + (cstr.size() > 10 ? cstr.substr(3, 7) : cstr);
+    }
+    
+    std::string prefix = "plot-mmx-" + std::string(ssd_mode ? "ssd" : "hdd");
+    std::string plot_name = prefix + "-k" + std::to_string(ksize) + "-c" + std::to_string(C)
+        + nft_tag + "-" + date_buf + "-" + plot_id.to_string();
+    
     std::string out_dir = final_dirs.empty() ? tmp_dirs[0] : final_dirs[0];
-    std::string output_path = out_dir + "/" + plot_name;
+    std::string output_path = out_dir + "/" + plot_name + ".plot";
 
     std::cout << "Working Directory:   " << tmp_dirs[0] << std::endl;
     if(tmp_dir2 != "@RAM") std::cout << "Working Directory 2: " << tmp_dir2 << std::endl;
