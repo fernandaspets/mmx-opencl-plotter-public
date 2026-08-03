@@ -1787,8 +1787,7 @@ void compute_gpu_bulk(
         const uint32_t kmask_u32 = kmask;
         uint32_t n_u32 = (uint32_t)total_entries;
         size_t gs = ((total_entries + 255) / 256) * 256;
-        auto t_sort_start = my_time_ms();
-        
+                
         cl_mem counts = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, (size_t)num_bins * 4, nullptr, &err);
         cl_mem offsets = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, (size_t)num_bins * 4, nullptr, &err);
         cl_mem atomic_buf = clCreateBuffer(gpu_plotter.context, CL_MEM_READ_WRITE, (size_t)num_bins * 4, nullptr, &err);
@@ -1797,8 +1796,7 @@ void compute_gpu_bulk(
         clEnqueueFillBuffer(gpu_plotter.queue, counts, &zero, 4, 0, (size_t)num_bins * 4, 0, nullptr, nullptr);
         clEnqueueFillBuffer(gpu_plotter.queue, atomic_buf, &zero, 4, 0, (size_t)num_bins * 4, 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
-        auto t_fill_end = my_time_ms();
-        
+                
         // Count per Y
         clSetKernelArg(gpu_plotter.k_bucket_count, 0, sizeof(cl_mem), &Y_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_count, 1, sizeof(cl_mem), &counts);
@@ -1808,8 +1806,7 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_bucket_count, 5, sizeof(uint32_t), &n_u32);
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_count, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
-        auto t_count_end = my_time_ms();
-        
+                
         // Prefix sum on CPU (2^K entries)
         std::vector<uint32_t> h_counts(num_bins);
         clEnqueueReadBuffer(gpu_plotter.queue, counts, CL_TRUE, 0, (size_t)num_bins * 4, h_counts.data(), 0, nullptr, nullptr);
@@ -1818,11 +1815,9 @@ void compute_gpu_bulk(
         for(uint32_t b = 0; b < num_bins; b++) { h_offsets[b] = sum; sum += h_counts[b]; }
         clEnqueueWriteBuffer(gpu_plotter.queue, offsets, CL_FALSE, 0, (size_t)num_bins * 4, h_offsets.data(), 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
-        auto t_prefix_end = my_time_ms();
-        
+                
         // Scatter to sorted positions
-        if(t == 2) { uint32_t dbg[10]; clEnqueueReadBuffer(gpu_plotter.queue, counts, CL_TRUE, 0, 40, dbg, 0, nullptr, nullptr); std::cerr << "  counts[0..9]: "; for(int i=0;i<10;i++) std::cerr << dbg[i] << " "; std::cerr << std::endl; }
-        clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[0]);
+                clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 1, sizeof(cl_mem), &pos_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 2, sizeof(cl_mem), &Y_buf[1]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 3, sizeof(cl_mem), &pos_buf[1]);
@@ -1832,25 +1827,15 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 7, sizeof(uint32_t), &n_u32);
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_scatter, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
         clFinish(gpu_plotter.queue);
-        auto t_scatter_end = my_time_ms();
-        
-        if(t == 2) std::cerr << "  sort: fill=" << (t_fill_end-t_sort_start) << "ms count=" << (t_count_end-t_fill_end) << "ms prefix=" << (t_prefix_end-t_count_end) << "ms scatter=" << (t_scatter_end-t_prefix_end) << "ms" << std::endl;
+                
         
         clReleaseMemObject(atomic_buf);
         // Keep counts and offsets on GPU for match kernel (freed after match)
         // Sorted data is in Y_buf[1], pos_buf[1]
         
         // DEBUG: check if sorted
-        if(t == 2) {
-            std::vector<uint32_t> dbg_y(std::min((size_t)20, total_entries));
-            clEnqueueReadBuffer(gpu_plotter.queue, Y_buf[1], CL_TRUE, 0, dbg_y.size() * 4, dbg_y.data(), 0, nullptr, nullptr);
-            std::cerr << "  Y_sorted[0..19]: ";
-            for(size_t i = 0; i < dbg_y.size(); i++) std::cerr << (dbg_y[i] & kmask) << " ";
-            std::cerr << std::endl;
-        }
         
-        std::cerr << "  Step 2 start" << std::flush;
-        // Step 2: GPU match — direct pairing using sort counts/offsets
+                // Step 2: GPU match — direct pairing using sort counts/offsets
         // Each work-item processes one Y value (2^K work-items)
         size_t gs_match = ((size_t)num_bins + 255) / 256 * 256;
         clEnqueueFillBuffer(gpu_plotter.queue, match_count, &zero, 4, 0, 4, 0, nullptr, nullptr);
@@ -1865,28 +1850,29 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_match_sorted, 7, sizeof(cl_mem), &match_count);
         clSetKernelArg(gpu_plotter.k_match_sorted, 8, sizeof(uint32_t), &kmask_u32);
         clSetKernelArg(gpu_plotter.k_match_sorted, 9, sizeof(uint32_t), &max_matches_u32);
-        std::cerr << "  match kernel launching..." << std::flush;
-        clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_sorted, 1, nullptr, &gs_match, nullptr, 0, nullptr, nullptr);
-        clFinish(gpu_plotter.queue);
-        std::cerr << " done." << std::endl;
-        
+                clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_match_sorted, 1, nullptr, &gs_match, nullptr, 0, nullptr, nullptr);
+                
         // Read match count
         uint32_t num_matches = 0;
-        clEnqueueReadBuffer(gpu_plotter.queue, match_count, CL_TRUE, 0, 4, &num_matches, 0, nullptr, nullptr);
-        match_counts[t] = num_matches;
-        
+        cl_event ev;
+        clEnqueueReadBuffer(gpu_plotter.queue, match_count, CL_FALSE, 0, 4, &num_matches, 0, nullptr, &ev);
+        clWaitForEvents(1, &ev);
+        clReleaseEvent(ev);
+                match_counts[t] = num_matches;
+                
         // Free sort buffers (counts, offsets) — no longer needed
         clReleaseMemObject(counts);
         clReleaseMemObject(offsets);
-        
+                
         // Step 3: GPU hash — hash LR_orig pairs → Y_out, M_out
         // The hash_lr_kernel reads LR_flat as (P1, P2) = (orig_L, orig_R)
         // We need to create a temporary LR_flat view that is just (orig_L, orig_R) without stride
         // Actually, LR_orig already has (orig_L, orig_R) at stride 2. Perfect!
         
         // Allocate Y_out buffer for hash results
-        cl_mem Y_out = clCreateBuffer(gpu_plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err);
-        
+                cl_mem Y_out = clCreateBuffer(gpu_plotter.context, CL_MEM_WRITE_ONLY, num_matches * 4, nullptr, &err);
+        if(err != CL_SUCCESS) { std::cerr << "Y_out create failed: " << err << std::endl; }
+                
         uint32_t num_total_u32 = (uint32_t)total_entries;
         clSetKernelArg(gpu_plotter.hash_lr_kernel, 0, sizeof(cl_mem), &M_curr_gpu);
         clSetKernelArg(gpu_plotter.hash_lr_kernel, 1, sizeof(cl_mem), &LR_orig);
@@ -1898,21 +1884,22 @@ void compute_gpu_bulk(
         size_t hash_global = num_matches;
         size_t hash_local = g_hash_local;
         if(hash_global % hash_local) hash_global = ((hash_global / hash_local) + 1) * hash_local;
-        clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.hash_lr_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
-        
+                clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.hash_lr_kernel, 1, nullptr, &hash_global, &hash_local, 0, nullptr, nullptr);
+                clFinish(gpu_plotter.queue);
+                
         // Download LR_sorted, Y_L, and pos_sorted (for T2 X_pairs) for PD build
         if(num_matches > 0) {
             std::vector<uint32_t> lr_sorted_host(num_matches * 2);
             std::vector<uint32_t> y_l_host(num_matches);
-            clEnqueueReadBuffer(gpu_plotter.queue, LR_sorted, CL_TRUE, 0, num_matches * 2 * 4, lr_sorted_host.data(), 0, nullptr, nullptr);
-            clEnqueueReadBuffer(gpu_plotter.queue, Y_L_buf, CL_TRUE, 0, num_matches * 4, y_l_host.data(), 0, nullptr, nullptr);
-            // For T2: also download pos_sorted (F1 indices) for X_pairs
+                        clEnqueueReadBuffer(gpu_plotter.queue, LR_sorted, CL_TRUE, 0, num_matches * 2 * 4, lr_sorted_host.data(), 0, nullptr, nullptr);
+                                    clEnqueueReadBuffer(gpu_plotter.queue, Y_L_buf, CL_TRUE, 0, num_matches * 4, y_l_host.data(), 0, nullptr, nullptr);
+                        // For T2: also download pos_sorted (F1 indices) for X_pairs
             std::vector<uint32_t> pos_t_host;
             if(t == 2) {
                 pos_t_host.resize(total_entries);
-                clEnqueueReadBuffer(gpu_plotter.queue, pos_buf[1], CL_TRUE, 0, total_entries * 4, pos_t_host.data(), 0, nullptr, nullptr);
-            }
-            LR_all[t].resize(num_matches);
+                                clEnqueueReadBuffer(gpu_plotter.queue, pos_buf[1], CL_TRUE, 0, total_entries * 4, pos_t_host.data(), 0, nullptr, nullptr);
+                            }
+                        LR_all[t].resize(num_matches);
             std::vector<uint32_t> Y_L_all_t(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_all[t][i] = {lr_sorted_host[i * 2], lr_sorted_host[i * 2 + 1]};
@@ -1921,14 +1908,13 @@ void compute_gpu_bulk(
             // Sort by Y_L for PD in sorted order
             std::vector<std::pair<uint32_t, uint32_t>> match_indices(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {Y_L_all_t[i], i};
-            radix_sort_pairs(match_indices, KSIZE);
-            // Reorder LR_all[t] by sorted order and save pos_t for X_pairs
+                        radix_sort_pairs(match_indices, KSIZE);
+                        // Reorder LR_all[t] by sorted order
             std::vector<std::pair<uint32_t, uint32_t>> LR_sorted_order(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_sorted_order[i] = LR_all[t][match_indices[i].second];
             }
-            LR_all[t] = std::move(LR_sorted_order);
-            // For T2: build X_pairs from pos_sorted and sorted LR
+            // For T2: build X_pairs BEFORE moving LR_sorted_order
             if(t == 2 && !pos_t_host.empty()) {
                 plot.X_pairs.resize(num_matches);
                 for(uint32_t i = 0; i < num_matches; i++) {
@@ -1936,9 +1922,10 @@ void compute_gpu_bulk(
                     uint32_t sorted_R = LR_sorted_order[i].second;
                     if(sorted_L < pos_t_host.size() && sorted_R < pos_t_host.size())
                         plot.X_pairs[i] = {pos_t_host[sorted_L], pos_t_host[sorted_R]};
-                    else std::cerr << "X_pairs OOB: sorted_L=" << sorted_L << " sorted_R=" << sorted_R << " pos_size=" << pos_t_host.size() << std::endl;
                 }
             }
+            // Now safe to move
+            LR_all[t] = std::move(LR_sorted_order);
         }
         
         // Swap: Y_buf[0] = Y_out (for next table's sort), M_curr = M_out
@@ -2422,8 +2409,7 @@ void compute_full_pipeline(
                 total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
         // Sort matches by Y
-        auto t_sort_start = my_time_ms();
-        if(use_gpu_sort && gpu_plotter.k_bucket_count) {
+                if(use_gpu_sort && gpu_plotter.k_bucket_count) {
             std::vector<uint32_t> Y_arr(matches.size());
             std::vector<uint32_t> val_arr(matches.size());
             #pragma omp parallel for schedule(static)
@@ -2439,6 +2425,7 @@ void compute_full_pipeline(
         } else {
             radix_sort_pairs(matches, KSIZE);
         }
+        auto t_sort_start = my_time_ms();
         auto t_sort_end = my_time_ms();
         // Build entries_map[t] + PD[t] in single pass
         entries_map[t] = std::vector<uint32_t>(matches.size());
