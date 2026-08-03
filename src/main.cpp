@@ -1,5 +1,6 @@
 // mmx_opencl_plotter — MMX OpenCL Plotter
-// Usage: mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> [output_dir] [options]
+// 1:1 CLI compatible with reference mmx_cuda_plot
+// Usage: mmx_opencl_plotter -f <farmer_key> [options]
 #include "gpu_device.h"
 #include "gpu_manager.h"
 #include "plot_pipeline.h"
@@ -18,207 +19,209 @@
 #include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <csignal>
+
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
+static volatile bool sig_interrupt = false;
+static volatile bool sig_force = false;
+
+static void interrupt_handler(int) {
+    if(sig_interrupt) { sig_force = true; }
+    else { sig_interrupt = true; }
+}
+
+static std::string hex_str(const uint8_t* data, size_t len) {
+    std::string out(len * 2, ' ');
+    for(size_t i = 0; i < len; i++) {
+        out[i*2]   = "0123456789ABCDEF"[data[i] >> 4];
+        out[i*2+1] = "0123456789ABCDEF"[data[i] & 0xF];
+    }
+    return out;
+}
 
 int main(int argc, char** argv) {
-    if(argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <plot_id_hex> <farmer_key_hex> [output_dir] [options]" << std::endl;
-        std::cerr << "Options:" << std::endl;
-        std::cerr << "  --k N           Set plot k-size (default: 26, range " << mmx::MIN_KSIZE << "-" << mmx::MAX_KSIZE << ")" << std::endl;
-        std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
-        std::cerr << "  --device N      GPU device index (default: 0)" << std::endl;
-        std::cerr << "  --num-gpus N    Number of GPUs to use (default: 1)" << std::endl;
-        std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for fast plotting" << std::endl;
-        std::cerr << "  --no-meta       SSD mode (no metadata table, ~55% smaller)" << std::endl;
-        std::cerr << "  --clevel N      Compression level 0-15 (default: 0)" << std::endl;
-        std::cerr << "  --nft           NFT plot (requires --contract)" << std::endl;
-        std::cerr << "  --contract HEX  Contract address for NFT plot" << std::endl;
-        std::cerr << "  --derive        Derive plot_id from seed (arg1) + farmer_key (arg2)" << std::endl;
-        return 1;
-    }
+    std::string farmer_key_str;
+    std::string contract_addr_str;
+    std::vector<std::string> tmp_dirs;
+    std::string tmp_dir2 = "@RAM";
+    std::string tmp_dir3 = "@RAM";
+    std::vector<std::string> final_dirs;
+    int C = 0;
+    int device = 0;
+    int num_devices = 1;
+    int num_plots = 1;
+    bool ssd_mode = false;
+    bool show_help = false;
+    bool show_version = false;
 
-    std::string pid_str = argv[1];
-    std::string fk_str = argv[2];
-    std::string output_dir = "./";
-    std::string ramdisk_dir;
-    uint32_t ksize = 26;
-    uint32_t clevel = 0;  // compression level C0
-    uint64_t limit = 0;
-    int device_id = 0;
-    int num_gpus = 1;
-    bool has_meta = true;
-    bool is_nft = false;
-    bool do_derive = false;
-    std::string contract_str;
-
-    for(int i = 3; i < argc; i++) {
+    for(int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if(arg == "--k" && i+1 < argc) ksize = std::stoi(argv[++i]);
-        else if(arg == "--limit" && i+1 < argc) limit = std::stoull(argv[++i]);
-        else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
-        else if(arg == "--num-gpus" && i+1 < argc) num_gpus = std::stoi(argv[++i]);
-        else if(arg == "--ramdisk" && i+1 < argc) ramdisk_dir = argv[++i];
-        else if(arg == "--no-meta") has_meta = false;
-        else if(arg == "--clevel" && i+1 < argc) clevel = std::stoi(argv[++i]);
-        else if(arg == "--nft") is_nft = true;
-        else if(arg == "--contract" && i+1 < argc) contract_str = argv[++i];
-        else if(arg == "--derive") do_derive = true;
-        else output_dir = arg;
+        if      ((arg == "-C" || arg == "--level") && i+1 < argc)       C = std::stoi(argv[++i]);
+        else if(arg == "--ssd")                                          ssd_mode = true;
+        else if((arg == "-n" || arg == "--count") && i+1 < argc)        num_plots = std::stoi(argv[++i]);
+        else if((arg == "-g" || arg == "--device") && i+1 < argc)       device = std::stoi(argv[++i]);
+        else if((arg == "-r" || arg == "--ndevices") && i+1 < argc)     num_devices = std::stoi(argv[++i]);
+        else if((arg == "-t" || arg == "--tmpdir") && i+1 < argc)       tmp_dirs.push_back(argv[++i]);
+        else if((arg == "-2" || arg == "--tmpdir2") && i+1 < argc)      tmp_dir2 = argv[++i];
+        else if((arg == "-3" || arg == "--tmpdir3") && i+1 < argc)      tmp_dir3 = argv[++i];
+        else if((arg == "-d" || arg == "--finaldir") && i+1 < argc)     final_dirs.push_back(argv[++i]);
+        else if((arg == "-c" || arg == "--contract") && i+1 < argc)     contract_addr_str = argv[++i];
+        else if((arg == "-f" || arg == "--farmerkey") && i+1 < argc)    farmer_key_str = argv[++i];
+        else if(arg == "-h" || arg == "--help")                         show_help = true;
+        else if(arg == "--version")                                      show_version = true;
+        else if(arg == "-S" || arg == "--streams")     { if(i+1 < argc) i++; }
+        else if(arg == "-B" || arg == "--chunksize")   { if(i+1 < argc) i++; }
+        else if(arg == "-Q" || arg == "--maxtmp")      { if(i+1 < argc) i++; }
+        else if(arg == "-A" || arg == "--copylimit")   { if(i+1 < argc) i++; }
+        else if(arg == "-W" || arg == "--maxcopy")     { if(i+1 < argc) i++; }
+        else if(arg == "-M" || arg == "--memory")      { if(i+1 < argc) i++; }
+        else if(arg == "-z" || arg == "--dstport")     { if(i+1 < argc) i++; }
+        else if(arg == "-w" || arg == "--waitforcopy") { }
+        else { std::cerr << "Unknown: " << arg << std::endl; return -2; }
     }
 
-    if(ksize < mmx::MIN_KSIZE || ksize > mmx::MAX_KSIZE) {
-        std::cerr << "Error: ksize must be " << mmx::MIN_KSIZE << "-" << mmx::MAX_KSIZE << std::endl;
-        return 1;
+    const int ksize = 26;
+
+    if(show_version) {
+        std::cout << "MMX OpenCL Plotter k" << ksize << " - " TOSTRING(GIT_COMMIT_HASH) << std::endl;
+        _exit(0);  // avoid static destructor issues
     }
 
-    // Parse keys: first arg is plot_id_hex (or seed_hex if --derive)
-    mmx::hash_t plot_id;
+    if(show_help || argc <= 1 || farmer_key_str.empty()) {
+        std::cout << "MMX k" << ksize << " OpenCL plotter - " TOSTRING(GIT_COMMIT_HASH) "\n\n"
+            "For <farmerkey> see output of `mmx wallet keys`.\n"
+            "To plot for pooling, specify -c <contract> address.\n\n"
+            "Usage:\n"
+            "  mmx_opencl_plotter [OPTION...]\n\n"
+            "  -C, --level arg      Compression level (0 to 15)\n"
+            "      --ssd            Make SSD plots\n"
+            "  -n, --count arg      Number of plots (default = 1, unlimited = -1)\n"
+            "  -g, --device arg     CUDA device (default = 0)\n"
+            "  -r, --ndevices arg   Number of CUDA devices (default = 1)\n"
+            "  -t, --tmpdir arg     Temporary directories\n"
+            "  -2, --tmpdir2 arg    Temporary dir 2 (default = @RAM)\n"
+            "  -3, --tmpdir3 arg    Temporary dir 3 (default = @RAM)\n"
+            "  -d, --finaldir arg   Final destinations\n"
+            "  -c, --contract arg   Pool Contract Address\n"
+            "  -f, --farmerkey arg  Farmer Public Key (33 bytes)\n"
+            "      --version        Print version\n"
+            "  -h, --help           Print help\n"
+            << std::endl;
+        return 0;
+    }
+
+    if(C < 0 || C > 15) {
+        std::cerr << "Invalid compression level: " << C << std::endl;
+        return -2;
+    }
+
+    if(tmp_dirs.empty()) tmp_dirs.push_back("./");
+    if(tmp_dir3 != "@RAM" && tmp_dir2 == "@RAM") tmp_dir2 = tmp_dir3;
+
+    // Parse farmer key (33 hex bytes)
+    auto fk_raw = vnx::from_hex_string(farmer_key_str);
+    if(fk_raw.size() != 33) {
+        std::cerr << "Invalid farmer key: " << farmer_key_str << " (needs 33 bytes)" << std::endl;
+        return -2;
+    }
     mmx::pubkey_t farmer_key;
-    mmx::addr_t contract_addr;
+    std::memcpy((void*)farmer_key.data(), fk_raw.data(), 33);
+
+    // Parse contract (bech32 address)
+    mmx::addr_t contract;
     bool have_contract = false;
-    
-    try {
-        if(do_derive) {
-            // First arg is seed, derive plot_id from seed+farm+ksize
-            mmx::hash_t seed;
-            seed.from_string(pid_str);
-            farmer_key.from_string(fk_str);
-            
-            if(is_nft) {
-                if(contract_str.empty()) {
-                    std::cerr << "Error: NFT plot requires --contract <hex>" << std::endl;
-                    return 1;
-                }
-                // Parse contract as hex bytes → hash_t → addr_t
-                std::vector<uint8_t> raw = vnx::from_hex_string(contract_str);
-                if(raw.size() != 32) {
-                    std::cerr << "Error: contract must be 32 hex bytes (64 hex chars)" << std::endl;
-                    return 1;
-                }
-                std::array<uint8_t, 32> arr;
-                std::memcpy(arr.data(), raw.data(), 32);
-                contract_addr = mmx::addr_t(mmx::hash_t(arr));
-                have_contract = true;
-            }
-            
-            plot_id = mmx::derive_plot_id(seed, ksize, farmer_key, is_nft, 
-                have_contract ? std::optional<mmx::addr_t>(contract_addr) : std::nullopt);
-        } else {
-            plot_id.from_string(pid_str);
-            farmer_key.from_string(fk_str);
-            if(is_nft || !contract_str.empty()) {
-                std::vector<uint8_t> raw = vnx::from_hex_string(contract_str);
-                if(raw.size() != 32) {
-                    std::cerr << "Error: contract must be 32 hex bytes (64 hex chars)" << std::endl;
-                    return 1;
-                }
-                std::array<uint8_t, 32> arr;
-                std::memcpy(arr.data(), raw.data(), 32);
-                contract_addr = mmx::addr_t(mmx::hash_t(arr));
-                have_contract = true;
-            }
+    if(!contract_addr_str.empty()) {
+        try {
+            contract.from_string(contract_addr_str);
+            have_contract = true;
+        } catch(...) {
+            std::cerr << "Invalid contract address" << std::endl;
+            return -2;
         }
-    } catch(const std::exception& e) {
-        std::cerr << "Error parsing keys: " << e.what() << std::endl;
-        return 1;
     }
 
-    uint64_t num_x = uint64_t(1) << ksize;
-    if(limit > 0 && limit < num_x) num_x = limit;
+    bool is_nft = have_contract;
 
+    // Generate random seed (matching reference)
+    std::array<uint8_t, 32> seed_bytes;
+    vnx::secure_random_bytes(seed_bytes.data(), 32);
+    mmx::hash_t seed;
+    std::memcpy(seed.data(), seed_bytes.data(), 32);
+
+    // Derive plot_id from seed + farmer_key + optional contract
+    mmx::hash_t plot_id = mmx::derive_plot_id(
+        seed, ksize, farmer_key, is_nft,
+        have_contract ? std::optional<mmx::addr_t>(contract) : std::nullopt);
+
+    if(num_plots != 1) {
+        std::signal(SIGINT, interrupt_handler);
+        std::signal(SIGTERM, interrupt_handler);
+    }
+
+    const uint64_t num_x = uint64_t(1) << ksize;
     std::string plot_name = "mmx-" + plot_id.to_string() + "-k" + std::to_string(ksize)
-        + (has_meta ? "" : "-ssd") + ".plot";
+        + (ssd_mode ? "-ssd" : "") + ".plot";
+    std::string out_dir = final_dirs.empty() ? tmp_dirs[0] : final_dirs[0];
+    std::string output_path = out_dir + "/" + plot_name;
 
-    std::string output_path = ramdisk_dir.empty()
-        ? output_dir + "/" + plot_name
-        : ramdisk_dir + "/" + plot_name;
-
-    std::cout << "=== MMX OpenCL Plotter ===" << std::endl;
-    std::cout << "  Plot ID: " << plot_id.to_string() << std::endl;
-    std::cout << "  Farmer Key: " << farmer_key.to_string() << std::endl;
-    std::cout << "  K-Size: " << ksize << std::endl;
-    std::cout << "  Compression: C" << clevel << " (xbits=" << (ksize - clevel) << ")" << std::endl;
-    std::cout << "  Entries: " << num_x << " (2^" << ksize << ")" << std::endl;
-    std::cout << "  Output: " << output_path << std::endl;
-    std::cout << "  Mode: " << (has_meta ? "HDD" : "SSD") << std::endl;
-    if(is_nft) std::cout << "  Type: NFT" << std::endl;
-    if(have_contract) std::cout << "  Contract: " << contract_addr.to_string() << std::endl;
+    std::cout << "Working Directory:   " << tmp_dirs[0] << std::endl;
+    if(tmp_dir2 != "@RAM") std::cout << "Working Directory 2: " << tmp_dir2 << std::endl;
+    if(tmp_dir3 != "@RAM") std::cout << "Working Directory 3: " << tmp_dir3 << std::endl;
+    std::cout << "Compression Level: C" << C << " (" << (ssd_mode ? "SSD" : "HDD") << ")" << std::endl;
+    std::cout << "Plot Name: " << plot_name << std::endl;
 
     // GPU init
-    std::unique_ptr<mmx::GPUManager> gpu_mgr;
-    std::unique_ptr<mmx::GPUDevice> single_gpu;
-    
-    if(num_gpus > 1) {
-        gpu_mgr = std::make_unique<mmx::GPUManager>();
-        gpu_mgr->init(device_id, num_gpus);
-    } else {
-        single_gpu = std::make_unique<mmx::GPUDevice>();
-        single_gpu->init(device_id);
-        single_gpu->print_info();
-    }
+    mmx::GPUManager gpu_mgr;
+    mmx::GPUDevice single_gpu;
+    if(num_devices > 1) { gpu_mgr.init(device, num_devices); }
+    else { single_gpu.init(device); single_gpu.print_info(); }
 
     // Pipeline
     std::unique_ptr<mmx::MultiPipeline> multi_pipe;
     std::unique_ptr<mmx::PlotPipeline> single_pipe;
-    
-    if(num_gpus > 1) {
-        multi_pipe = std::make_unique<mmx::MultiPipeline>(*gpu_mgr, ksize);
+    if(num_devices > 1) {
+        multi_pipe = std::make_unique<mmx::MultiPipeline>(gpu_mgr, ksize);
         multi_pipe->init();
     } else {
-        single_pipe = std::make_unique<mmx::PlotPipeline>(*single_gpu, ksize);
+        single_pipe = std::make_unique<mmx::PlotPipeline>(single_gpu, ksize);
         single_pipe->init();
     }
 
-    // Generate X values (0, 1, 2, ..., num_x-1)
     std::cout << "[F1] Generating " << num_x << " X values..." << std::endl;
     std::vector<uint32_t> X_values(num_x);
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for
     for(uint64_t i = 0; i < num_x; i++) X_values[i] = (uint32_t)i;
 
-    uint32_t plot_id_raw[8];
-    std::memcpy(plot_id_raw, plot_id.data(), 32);
+    uint32_t pid32[8];
+    std::memcpy(pid32, plot_id.data(), 32);
 
     auto t0 = std::chrono::high_resolution_clock::now();
-
-    // Run pipeline
     mmx::PlotData result;
     try {
-        if(num_gpus > 1) {
-            multi_pipe->run_full_pipeline(X_values, plot_id_raw, result);
-        } else {
-            single_pipe->run_full_pipeline(X_values, plot_id_raw, result);
-        }
+        if(num_devices > 1) multi_pipe->run_full_pipeline(X_values, pid32, result);
+        else single_pipe->run_full_pipeline(X_values, pid32, result);
     } catch(const std::exception& e) {
         std::cerr << "Pipeline failed: " << e.what() << std::endl;
         return 1;
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    double pipeline_sec = std::chrono::duration<double>(t1 - t0).count();
+    std::cout << "Pipeline time: " << std::chrono::duration<double>(t1 - t0).count() << "s" << std::endl;
 
-    std::cout << "\n=== Pipeline Complete ===" << std::endl;
-    std::cout << "  Time: " << pipeline_sec << "s" << std::endl;
-    std::cout << "  Final entries: " << result.final_Y.size() << std::endl;
+    if(result.final_Y.empty()) { std::cout << "No matches!" << std::endl; return 1; }
 
-    if(result.final_Y.empty()) {
-        std::cout << "No matches found — plot would be empty." << std::endl;
-        return 1;
-    }
-
-    // Write plot file
-    uint32_t xbits_val = clevel;  // compression level C
-    std::cout << "\n[Plot] Writing (C" << clevel << ", xbits=" << (ksize - clevel) << ")..." << std::endl;
-    mmx::PlotWriter writer(ksize, xbits_val, has_meta);
-
-    uint8_t fk_raw[33];
-    std::memset(fk_raw, 0, 33);
-    std::memcpy(fk_raw, farmer_key.data(), std::min((size_t)32, farmer_key.size()));
+    // Write plot
+    std::cout << "[Plot] Writing..." << std::endl;
+    mmx::PlotWriter writer(ksize, C, !ssd_mode);
+    uint8_t fk33[33];
+    std::memcpy(fk33, farmer_key.data(), 33);
 
     try {
         writer.write_file(output_path,
-            (const uint8_t*)plot_id.data(),
-            fk_raw,
-            result,
-            have_contract ? (const uint8_t*)contract_addr.data() : nullptr);
+            (const uint8_t*)plot_id.data(), fk33, result,
+            have_contract ? (const uint8_t*)contract.data() : nullptr);
     } catch(const std::exception& e) {
         std::cerr << "Write failed: " << e.what() << std::endl;
         return 1;
@@ -226,24 +229,16 @@ int main(int argc, char** argv) {
 
     auto t2 = std::chrono::high_resolution_clock::now();
     double total_sec = std::chrono::duration<double>(t2 - t0).count();
+    std::ifstream fs(output_path, std::ios::binary | std::ios::ate);
+    uint64_t fsize = fs.tellg();
 
-    // File size
-    std::ifstream f(output_path, std::ios::binary | std::ios::ate);
-    uint64_t file_size = f.tellg();
+    std::cout << "Total time: " << total_sec << "s" << std::endl;
+    std::cout << "Plot size: " << (fsize / 1e9) << " GB" << std::endl;
 
-    std::cout << "\n=== Plot Complete ===" << std::endl;
-    std::cout << "  File: " << output_path << std::endl;
-    std::cout << "  Size: " << (file_size / 1e6) << " MB" << std::endl;
-    std::cout << "  Time: " << total_sec << "s" << std::endl;
-
-    // Copy from ramdisk if needed
-    if(!ramdisk_dir.empty() && output_dir != "./") {
-        std::string final_path = output_dir + "/" + plot_name;
-        std::cout << "[Plot] Copying to " << final_path << "..." << std::endl;
-        std::filesystem::copy(output_path, final_path,
-            std::filesystem::copy_options::overwrite_existing);
-        std::filesystem::remove(output_path);
-        std::cout << "[Plot] Copied" << std::endl;
+    // Copy to additional destinations
+    for(size_t i = 1; i < final_dirs.size(); i++) {
+        std::string dest = final_dirs[i] + "/" + plot_name;
+        std::filesystem::copy(output_path, dest, std::filesystem::copy_options::overwrite_existing);
     }
 
     return 0;
