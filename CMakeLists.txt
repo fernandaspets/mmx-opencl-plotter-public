@@ -20,8 +20,13 @@ include_directories(
     ${OpenCL_INCLUDE_DIRS}
     ${MMX_NODE_PATH}/include
     ${MMX_NODE_PATH}/generated/include
+    ${MMX_NODE_PATH}/generated/contract/include
+    ${MMX_NODE_PATH}/generated/operation/include
+    ${MMX_NODE_PATH}/generated/solution/include
     ${MMX_NODE_PATH}/build/dist/include
     ${MMX_NODE_PATH}/vnx-base/include
+    ${MMX_NODE_PATH}/vnx-base/generated/include
+    ${MMX_NODE_PATH}/vnx-addons/generated/include
     ${MMX_NODE_PATH}/build/generated/include
     ${MMX_NODE_PATH}/generated/include
     ${MMX_NODE_PATH}/generated/vm/include
