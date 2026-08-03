@@ -268,7 +268,9 @@ std::vector<MatchPair> PlotPipeline::match_entries(
 }
 
 TableTiming PlotPipeline::process_table(
-    std::vector<PlotEntry>& entries)
+    std::vector<PlotEntry>& entries,
+    const std::vector<uint32_t>* x_values_orig,
+    std::vector<PDEntry>* pd_out)
 {
     TableTiming timing;
     timing.n_entries = entries.size();
@@ -347,6 +349,22 @@ TableTiming PlotPipeline::process_table(
     auto t4 = std::chrono::high_resolution_clock::now();
     timing.hash_ms = std::chrono::duration<double, std::milli>(t4 - t3).count();
 
+    // Compute PD entries if requested
+    if(pd_out) {
+        pd_out->resize(n_matches);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            const auto& m = matches[i];
+            uint16_t delta = (uint16_t)(m.second - m.first - 1);
+            (*pd_out)[i] = {m.first, delta};
+        }
+    }
+
+    // For table 2: collect X pairs
+    if(x_values_orig) {
+        // We need to pass this out separately — the caller handles it
+    }
+
     // Build next table entries
     entries.resize(n_matches);
     #pragma omp parallel for schedule(static)
@@ -366,40 +384,78 @@ TableTiming PlotPipeline::process_table(
 void PlotPipeline::run_full_pipeline(
     const std::vector<uint32_t>& X_values,
     const uint32_t* plot_id,
-    std::vector<std::vector<PlotEntry>>& table_entries,
-    std::vector<std::vector<MatchPair>>& table_matches,
-    std::vector<TableTiming>& timings)
+    PlotData& result)
 {
     constexpr int N_TABLE = 9;
+    const size_t num_x = X_values.size();
+
+    result.final_Y.clear();
+    result.table_entries.clear();
+    result.pd_data.clear();
+    result.x_pairs.clear();
+    result.timings.clear();
 
     // F1
     std::vector<uint32_t> Y_flat, M_flat;
     compute_f1(X_values, plot_id, Y_flat, M_flat);
 
     // Build table 1 entries
-    std::vector<PlotEntry> entries(X_values.size());
+    std::vector<PlotEntry> entries(num_x);
     #pragma omp parallel for schedule(static)
-    for(size_t i = 0; i < X_values.size(); i++) {
+    for(size_t i = 0; i < num_x; i++) {
         entries[i].Y = Y_flat[i];
         for(int j = 0; j < N_META; j++) {
             entries[i].M[j] = M_flat[i * N_META + j];
         }
     }
 
-    table_entries.clear();
-    table_matches.clear();
-    timings.clear();
-    table_entries.push_back(entries);
+    result.table_entries.push_back(entries);
 
     // F2-F9
     for(int t = 2; t <= N_TABLE; t++) {
+        std::vector<PDEntry> table_pd;
+        
         std::cout << "[T" << t << "] " << entries.size() << " entries..." << std::flush;
-        auto tt = process_table(entries);
-        timings.push_back(tt);
-        table_entries.push_back(entries);
+        
+        // For table 2, pass X values for X-pair collection
+        std::vector<uint32_t> x_pairs;
+        if(t == 2) {
+            x_pairs.reserve(entries.size());  // will be filled during matching
+        }
+        
+        auto tt = process_table(entries,
+            (t == 2) ? &X_values : nullptr,
+            &table_pd);
+        
+        result.timings.push_back(tt);
+        result.table_entries.push_back(entries);
+        result.pd_data.push_back(table_pd);
+        
+        // For table 2: compute X pairs from the original X values
+        if(t == 2 && tt.n_matches > 0) {
+            // Entries are now the sorted table 2 matches
+            // The PD entries contain (sorted_pos_L, delta)
+            // We need to map sorted positions to original X values
+            // entries at this point = sorted version of previous table
+            // Wait — entries are now sorted by Y (post-sort_entries_by_y)
+            // The PD has sorted_pos_L — we need to map to original index
+            // Actually, the sorting reorders the entries. But the PD stores
+            // indices into this SORTED order. So we need to track the 
+            // original indices through the sort.
+            std::cout << " (X pairs not yet tracked)" << std::flush;
+        }
+        
         std::cout << " " << tt.n_matches << " matches (sort=" << tt.sort_ms
                   << "ms match=" << tt.match_ms << "ms hash=" << tt.hash_ms
                   << "ms)" << std::endl;
+        
+        if(entries.empty()) break;
+    }
+    
+    // Save final Y values
+    result.final_Y.resize(entries.size());
+    for(size_t i = 0; i < entries.size(); i++) {
+        result.final_Y[i] = entries[i].Y;
     }
 }
 

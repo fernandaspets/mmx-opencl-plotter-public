@@ -23,6 +23,9 @@ struct PlotEntry {
 // Matched pair: (sorted_L_index, sorted_R_index)
 using MatchPair = std::pair<uint32_t, uint32_t>;
 
+// PD entry: (original_sorted_pos, delta)
+using PDEntry = std::pair<uint32_t, uint16_t>;
+
 // Timing info for one table
 struct TableTiming {
     double sort_ms = 0;
@@ -32,6 +35,26 @@ struct TableTiming {
     double build_ms = 0;
     uint32_t n_entries = 0;
     uint32_t n_matches = 0;
+};
+
+// Full plot data collected during pipeline execution
+struct PlotData {
+    // Final Y values (table 9 entries = proof targets)
+    std::vector<uint32_t> final_Y;
+    
+    // Per-table entries (table_entries[0] = F1, ..., table_entries[7] = F9)
+    std::vector<std::vector<PlotEntry>> table_entries;
+    
+    // PD data: PD[table_idx] = vector of PD entries for that table
+    // PD[0] corresponds to table 2→1 (from sorted positions in table 1)
+    // PD[t-2] corresponds to table t→t-1 (matching table t to its predecessor)
+    std::vector<std::vector<PDEntry>> pd_data;
+    
+    // X pairs for table 2 (original X values for proof reconstruction)
+    std::vector<uint32_t> x_pairs;
+    
+    // Per-table timings
+    std::vector<TableTiming> timings;
 };
 
 class PlotPipeline {
@@ -46,30 +69,28 @@ public:
     // Initialize kernels
     void init();
 
-    // Compute F1 for all X values (Phase 1)
+    // Compute F1 with batch X values
     void compute_f1(
         const std::vector<uint32_t>& X_values,
         const uint32_t* plot_id,
         std::vector<uint32_t>& Y_out,
         std::vector<uint32_t>& M_out);
 
-    // Compute one table (F2-F9): sort → match → hash → build next
+    // Process one table (F2-F9): sort → match → hash → build next
     // entries: in/out — sorted in place, replaced with next table entries
-    // Returns match pairs and timing info
+    // pd_out: output PD data (one entry per matched pair)
+    // x_pairs_out: for table 2, original X values (empty otherwise)
+    // Returns timing info
     TableTiming process_table(
-        std::vector<PlotEntry>& entries);
+        std::vector<PlotEntry>& entries,
+        const std::vector<uint32_t>* x_values_orig = nullptr,  // for table 2 X pairs
+        std::vector<PDEntry>* pd_out = nullptr);
 
-    // Full pipeline: F1 → F2 → ... → F9
-    // X_values: input X values
-    // plot_id: 32-byte plot identifier
-    // Run full F1→F9 pipeline
-    // Returns per-table entries and timing info
+    // Run full pipeline with PD and X-pair collection
     void run_full_pipeline(
         const std::vector<uint32_t>& X_values,
         const uint32_t* plot_id,
-        std::vector<std::vector<PlotEntry>>& table_entries,
-        std::vector<std::vector<MatchPair>>& table_matches,
-        std::vector<TableTiming>& timings);
+        PlotData& result);
 
 private:
     GPUDevice& gpu;
@@ -80,7 +101,7 @@ private:
     cl_kernel k_f1 = nullptr;
     cl_kernel k_table_hash = nullptr;
 
-    // GPU buffers (reused across tables)
+    // GPU buffers (reused)
     cl_mem f1_X_buf = nullptr;
     cl_mem f1_ID_buf = nullptr;
     cl_mem f1_Y_buf = nullptr;
@@ -98,13 +119,10 @@ private:
     void ensure_hash_buffers(size_t num_matches);
     void load_kernels();
 
-    // Sort entries by Y (8-bit radix + std::sort within buckets)
-    // Uses entries[n] = {(Y, idx)}
-    // On output: entries are sorted by Y with metadata tiebreaker
+    // Sort entries by Y
     void sort_entries_by_y(std::vector<PlotEntry>& entries);
 
-    // Match Y,Y+1 pairs within sorted entries
-    // Returns (sorted_L_idx, sorted_R_idx)
+    // Match Y,Y+1 pairs
     std::vector<MatchPair> match_entries(
         const std::vector<PlotEntry>& entries);
 };

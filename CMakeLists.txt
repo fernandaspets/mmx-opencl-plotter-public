@@ -29,6 +29,8 @@ include_directories(
     ${MMX_NODE_PATH}/uint256_t
     ${MMX_NODE_PATH}/uint256_t/uint128_t
     ${MMX_NODE_PATH}/lib/secp256k1/include
+    ${MMX_NODE_PATH}/lib/libbech32/include
+    ${MMX_NODE_PATH}/RNP/include
 )
 
 # Link directories
@@ -87,9 +89,14 @@ add_test(NAME test_sha512_gpu COMMAND test_sha512_gpu)
 set_target_properties(test_sha512_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_full_pipeline tests/test_full_pipeline.cpp ${GPU_SOURCES} src/plot_pipeline.cpp)
-target_link_libraries(test_full_pipeline PRIVATE ${OpenCL_LIBRARIES})
+target_link_libraries(test_full_pipeline PRIVATE ${OpenCL_LIBRARIES} mmx_iface vnx_base_static)
 add_test(NAME test_full_pipeline COMMAND test_full_pipeline)
 set_target_properties(test_full_pipeline PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Plot writer object library (links against mmx-node)
+add_library(plot_writer OBJECT src/plot_writer.cpp)
+target_link_libraries(plot_writer PUBLIC mmx_iface vnx_base_static)
+target_include_directories(plot_writer PUBLIC src ${OpenCL_INCLUDE_DIRS})
 
 add_executable(test_table_pipeline tests/test_table_pipeline.cpp ${GPU_SOURCES})
 target_link_libraries(test_table_pipeline PRIVATE ${OpenCL_LIBRARIES} ssl crypto)
