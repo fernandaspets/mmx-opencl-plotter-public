@@ -61,6 +61,17 @@ set_target_properties(test_plot_codec PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
 
+# GPU device source (shared by GPU tests)
+set(GPU_SOURCES src/gpu_device.cpp)
+
+# F1 kernel test (requires GPU)
+add_executable(test_f1 tests/test_f1.cpp ${GPU_SOURCES})
+target_link_libraries(test_f1 PRIVATE ${OpenCL_LIBRARIES})
+add_test(NAME test_f1 COMMAND test_f1)
+set_target_properties(test_f1 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+)
+
 # Test with MMX deps
 add_executable(test_pid_derive tests/test_pid_derive.cpp)
 target_link_libraries(test_pid_derive PRIVATE
