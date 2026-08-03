@@ -80,6 +80,19 @@ set_target_properties(test_table_hash PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
 
+# Full table pipeline test (sort + match + GPU hash vs CPU)
+add_executable(test_sha512_gpu tests/test_sha512_gpu.cpp ${GPU_SOURCES})
+target_link_libraries(test_sha512_gpu PRIVATE ${OpenCL_LIBRARIES} ssl crypto)
+add_test(NAME test_sha512_gpu COMMAND test_sha512_gpu)
+set_target_properties(test_sha512_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_table_pipeline tests/test_table_pipeline.cpp ${GPU_SOURCES})
+target_link_libraries(test_table_pipeline PRIVATE ${OpenCL_LIBRARIES} ssl crypto)
+add_test(NAME test_table_pipeline COMMAND test_table_pipeline)
+set_target_properties(test_table_pipeline PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+)
+
 # Test with MMX deps
 add_executable(test_pid_derive tests/test_pid_derive.cpp)
 target_link_libraries(test_pid_derive PRIVATE
