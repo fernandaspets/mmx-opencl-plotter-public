@@ -5183,6 +5183,7 @@ bool timing_detail = false;
 
 int main(int argc, char** argv)
 {
+ try {
     auto total_start = my_time_ms();
     std::string output_dir = "./";  // default: current directory
     std::string plot_name;
@@ -5633,6 +5634,13 @@ std::vector<std::vector<PDEntry>> pd_all;
     
     return 0;
     } // end else (flat pipeline)
+ } catch(const std::exception& e) {
+    std::cerr << "\n[FATAL] " << e.what() << std::endl;
+    return 1;
+ } catch(...) {
+    std::cerr << "\n[FATAL] Unknown exception" << std::endl;
+    return 1;
+ }
 }
 
 
