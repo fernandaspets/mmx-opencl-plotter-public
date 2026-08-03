@@ -2302,15 +2302,40 @@ void compute_full_pipeline(
         
         auto t_meta_start = my_time_ms();
         
-        // Flatten LR pairs — pre-allocated with thread offsets (parallel)
-        std::vector<std::pair<uint32_t, uint32_t>> all_lr(total_matches);
-        {
-            std::vector<size_t> thread_offsets(nthreads);
-            size_t offset = 0;
+        // Compute thread offsets for direct LR_flat build (fuses flatten + lr_flat_build)
+        std::vector<size_t> thread_offsets(nthreads);
+        size_t offset = 0;
+        for(int ti = 0; ti < nthreads; ti++) {
+            thread_offsets[ti] = offset;
+            offset += thread_lr[ti].size();
+        }
+        
+        // GPU hash — GPU-resident M_curr (Module I)
+        std::vector<uint32_t> Y_results;
+        std::vector<uint32_t> M_results;  // only used in fallback mode
+        std::vector<std::pair<uint32_t, uint32_t>> all_lr;  // needed for non-resident path
+        if(use_gpu_resident && total_matches > 0) {
+            // FUSED: Build LR_flat directly from thread_lr + entries (skips all_lr intermediate)
+            std::vector<uint32_t> LR_flat(total_matches * 2);
+            #pragma omp parallel for schedule(static)
             for(int ti = 0; ti < nthreads; ti++) {
-                thread_offsets[ti] = offset;
-                offset += thread_lr[ti].size();
+                const auto& src = thread_lr[ti];
+                size_t off = thread_offsets[ti];
+                for(size_t i = 0; i < src.size(); i++) {
+                    LR_flat[(off + i) * 2] = entries[src[i].first].second;
+                    LR_flat[(off + i) * 2 + 1] = entries[src[i].second].second;
+                }
             }
+            auto t_gpu_start = my_time_ms();
+            uint32_t num_total = (uint32_t)entries.size();
+            gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
+                KMASK, num_total);
+            clFinish(gpu_plotter.queue);
+            auto t_gpu_end = my_time_ms();
+            if(t == 4) std::cerr << "[T" << t << "] match=" << (t_match_end - t_sorted) << "ms fused_lr=" << (t_gpu_start - t_meta_start) << "ms gpu_hash=" << (t_gpu_end - t_gpu_start) << "ms" << std::flush;
+            
+            // Build all_lr from thread_lr (needed for PD build later)
+            all_lr.resize(total_matches);
             #pragma omp parallel for schedule(static)
             for(int ti = 0; ti < nthreads; ti++) {
                 const auto& src = thread_lr[ti];
@@ -2319,30 +2344,6 @@ void compute_full_pipeline(
                     all_lr[off + i] = src[i];
                 }
             }
-        }
-        auto t_flatten_lr = my_time_ms();
-        if(t == 4) std::cerr << "[T" << t << "] match=" << (t_match_end - t_sorted) << "ms flatten=" << (t_flatten_lr - t_meta_start) << "ms" << std::flush;
-        
-        // GPU hash — GPU-resident M_curr (Module I)
-        // M_curr stays on GPU, only upload LR_pairs, only download Y_out
-        std::vector<uint32_t> Y_results;
-        std::vector<uint32_t> M_results;  // only used in fallback mode
-        if(use_gpu_resident && total_matches > 0) {
-            // Build LR pairs (P1, P2 = original indices into M_curr)
-            std::vector<uint32_t> LR_flat(total_matches * 2);
-            #pragma omp parallel for schedule(static)
-            for(size_t i = 0; i < total_matches; i++) {
-                const auto& [sorted_L, sorted_R] = all_lr[i];
-                LR_flat[i * 2] = entries[sorted_L].second;
-                LR_flat[i * 2 + 1] = entries[sorted_R].second;
-            }
-            auto t_gpu_start = my_time_ms();
-            uint32_t num_total = (uint32_t)entries.size();
-            gpu_plotter.gpu_hash_table_lr_resident(M_curr_gpu, LR_flat, Y_results, M_out_gpu,
-                KMASK, num_total);
-            clFinish(gpu_plotter.queue);
-            auto t_gpu_end = my_time_ms();
-            if(t == 4) std::cerr << "[T" << t << "] lr_flat_build=" << (t_gpu_start - t_flatten_lr) << "ms gpu_hash=" << (t_gpu_end - t_gpu_start) << "ms" << std::flush;
             
             // Swap: M_curr_gpu ↔ M_out_gpu (no data transfer!)
             std::swap(M_curr_gpu, M_out_gpu);
@@ -2352,6 +2353,16 @@ void compute_full_pipeline(
             // For now, update num_total for next table
             // (M_out_gpu now contains the new M_curr for next table)
         } else {
+            // Fallback: build all_lr first (not fused in this path)
+            all_lr.resize(total_matches);
+            #pragma omp parallel for schedule(static)
+            for(int ti = 0; ti < nthreads; ti++) {
+                const auto& src = thread_lr[ti];
+                size_t off = thread_offsets[ti];
+                for(size_t i = 0; i < src.size(); i++) {
+                    all_lr[off + i] = src[i];
+                }
+            }
             // Fallback: upload M_curr + download M_out each table
             if(gpu_plotter.hash_lr_kernel && total_matches > 0) {
                 std::vector<uint32_t> LR_flat(total_matches * 2);
@@ -4615,13 +4626,20 @@ void compute_f2_f9_chunked(
         std::cout << "\n[T" << t << "] " << total << " entries (" << elapsed << " sec)" << std::endl;
         
         // Save PD for this table: collect (Y, sorted_pos, delta) from dst
+        // Parallelized: pre-compute bucket offsets, pre-allocate, then fill in parallel
         auto tpd0 = my_time_ms();
-        pd_all[t].clear();
-        pd_all[t].reserve(total);
-        if(t == 2) {
-            x_pairs_all.clear();
-            x_pairs_all.reserve(total);
+        pd_all[t].resize(total);
+        if(t == 2) x_pairs_all.resize(total);
+        
+        // Compute starting offset for each bucket
+        std::vector<uint32_t> bucket_offsets(num_buckets);
+        uint32_t offset = 0;
+        for(int y = 0; y < num_buckets; y++) {
+            bucket_offsets[y] = offset;
+            offset += dst.counts[y];
         }
+        
+        #pragma omp parallel for schedule(dynamic, 1)
         for(int y = 0; y < num_buckets; y++) {
             uint32_t cnt = dst.counts[y];
             if(cnt == 0) continue;
@@ -4630,6 +4648,7 @@ void compute_f2_f9_chunked(
             bool has_pd = (dst.pd_buckets[y].size() >= (size_t)cnt * 2);
             const uint32_t* xp = (t == 2 && y < (int)dst.x_pairs_buckets.size()) ? dst.x_pairs_buckets[y].data() : nullptr;
             bool has_xp = (t == 2 && y < (int)dst.x_pairs_buckets.size() && dst.x_pairs_buckets[y].size() >= (size_t)cnt * 2);
+            uint32_t pos = bucket_offsets[y];
             for(uint32_t i = 0; i < cnt; i++) {
                 uint32_t Y = 0;
                 for(int j = 0; j < n_meta; j++) Y ^= meta[i * n_meta + j];
@@ -4643,9 +4662,9 @@ void compute_f2_f9_chunked(
                     entry.left_pos = 0;
                     entry.right_pos = 0;
                 }
-                pd_all[t].push_back(entry);
+                pd_all[t][pos + i] = entry;
                 if(t == 2 && has_xp) {
-                    x_pairs_all.push_back({xp[i * 2], xp[i * 2 + 1]});
+                    x_pairs_all[pos + i] = {xp[i * 2], xp[i * 2 + 1]};
                 }
             }
         }
