@@ -33,18 +33,7 @@ static void interrupt_handler(int) {
     else { sig_interrupt = true; }
 }
 
-static std::string hex_str(const uint8_t* data, size_t len) {
-    std::string out(len * 2, ' ');
-    for(size_t i = 0; i < len; i++) {
-        out[i*2]   = "0123456789ABCDEF"[data[i] >> 4];
-        out[i*2+1] = "0123456789ABCDEF"[data[i] & 0xF];
-    }
-    return out;
-}
-
 int main(int argc, char** argv) {
-    // Silence unused function warning
-    (void)hex_str;
 
     int ksize = KSIZE;
     std::string farmer_key_str;
@@ -238,7 +227,8 @@ int main(int argc, char** argv) {
     try {
         writer.write_file(output_path,
             (const uint8_t*)plot_id.data(), fk33, result,
-            have_contract ? (const uint8_t*)contract.data() : nullptr);
+            have_contract ? (const uint8_t*)contract.data() : nullptr,
+            (const uint8_t*)seed_bytes.data());
     } catch(const std::exception& e) {
         std::cerr << "Write failed: " << e.what() << std::endl;
         return 1;

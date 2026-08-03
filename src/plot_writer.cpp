@@ -24,8 +24,8 @@ void PlotWriter::compute_header(
     header->park_size_pd = PARK_SIZE_PD;
     header->park_size_meta = PARK_SIZE_META;
 
-    // X pairs: two values per entry (X_L and X_R), each x2size bits
-    header->park_bytes_x = cdiv(PARK_SIZE_X * x2size * 2, 8);
+    // x2size = 2 * (ksize - xbits) - 1 = LPX2SIZE (matching reference)
+    header->park_bytes_x = cdiv(PARK_SIZE_X * x2size, 8);
     header->park_bytes_meta = cdiv(PARK_SIZE_META * ksize * N_META_OUT, 8);
     header->park_bytes_y = 4 + (uint32_t)std::ceil((PARK_SIZE_Y - 1) * MAX_AVG_YDELTA_BITS * 1.2 / 8.0);
     header->park_bytes_pd = cdiv(PARK_SIZE_PD * ksize, 8)
@@ -83,7 +83,8 @@ void PlotWriter::write_file(
     const uint8_t* plot_id_32,
     const uint8_t* farmer_key_33,
     const PlotData& data,
-    const uint8_t* contract_32)
+    const uint8_t* contract_32,
+    const uint8_t* seed_32)
 {
     // Sort final Y values for delta encoding
     std::vector<uint32_t> sorted_Y = data.final_Y;
@@ -226,19 +227,17 @@ void PlotWriter::write_file(
 void PlotWriter::encode_y_park(std::vector<uint8_t>& park, const uint32_t* Y, size_t count,
                                 uint32_t max_bytes)
 {
+    // Matching reference encoding:
+    //   bits [0, ksize):     first Y value
+    //   bits [32, end):      Y deltas via encode_symbol (gap reserved for 4-byte header)
     std::vector<uint64_t> bit_buf(max_bytes * 2 / sizeof(uint64_t) + 4, 0);
 
-    // First Y value: KSIZE bits
+    // First Y value at bit 0 (KSIZE bits)
     write_bits(bit_buf, Y[0], 0, ksize);
 
-    uint64_t bit_offset = 32;  // start at byte 4 (after 4-byte header area)
-    // Actually the first Y is just at bit 0 with ksize bits
-    // Let me redo: bit 0 = first Y value
+    // Deltas start at bit 32 (matching reference's delta_offset = park_begin + 32)
+    uint64_t bit_offset = 32;
 
-    // Reset — write first Y at bit 0
-    bit_offset = ksize;
-
-    // Y deltas using encode_symbol
     for(size_t i = 1; i < count; i++) {
         uint32_t delta = Y[i] - Y[i-1];
         if(delta > 255) {
@@ -249,7 +248,6 @@ void PlotWriter::encode_y_park(std::vector<uint8_t>& park, const uint32_t* Y, si
         bit_offset += nbits;
     }
 
-    // Copy to byte buffer
     uint64_t byte_count = (bit_offset + 7) / 8;
     if(byte_count > max_bytes) {
         throw std::runtime_error("Y park overflow: " + std::to_string(byte_count)
@@ -285,18 +283,26 @@ void PlotWriter::encode_pd_park(std::vector<uint8_t>& park,
                                  const std::vector<PDEntry>& entries,
                                  uint32_t max_bytes)
 {
+    // Matching reference encoding:
+    //   bits [0, N*ksize):       all positions (contiguous, each KSIZE bits)
+    //   bits [N*ksize, end):     all deltas (via encode_symbol)
+    const size_t N = entries.size();
     std::vector<uint64_t> bit_buf(max_bytes * 2 / sizeof(uint64_t) + 4, 0);
-    uint64_t bit_offset = 0;
 
-    for(const auto& [pos, delta] : entries) {
-        write_bits(bit_buf, pos, bit_offset, ksize);
-        bit_offset += ksize;
-        auto [dbits, dnbits] = encode_symbol((uint8_t)delta);
-        write_bits(bit_buf, dbits, bit_offset, dnbits);
-        bit_offset += dnbits;
+    // Write all positions first
+    for(size_t i = 0; i < N; i++) {
+        write_bits(bit_buf, entries[i].first, uint64_t(i) * ksize, ksize);
     }
 
-    uint64_t byte_count = (bit_offset + 7) / 8;
+    // Write all deltas after positions
+    uint64_t delta_offset = uint64_t(N) * ksize;
+    for(size_t i = 0; i < N; i++) {
+        auto [dbits, dnbits] = encode_symbol((uint8_t)entries[i].second);
+        write_bits(bit_buf, dbits, delta_offset, dnbits);
+        delta_offset += dnbits;
+    }
+
+    uint64_t byte_count = (delta_offset + 7) / 8;
     if(byte_count > max_bytes) {
         throw std::runtime_error("PD park overflow: " + std::to_string(byte_count)
             + " > " + std::to_string(max_bytes));
@@ -304,21 +310,44 @@ void PlotWriter::encode_pd_park(std::vector<uint8_t>& park,
     std::memcpy(park.data(), bit_buf.data(), std::min(byte_count, (uint64_t)max_bytes));
 }
 
+// Match reference's get_x_enc: S(a) * b where a+b = x and |a-b| <= 1
+static inline uint64_t get_x_enc(uint64_t x) {
+    uint64_t a = x;
+    uint64_t b = x - 1;
+    if(a % 2 == 0) {
+        a /= 2;
+    } else {
+        b /= 2;
+    }
+    return a * b;
+}
+
+// Match reference's calc_line_point: encodes two values into one
+static inline uint64_t calc_line_point(uint64_t x, uint64_t y) {
+    const uint64_t mx = std::max(x, y);
+    const uint64_t mn = std::min(x, y);
+    return get_x_enc(mx) + mn;
+}
+
 void PlotWriter::encode_x_park(std::vector<uint8_t>& park,
                                 const std::vector<uint32_t>& x_pairs,
                                 size_t start, size_t count,
                                 uint32_t max_bytes)
 {
+    // x2size = 2 * (ksize - xbits) - 1 = LPX2SIZE (bits per encoded X pair)
+    const int LPX2SIZE = x2size;
     std::vector<uint64_t> bit_buf(max_bytes * 2 / sizeof(uint64_t) + 4, 0);
     uint64_t bit_offset = 0;
 
     const uint32_t shift = xbits;  // compression level = bits to drop
 
     for(size_t i = start * 2; i < (start + count) * 2 && i < x_pairs.size(); i += 2) {
-        write_bits(bit_buf, x_pairs[i] >> shift, bit_offset, x2size);
-        bit_offset += x2size;
-        write_bits(bit_buf, x_pairs[i+1] >> shift, bit_offset, x2size);
-        bit_offset += x2size;
+        // Match reference: calc_line_point(X_L >> C, X_R >> C), encode in LPX2SIZE bits
+        const uint64_t x_shifted = x_pairs[i] >> shift;
+        const uint64_t y_shifted = x_pairs[i+1] >> shift;
+        const uint64_t combined = calc_line_point(x_shifted, y_shifted);
+        write_bits(bit_buf, combined, bit_offset, LPX2SIZE);
+        bit_offset += LPX2SIZE;
     }
 
     uint64_t byte_count = (bit_offset + 7) / 8;

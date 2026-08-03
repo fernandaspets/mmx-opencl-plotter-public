@@ -35,7 +35,8 @@ public:
         const uint8_t* plot_id_32,
         const uint8_t* farmer_key_33,
         const PlotData& data,
-        const uint8_t* contract_32 = nullptr);  // optional contract for NFT
+        const uint8_t* contract_32 = nullptr,
+        const uint8_t* seed_32 = nullptr);  // random seed for header
 
 private:
     uint32_t ksize;
