@@ -1900,16 +1900,17 @@ void compute_gpu_bulk(
                                 clEnqueueReadBuffer(gpu_plotter.queue, pos_buf[1], CL_TRUE, 0, total_entries * 4, pos_t_host.data(), 0, nullptr, nullptr);
                             }
                         LR_all[t].resize(num_matches);
-            std::vector<uint32_t> Y_L_all_t(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_all[t][i] = {lr_sorted_host[i * 2], lr_sorted_host[i * 2 + 1]};
-                Y_L_all_t[i] = y_l_host[i];
             }
-            // Sort by Y_L for PD in sorted order
+            // Download Y_out (hash output Y) for sorting PD
+            std::vector<uint32_t> y_out_host(num_matches);
+            clEnqueueReadBuffer(gpu_plotter.queue, Y_out, CL_TRUE, 0, num_matches * 4, y_out_host.data(), 0, nullptr, nullptr);
+            // Sort by Y_out (hash output Y) for PD in sorted order — same as flat pipeline
             std::vector<std::pair<uint32_t, uint32_t>> match_indices(num_matches);
-            for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {Y_L_all_t[i], i};
-                        radix_sort_pairs(match_indices, KSIZE);
-                        // Reorder LR_all[t] by sorted order
+            for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {y_out_host[i] & kmask, i};
+            radix_sort_pairs(match_indices, KSIZE);
+            // Reorder LR_all[t] by sorted order
             std::vector<std::pair<uint32_t, uint32_t>> LR_sorted_order(num_matches);
             for(uint32_t i = 0; i < num_matches; i++) {
                 LR_sorted_order[i] = LR_all[t][match_indices[i].second];
