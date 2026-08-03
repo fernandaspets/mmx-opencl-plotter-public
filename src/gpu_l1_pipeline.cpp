@@ -1,4 +1,4 @@
-// GPU L1-bucket pipeline v2 — GLOBAL EVAL (working on NVIDIA where no AMD driver bug)
+// GPU L1-bucket pipeline v2 — global eval
 // Phase 1: scatter+sort+match ALL buckets batched (no per-bucket sync)
 // Phase 2: ONE global eval using aCI + global LR indices
 // scatter_2 reads from aCI at (x + bucket_offset) using GLOBAL access
@@ -105,7 +105,6 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             uint32_t cy=cnt[y],bo=y*MB;
             clEnqueueFillBuffer(g.queue,SC,&z,4,0,NS*4,0,0,0);
             uint32_t cyu=cy,m2=M2;
-            // scatter_2 reads from aCI at (x + bucket_offset) * N_META + i
             clSetKernelArg(k2,0,8,&PY);clSetKernelArg(k2,1,8,&SC);
             clSetKernelArg(k2,2,8,0);clSetKernelArg(k2,3,8,&aCI);
             clSetKernelArg(k2,4,4,&cyu);clSetKernelArg(k2,5,4,&m2);
@@ -133,31 +132,9 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
         }
         g.finish(); // Wait for Phase 1
 
-        // DEBUG: read first 3 LR pairs and C_in metadata
-        if(t==2){
-            std::vector<uint32_t> lr3(6);
-            clEnqueueReadBuffer(g.queue,LR,CL_TRUE,0,24,lr3.data(),0,0,0);
-            uint32_t p10=lr3[0],p20=lr3[1];
-            std::vector<uint32_t> m1(N_META),m2(N_META);
-            clEnqueueReadBuffer(g.queue,aCI,CL_TRUE,(size_t)p10*N_META*4,N_META*4,m1.data(),0,0,0);
-            clEnqueueReadBuffer(g.queue,aCI,CL_TRUE,(size_t)p20*N_META*4,N_META*4,m2.data(),0,0,0);
-            uint32_t y1=0,y2=0;
-            for(int di=0;di<N_META;di++){y1^=m1[di];y2^=m2[di];}
-            std::cout<<"[DBG] LR[0]="<<p10<<","<<p20<<" Y1="<<(y1&KM)<<" Y2="<<(y2&KM)<<"\n";
-            // Also check if both positions are within buffer bounds
-            size_t buf_sz = (size_t)NL*MB*N_META*4;
-            bool p1_ok = (size_t)p10*N_META*4 + N_META*4 <= buf_sz;
-            bool p2_ok = (size_t)p20*N_META*4 + N_META*4 <= buf_sz;
-            std::cout<<"[DBG] P1 bounds: "<<(p1_ok?"OK":"OVERFLOW")<<" P2: "<<(p2_ok?"OK":"OVERFLOW")<<"\n";
-            uint32_t nmt=0;
-            clEnqueueReadBuffer(g.queue,NM,CL_TRUE,0,4,&nmt,0,0,0);
-            std::cout<<"[DBG] NM="<<nmt<<"\n";
-            nmt = nmt;
-        }
-
         // Phase 2: ONE global eval using aCI + global LR indices
-        // uint32_t nmt=0; // already set above
-        // clEnqueueReadBuffer(g.queue,NM,CL_TRUE,0,4,&nmt,0,0,0); // skip this
+        uint32_t nmt=0;
+        clEnqueueReadBuffer(g.queue,NM,CL_TRUE,0,4,&nmt,0,0,0);
 
         if(nmt>0){
             uint32_t mx=MB,tu=(uint32_t)t,wy=0,wc=1,hp=(t>=3),hx=(t==2);

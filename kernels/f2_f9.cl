@@ -487,26 +487,10 @@ __kernel void eval_p1_tx(
     const uint P_1 = LR_i.x;
     const uint P_2 = LR_i.y;
 
-    // AMD OpenCL driver workaround: load through local memory to prevent
-    // optimizer from merging/coalescing random global reads
-    // (Driver returns wrong data for large-buffer random reads, verified
-    //  by SHA-512 output having 98% concentration in one bucket vs CPU reference)
-    // 7168 uint32 = 28672 bytes LDS per work-group (within 48KB limit)
-    __local uint lr_buf[7168];
-    const uint lid = get_local_id(0);
-    const uint base = lid * 2 * N_META;
-    for (int i = 0; i < N_META; i++) {
-        lr_buf[base + i] = C_in[P_1 * N_META + i];
-        lr_buf[base + N_META + i] = C_in[P_2 * N_META + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    
-    // Now pack into msg64 from local memory (preventing optimizer from
-    // re-reading global memory with incorrect coalescing)
     ulong msg64[64] = {};
     for (int i = 0; i < N_META; i++) {
-        msg64[i / 2] |= (ulong)lr_buf[base + i] << ((i % 2) * 32);
-        msg64[(N_META + i) / 2] |= (ulong)lr_buf[base + N_META + i] << (((N_META + i) % 2) * 32);
+        msg64[i / 2] |= (ulong)C_in[P_1 * N_META + i] << ((i % 2) * 32);
+        msg64[(N_META + i) / 2] |= (ulong)C_in[P_2 * N_META + i] << (((N_META + i) % 2) * 32);
     }
     ulong hash[8] = {};
     sha512(msg64, 2 * N_META * 4, hash);
