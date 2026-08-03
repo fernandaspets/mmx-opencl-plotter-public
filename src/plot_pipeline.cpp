@@ -365,11 +365,12 @@ TableTiming PlotPipeline::process_table(
         // We need to pass this out separately — the caller handles it
     }
 
-    // Build next table entries
+    // Build next table entries with original indices
     entries.resize(n_matches);
     #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < n_matches; i++) {
         entries[i].Y = Y_out[i];
+        entries[i].orig_idx = (uint32_t)i;  // tracks position in this table's match list
         for(int j = 0; j < N_META; j++) {
             entries[i].M[j] = M_out[i * N_META + j];
         }
@@ -399,11 +400,12 @@ void PlotPipeline::run_full_pipeline(
     std::vector<uint32_t> Y_flat, M_flat;
     compute_f1(X_values, plot_id, Y_flat, M_flat);
 
-    // Build table 1 entries
+    // Build table 1 entries with original indices
     std::vector<PlotEntry> entries(num_x);
     #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < num_x; i++) {
         entries[i].Y = Y_flat[i];
+        entries[i].orig_idx = (uint32_t)i;
         for(int j = 0; j < N_META; j++) {
             entries[i].M[j] = M_flat[i * N_META + j];
         }
@@ -417,10 +419,12 @@ void PlotPipeline::run_full_pipeline(
         
         std::cout << "[T" << t << "] " << entries.size() << " entries..." << std::flush;
         
-        // For table 2, pass X values for X-pair collection
-        std::vector<uint32_t> x_pairs;
+        // Save sorted entries BEFORE processing for X-pair lookup
+        std::vector<PlotEntry> prev_sorted_entries;
         if(t == 2) {
-            x_pairs.reserve(entries.size());  // will be filled during matching
+            // Sort a copy to get the order that process_table will use
+            prev_sorted_entries = entries;
+            sort_entries_by_y(prev_sorted_entries);
         }
         
         auto tt = process_table(entries,
@@ -431,18 +435,39 @@ void PlotPipeline::run_full_pipeline(
         result.table_entries.push_back(entries);
         result.pd_data.push_back(table_pd);
         
-        // For table 2: compute X pairs from the original X values
+        // For table 2: compute X pairs from original indices
         if(t == 2 && tt.n_matches > 0) {
-            // Entries are now the sorted table 2 matches
-            // The PD entries contain (sorted_pos_L, delta)
-            // We need to map sorted positions to original X values
-            // entries at this point = sorted version of previous table
-            // Wait — entries are now sorted by Y (post-sort_entries_by_y)
-            // The PD has sorted_pos_L — we need to map to original index
-            // Actually, the sorting reorders the entries. But the PD stores
-            // indices into this SORTED order. So we need to track the 
-            // original indices through the sort.
-            std::cout << " (X pairs not yet tracked)" << std::flush;
+            // entries are sorted by Y from the PRECEDING process_table call
+            // Wait — entries in the NEW table are in match order, not sorted by Y!
+            // We need to track which match each sorted entry came from.
+            // The match pairs are: (sorted_pos_L, sorted_pos_R)
+            // sorted_pos_L refers to position in the SORTED previous table
+            // Let me use orig_idx to reconstruct:
+            // After process_table returns, entries[i] has orig_idx = match index
+            // We need to map: match_idx → (X_L, X_R) → (orig_idx of L in table 1, orig_idx of R in table 1)
+            // The PD table[0] has entries: (sorted_pos_L_in_prev, delta)
+            // For match i: sorted_pos_L = pd_data[0][i].first
+            //              sorted_pos_R = sorted_pos_L + pd_data[0][i].second + 1
+            // X value for sorted_pos_L = X_values[sorted_to_orig_map[sorted_pos_L]]
+            
+            // Build map from sorted position to original X value
+            std::vector<uint32_t> sorted_to_x(prev_sorted_entries.size());
+            for(size_t j = 0; j < prev_sorted_entries.size(); j++) {
+                sorted_to_x[j] = X_values[prev_sorted_entries[j].orig_idx];
+            }
+            
+            // Now for each match, get X values
+            result.x_pairs.resize(tt.n_matches * 2);
+            for(uint32_t j = 0; j < tt.n_matches; j++) {
+                auto& pd = result.pd_data.back()[j];
+                uint32_t sorted_L = pd.first;
+                uint32_t delta = pd.second;
+                uint32_t sorted_R = sorted_L + delta + 1;
+                
+                result.x_pairs[j * 2]     = sorted_to_x[sorted_L];
+                result.x_pairs[j * 2 + 1] = sorted_to_x[sorted_R];
+            }
+            std::cout << " (" << result.x_pairs.size()/2 << " X pairs)" << std::flush;
         }
         
         std::cout << " " << tt.n_matches << " matches (sort=" << tt.sort_ms

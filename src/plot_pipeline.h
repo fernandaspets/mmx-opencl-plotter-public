@@ -14,9 +14,10 @@
 
 namespace mmx {
 
-// One table entry: (Y, metadata[0..N_META-1])
+// One table entry: (Y, metadata[0..N_META-1], orig_idx)
 struct PlotEntry {
     uint32_t Y;
+    uint32_t orig_idx;  // original index in the PREVIOUS table
     std::array<uint32_t, N_META> M;
 };
 
