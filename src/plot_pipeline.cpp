@@ -562,10 +562,8 @@ TableTiming PlotPipeline::process_table(
     std::vector<uint32_t> Y_out(n_matches);
     std::vector<uint32_t> M_out;
 
-    // Disable GPU-resident hash on AMD (driver returns wrong data for large-buffer random reads)
-    // Keep enabled on NVIDIA where it works correctly.
-    bool use_gpu_res_hash = use_gpu_resident && M_curr_gpu && M_out_gpu && k_table_hash_lr;
-    if(use_gpu_res_hash && !is_amd) {
+    // GPU-resident hash disabled (AMD driver returns wrong data for large-buffer random reads)
+    if(false) {
         // Build LR_flat (DISABLED — AMD driver returns wrong data for large-buffer random reads) with ORIGINAL indices (entries[i].orig_idx references M_curr_gpu)
         std::vector<uint32_t> LR_flat(n_matches * 2);
         #pragma omp parallel for schedule(static)
