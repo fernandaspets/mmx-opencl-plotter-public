@@ -1,30 +1,7 @@
-# Build artifacts
 build/
 *.o
 *.so
 *.a
-
-# Compiled test binaries
-tests/test_f1_compare
-tests/test_sha512_gpu
-tests/test_sha512_step
-tests/test_tablehash
-tests/test_memhash_gpu
-tests/test_memhash_iter
-tests/test_memhash_multi
-
-# Copied kernels (runtime)
-build/*.cl
-
-# Temporary files
+compile_commands.json
+*.plot
 *.tmp
-*.bak
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
