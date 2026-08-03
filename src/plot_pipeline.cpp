@@ -577,6 +577,8 @@ TableTiming PlotPipeline::process_table(
         if(!gpu_ok) use_gpu_lr = false;
     }
     if(use_gpu_lr) {
+        // Ensure buffers have enough capacity for this table (entries grow)<
+        ensure_gpu_resident_buffers(std::max((size_t)entries.size(), n_matches));
         // Build LR_flat (DISABLED — AMD driver returns wrong data for large-buffer random reads) with ORIGINAL indices (entries[i].orig_idx references M_curr_gpu)
         std::vector<uint32_t> LR_flat(n_matches * 2);
         #pragma omp parallel for schedule(static)
@@ -588,6 +590,18 @@ TableTiming PlotPipeline::process_table(
         auto t_ext = std::chrono::high_resolution_clock::now();
         timing.extract_ms = std::chrono::duration<double, std::milli>(t_ext - t3).count();
 
+        // Check max orig_idx vs entries size
+        {
+            uint32_t max_orig = 0;
+            for(size_t ci = 0; ci < n_matches; ci++) {
+                if(LR_flat[ci*2] > max_orig) max_orig = LR_flat[ci*2];
+                if(LR_flat[ci*2+1] > max_orig) max_orig = LR_flat[ci*2+1];
+            }
+            if(max_orig >= entries.size()) {
+                std::cerr << "[LR] BOUNDS: max_orig=" << max_orig << " >= entries.size()=" << entries.size() << " (cap=" << gpu_resident_capacity << ")" << std::endl;
+            }
+        }
+
         // Upload LR pairs (2 uint32s per match vs 28 for L_meta + 28 for R_meta)
         cl_mem LR_buf = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             n_matches * 2 * sizeof(uint32_t), LR_flat.data(), &err);
@@ -596,7 +610,7 @@ TableTiming PlotPipeline::process_table(
             n_matches * sizeof(uint32_t), nullptr, &err);
         GPUDevice::check(err, "Y_buf_lr");
 
-        uint32_t n_total = (uint32_t)entries.size();
+        uint32_t n_total_local = (uint32_t)entries.size();
         uint32_t n_match = (uint32_t)n_matches;
         clSetKernelArg(k_table_hash_lr, 0, sizeof(cl_mem), &M_curr_gpu);
         clSetKernelArg(k_table_hash_lr, 1, sizeof(cl_mem), &LR_buf);
@@ -604,7 +618,7 @@ TableTiming PlotPipeline::process_table(
         clSetKernelArg(k_table_hash_lr, 3, sizeof(cl_mem), &M_out_gpu);
         clSetKernelArg(k_table_hash_lr, 4, sizeof(uint32_t), &kmask);
         clSetKernelArg(k_table_hash_lr, 5, sizeof(uint32_t), &n_match);
-        clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &n_total);
+        clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &n_total_local);
 
         size_t local = (size_t)g_hash_local;
         size_t global = ((n_matches + local - 1) / local) * local;
