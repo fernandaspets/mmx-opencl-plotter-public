@@ -130,6 +130,7 @@ private:
     cl_mem M_out_gpu = nullptr;   // output metadata (written by hash)
     cl_kernel k_table_hash_lr = nullptr;
     bool use_gpu_resident = false;
+    int g_hash_local = 64;
     size_t gpu_resident_capacity = 0;
 
     size_t f1_buf_size = 0;
