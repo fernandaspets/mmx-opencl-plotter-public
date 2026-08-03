@@ -1,8 +1,6 @@
 #include "plot_pipeline.h"
+#include "bitmap_match.h"
 #include <omp.h>
-
-// GPU L1 pipeline (defined in gpu_l1_pipeline.cpp)
-namespace mmx { extern bool run_gpu_l1_pipeline(GPUDevice&, int, uint32_t, const std::vector<uint32_t>&, const std::vector<uint32_t>&, std::vector<PlotEntry>&, std::vector<uint32_t>&, std::vector<std::vector<PDEntry>>&, std::vector<uint32_t>&); }
 #include <fstream>
 #include <cassert>
 
@@ -324,55 +322,64 @@ void PlotPipeline::compute_f1(
 // 8-bit radix, 4 passes for 32-bit Y (but ksize bits are significant).
 static void radix_sort_pairs(std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t ksize) {
     const size_t n = entries.size();
-    if(n < 2) return;
-    const int passes = (ksize + 7) / 8;  // number of 8-bit radix passes
-    const int num_threads = omp_get_max_threads();
+    if(n <= 1) return;
+    
+    const int nthreads = omp_get_max_threads();
+    const int BITS_PER_PASS = 8;
+    const int num_passes = (ksize + BITS_PER_PASS - 1) / BITS_PER_PASS;
+    
     std::vector<std::pair<uint32_t, uint32_t>> temp(n);
-    for(int pass = 0; pass < passes; pass++) {
-        const int shift = pass * 8;
-        const uint32_t mask = 0xFF;
-        // Count per digit
-        std::vector<uint32_t> counts(256 * num_threads, 0);
+    
+    for(int pass = 0; pass < num_passes; pass++) {
+        const uint32_t shift = pass * BITS_PER_PASS;
+        const uint32_t bits_this_pass = std::min((uint32_t)BITS_PER_PASS, ksize - shift);
+        const uint32_t mask = (1u << bits_this_pass) - 1;
+        const int num_bins = 1u << bits_this_pass;
+        if(num_bins <= 0) break;
+        
+        // Per-thread histograms (vector of vectors avoids false sharing)
+        std::vector<std::vector<uint32_t>> thread_hists(nthreads, std::vector<uint32_t>(num_bins, 0));
+        
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < n; i++) {
             int ti = omp_get_thread_num();
             uint32_t digit = (entries[i].first >> shift) & mask;
-            counts[ti * 256 + digit]++;
+            thread_hists[ti][digit]++;
         }
-        // Prefix sum
-        for(int ti = 0; ti < num_threads; ti++) {
-            uint32_t sum = 0;
-            for(int d = 0; d < 256; d++) {
-                uint32_t c = counts[ti * 256 + d];
-                counts[ti * 256 + d] = sum;
-                sum += c;
+        
+        // Global histogram (prefix sum across threads)
+        std::vector<uint32_t> global_hist(num_bins, 0);
+        for(int ti = 0; ti < nthreads; ti++)
+            for(int b = 0; b < num_bins; b++)
+                global_hist[b] += thread_hists[ti][b];
+        
+        // Exclusive prefix sum → global offsets
+        std::vector<uint32_t> global_offset(num_bins, 0);
+        uint32_t sum = 0;
+        for(int b = 0; b < num_bins; b++) {
+            global_offset[b] = sum;
+            sum += global_hist[b];
+        }
+        
+        // Per-thread starting offsets
+        std::vector<std::vector<uint32_t>> thread_offsets(nthreads, std::vector<uint32_t>(num_bins));
+        for(int b = 0; b < num_bins; b++) {
+            uint32_t off = global_offset[b];
+            for(int ti = 0; ti < nthreads; ti++) {
+                thread_offsets[ti][b] = off;
+                off += thread_hists[ti][b];
             }
         }
-        std::vector<uint32_t> base(256, 0);
-        for(int d = 0; d < 256; d++) {
-            for(int ti = 0; ti < num_threads; ti++) {
-                base[d] += counts[ti * 256 + d];
-            }
-        }
-        uint32_t total = 0;
-        for(int d = 0; d < 256; d++) {
-            uint32_t c = base[d];
-            base[d] = total;
-            total += c;
-        }
-        for(int ti = 0; ti < num_threads; ti++) {
-            for(int d = 0; d < 256; d++) {
-                counts[ti * 256 + d] += base[d];
-            }
-        }
-        // Scatter
+        
+        // Scatter (stable within each thread)
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < n; i++) {
             int ti = omp_get_thread_num();
             uint32_t digit = (entries[i].first >> shift) & mask;
-            uint32_t pos = counts[ti * 256 + digit]++;
+            uint32_t pos = thread_offsets[ti][digit]++;
             temp[pos] = entries[i];
         }
+        
         std::swap(entries, temp);
     }
 }
@@ -548,6 +555,16 @@ TableTiming PlotPipeline::process_table(
     auto t1 = std::chrono::high_resolution_clock::now();
     timing.sort_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
+    // Check Y distribution for debugging (verify no fixed-point dupes)
+    if(entries.size() > 1000) {
+        uint32_t max_dup = 0, max_dup_y = 0, cur_y = entries[0].Y, cur_cnt = 1;
+        for(size_t di = 1; di < entries.size(); di++) {
+            if(entries[di].Y == cur_y) { cur_cnt++; }
+            else { if(cur_cnt > max_dup) { max_dup = cur_cnt; max_dup_y = cur_y; } cur_y = entries[di].Y; cur_cnt = 1; }
+        }
+        if(cur_cnt > max_dup) { max_dup = cur_cnt; max_dup_y = cur_y; }
+        std::cerr << "[Ydist] n=" << entries.size() << " max_dup=" << max_dup << "@Y=" << max_dup_y << "\n";
+    }
     // Match Y,Y+1
     auto matches = match_entries(entries);
     timing.n_matches = matches.size();
@@ -579,7 +596,9 @@ TableTiming PlotPipeline::process_table(
             if(gpu_ok) std::cout << "[GPU-Res] hash enabled (NVIDIA)" << std::endl;
             else std::cout << "[GPU-Res] hash disabled (AMD driver large-buffer bug)" << std::endl;
         }
-        if(!gpu_ok) { use_gpu_lr = false; }
+        // AMD: previously disabled due to uninit buffer read + missing resize causing garbage Y.
+        // Both issues are now fixed — re-enable GPU-resident hash on all platforms.
+        if(!gpu_ok) { std::cout << "[GPU-Res] hash enabled (AMD)" << std::endl; }
         else {
             // Ensure buffers have enough capacity for this table (entries grow)
             ensure_gpu_resident_buffers(std::max(entries.size(), n_matches));
@@ -732,8 +751,6 @@ TableTiming PlotPipeline::process_table(
 
     auto t5 = std::chrono::high_resolution_clock::now();
     timing.build_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
-    // Emit breakdown if build > 50ms
-    }
 
     return timing;
 }
@@ -745,6 +762,7 @@ void PlotPipeline::run_full_pipeline(
 {
     constexpr int N_TABLE = 9;
     const size_t num_x = X_values.size();
+    const uint32_t kmask = this->kmask;
 
     result.final_Y.clear();
     result.table_entries.clear();
@@ -756,127 +774,311 @@ void PlotPipeline::run_full_pipeline(
     std::vector<uint32_t> Y_flat, M_flat;
     compute_f1(X_values, plot_id, Y_flat, M_flat);
 
-    // Build table 1 entries with original indices
-    std::vector<PlotEntry> entries(num_x);
+    // === ocl2.0-svm fast pipeline ===
+    // Use lightweight pairs (Y, orig_idx) — 8 bytes each, NOT 64-byte PlotEntry.
+    // M_curr stays as flat uint32_t array, uploaded to GPU once.
+    std::vector<std::pair<uint32_t, uint32_t>> entries(num_x);
     #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < num_x; i++) {
-        entries[i].Y = Y_flat[i];
-        entries[i].orig_idx = (uint32_t)i;
-        for(int j = 0; j < N_META; j++) {
-            entries[i].M[j] = M_flat[i * N_META + j];
-        }
+        entries[i] = {Y_flat[i], (uint32_t)i};
     }
 
-    result.table_entries.push_back(entries);
+    // M_curr_flat: flat metadata array [num_entries * N_META]
+    std::vector<uint32_t> M_curr_flat(num_x * N_META);
+    std::memcpy(M_curr_flat.data(), M_flat.data(), num_x * N_META * sizeof(uint32_t));
 
-    // Initialize GPU-resident hash if available and upload F1 metadata
+    // Detect GPU vendor for sort tiebreaker (NVIDIA needs metadata sort)
+    char dev_vendor[256] = {};
+    clGetDeviceInfo(gpu.device, CL_DEVICE_VENDOR, sizeof(dev_vendor), dev_vendor, nullptr);
+    bool is_nvidia = strstr(dev_vendor, "NVIDIA") != nullptr;
+    bool use_meta_sort = is_nvidia;
+
+    // Initialize GPU-resident hash
     if(!use_gpu_resident) {
         init_hash_lr_kernel();
     }
-    if(use_gpu_resident && M_curr_gpu && k_table_hash_lr) {
-        // Allocate buffers for the actual data size and upload F1 metadata
-        ensure_gpu_resident_buffers(num_x);
+    cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
+    bool gpu_resident = use_gpu_resident && k_table_hash_lr != nullptr;
+    if(gpu_resident) {
+        // Allocate 1.1x for growth (entries grow ~2% per table) — allocate ONCE, never resize
+        // (resizing releases and recreates buffers, losing M_curr data)
+        size_t max_entries = (size_t)(num_x * 11 / 10 + 256);
+        ensure_gpu_resident_buffers(max_entries);
+        M_curr_gpu = this->M_curr_gpu;
+        M_out_gpu = this->M_out_gpu;
         clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
-            num_x * N_META * sizeof(uint32_t), M_flat.data(), 0, nullptr, nullptr);
-        std::cout << "[GPU-Res] Uploaded F1 metadata to GPU: " << num_x << " entries" << std::endl;
+            num_x * N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
+        std::cout << "[GPU-Res] Uploaded F1 metadata to GPU: " << num_x << " entries (cap=" << max_entries << ")" << std::endl;
     }
 
-    std::cerr << "[DBG] entering L1 block use_gpu_resident=" << use_gpu_resident << "\n";
-    // GPU L1 pipeline v2 — global eval (NVIDIA tested)
-    {
-        if(false) { // L1 pipeline disabled — fallback is faster
-            try {
-                std::vector<std::vector<PDEntry>> l1_pd;
-                std::vector<uint32_t> l1_xp;
-                std::vector<PlotEntry> l1_ent;
-                std::vector<uint32_t> l1_fy;
-                bool ok = run_gpu_l1_pipeline(gpu, ksize, num_x,
-                    M_flat, X_values, l1_ent, l1_fy, l1_pd, l1_xp);
-                if(ok) {
-                    result.table_entries.push_back(l1_ent);
-                    result.final_Y = l1_fy;
-                    for(auto& pt : l1_pd) if(!pt.empty()) result.pd_data.push_back(pt);
-                    for(size_t i = 1; i < l1_xp.size(); i += 2) {
-                        result.x_pairs.push_back(l1_xp[i-1]);
-                        result.x_pairs.push_back(l1_xp[i]);
-                    }
-                    std::cout << "[L1v2] Pipeline complete" << std::endl;
-                    return;
-                }
-            } catch(const std::exception& e) {
-                std::cout << "[L1] " << e.what() << std::endl;
-            }
-        }
-    }
+    // PD storage: PD[t] = vector of (sorted_L, delta) in sorted Y order
+    std::vector<std::vector<PDEntry>> PD(N_TABLE + 1);
+    // LR[t] = (sorted_L_pos, sorted_R_pos) per match — for PD build
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> LR(N_TABLE + 1);
+    // X pairs for table 2
+    std::vector<uint32_t> x_pairs_flat;
 
-    // F2-F9 (fallback)
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     for(int t = 2; t <= N_TABLE; t++) {
-        std::vector<PDEntry> table_pd;
-        
-        std::cout << "[T" << t << "] " << entries.size() << " entries..." << std::flush;
-        
-        // Save sorted entries BEFORE processing for X-pair lookup
-        std::vector<PlotEntry> prev_sorted_entries;
+        auto t_table = std::chrono::high_resolution_clock::now();
+        const size_t n = entries.size();
+
+        std::vector<std::pair<uint32_t, uint32_t>> lr_pairs;      // (orig_L, orig_R)
+        std::vector<std::pair<uint32_t, uint32_t>> sorted_entries;   // (Y, orig_idx) sorted by Y
+        std::vector<uint32_t> inv_map;                                // orig_pos → sorted_pos
+
         if(t == 2) {
-            prev_sorted_entries = entries;
-            sort_entries_by_y(prev_sorted_entries);
+            // T2: entries come unsorted from F1 — radix sort first
+            radix_sort_pairs(entries, ksize);
         }
-        
-        auto tt = process_table(entries,
-            (t == 2) ? &X_values : nullptr,
-            &table_pd);
-        
-        result.timings.push_back(tt);
-        result.table_entries.push_back(entries);
-        result.pd_data.push_back(table_pd);
-        
-        // For table 2: compute X pairs from original indices
-        if(t == 2 && tt.n_matches > 0) {
-            std::vector<uint32_t> sorted_to_x(prev_sorted_entries.size());
-            for(size_t j = 0; j < prev_sorted_entries.size(); j++) {
-                sorted_to_x[j] = X_values[prev_sorted_entries[j].orig_idx];
+        // entries are now sorted by Y (T2: just sorted, T3+: from previous match sort)
+        sorted_entries = entries;  // already sorted
+        // Bucket match on sorted entries
+        {
+            const int log_buckets = std::min(8, ksize - 1);
+            const int shift = ksize - log_buckets;
+            const size_t num_buckets = 1u << log_buckets;
+            std::vector<uint32_t> bucket_counts(num_buckets, 0);
+            for(size_t i = 0; i < n; i++)
+                bucket_counts[std::min(entries[i].first >> shift, (uint32_t)num_buckets - 1)]++;
+            std::vector<uint32_t> bucket_offsets(num_buckets + 1, 0);
+            for(size_t i = 0; i < num_buckets; i++)
+                bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
+            const int nthreads = std::min(omp_get_max_threads(), (int)num_buckets);
+            std::vector<std::vector<std::pair<uint32_t, uint32_t>>> thread_lr(nthreads);
+            #pragma omp parallel for schedule(dynamic, 1)
+            for(size_t b = 0; b < num_buckets; b++) {
+                int ti = omp_get_thread_num();
+                uint32_t start = bucket_offsets[b], cnt = bucket_counts[b];
+                if(cnt == 0) continue;
+                for(uint32_t x = start; x < start + cnt; x++) {
+                    const auto YL = entries[x].first;
+                    for(uint32_t y = x + 1; y < start + cnt && entries[y].first <= YL + 1; y++)
+                        if(entries[y].first == YL + 1) thread_lr[ti].emplace_back(entries[x].second, entries[y].second);
+                }
+                if(b + 1 < num_buckets) {
+                    uint32_t ns = bucket_offsets[b+1], nc = bucket_counts[b+1];
+                    if(nc > 0) {
+                        uint32_t last_Y = entries[start + cnt - 1].first;
+                        for(int64_t x = (int64_t)start + cnt - 1; x >= (int64_t)start; x--) {
+                            const auto YL = entries[x].first;
+                            if(YL < last_Y) break;
+                            for(uint32_t y = ns; y < ns + nc && entries[y].first <= YL + 1; y++)
+                                if(entries[y].first == YL + 1) thread_lr[ti].emplace_back(entries[x].second, entries[y].second);
+                        }
+                    }
+                }
             }
-            
-            result.x_pairs.resize(tt.n_matches * 2);
-            for(uint32_t j = 0; j < tt.n_matches; j++) {
-                auto& pd = result.pd_data.back()[j];
-                uint32_t sorted_L = pd.first;
-                uint32_t delta = pd.second;
-                uint32_t sorted_R = sorted_L + delta + 1;
-                
-                result.x_pairs[j * 2]     = sorted_to_x[sorted_L];
-                result.x_pairs[j * 2 + 1] = sorted_to_x[sorted_R];
-            }
-            std::cout << " (" << result.x_pairs.size()/2 << " X pairs)" << std::flush;
+            size_t total = 0;
+            for(int ti = 0; ti < nthreads; ti++) total += thread_lr[ti].size();
+            lr_pairs.clear(); lr_pairs.reserve(total);
+            for(int ti = 0; ti < nthreads; ti++)
+                for(const auto& p : thread_lr[ti]) lr_pairs.push_back(p);
+            inv_map.resize(n);
+            for(size_t i = 0; i < n; i++) inv_map[entries[i].second] = (uint32_t)i;
         }
-        
-        std::cout << " " << tt.n_matches << " matches (sort=" << tt.sort_ms
-                  << "ms match=" << tt.match_ms << "ms hash=" << tt.hash_ms
-                  << "ms extract=" << tt.extract_ms
-                  << "ms build=" << tt.build_ms
-                  << "ms)" << std::endl;
-        
+
+        size_t total_matches = lr_pairs.size();
+
+        auto t_bm = std::chrono::high_resolution_clock::now();
+        double bm_ms = std::chrono::duration<double, std::milli>(t_bm - t_table).count();
+
+        if(total_matches == 0) throw std::runtime_error("zero matches at table " + std::to_string(t));
+
+        // --- GPU hash ---
+        std::vector<uint32_t> Y_results;
+        std::vector<uint32_t> M_results;  // only used in non-resident path
+
+        // Build LR_flat: (orig_L, orig_R) indices into M_curr
+        std::vector<uint32_t> LR_flat(total_matches * 2);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < total_matches; i++) {
+            LR_flat[i * 2]     = lr_pairs[i].first;
+            LR_flat[i * 2 + 1] = lr_pairs[i].second;
+        }
+
+        auto t_hash_start = std::chrono::high_resolution_clock::now();
+
+        if(gpu_resident && total_matches > 0) {
+            // GPU-resident: M_curr stays on GPU, only upload LR + download Y
+            // Buffer already sized to 1.1x at init — no resize here (would lose data)
+            cl_mem LR_buf = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                total_matches * 2 * sizeof(uint32_t), LR_flat.data(), nullptr);
+            cl_mem Y_buf = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY,
+                total_matches * sizeof(uint32_t), nullptr, nullptr);
+
+            uint32_t n_match_u32 = (uint32_t)total_matches;
+            uint32_t n_total_u32 = (uint32_t)n;
+            clSetKernelArg(k_table_hash_lr, 0, sizeof(cl_mem), &M_curr_gpu);
+            clSetKernelArg(k_table_hash_lr, 1, sizeof(cl_mem), &LR_buf);
+            clSetKernelArg(k_table_hash_lr, 2, sizeof(cl_mem), &Y_buf);
+            clSetKernelArg(k_table_hash_lr, 3, sizeof(cl_mem), &M_out_gpu);
+            clSetKernelArg(k_table_hash_lr, 4, sizeof(uint32_t), &kmask);
+            clSetKernelArg(k_table_hash_lr, 5, sizeof(uint32_t), &n_match_u32);
+            clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &n_total_u32);
+
+            size_t local = (size_t)g_hash_local;
+            size_t global = ((total_matches + local - 1) / local) * local;
+            cl_int err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash_lr, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+            if(err != CL_SUCCESS) {
+                // Fallback to non-resident
+                std::cerr << "[GPU-Res] hash failed (err=" << err << "), falling back" << std::endl;
+                gpu_resident = false;
+            } else {
+                gpu.finish();
+                Y_results.resize(total_matches);
+                clEnqueueReadBuffer(gpu.queue, Y_buf, CL_TRUE, 0,
+                    total_matches * sizeof(uint32_t), Y_results.data(), 0, nullptr, nullptr);
+                std::swap(M_curr_gpu, M_out_gpu);
+            }
+            clReleaseMemObject(LR_buf);
+            clReleaseMemObject(Y_buf);
+        }
+
+        if(!gpu_resident && total_matches > 0) {
+            // Non-resident: upload M_curr + LR, download Y + M_out
+            ensure_hash_buffers(total_matches);
+            cl_int err;
+            cl_mem Mb = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                M_curr_flat.size() * sizeof(uint32_t), M_curr_flat.data(), &err);
+            cl_mem LRb = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                total_matches * 2 * sizeof(uint32_t), LR_flat.data(), &err);
+            cl_mem Yb = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY,
+                total_matches * sizeof(uint32_t), nullptr, &err);
+            cl_mem Mb_out = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY,
+                total_matches * N_META * sizeof(uint32_t), nullptr, &err);
+
+            uint32_t n_match_u32 = (uint32_t)total_matches;
+            uint32_t n_total_u32 = (uint32_t)(M_curr_flat.size() / N_META);
+            clSetKernelArg(k_table_hash_lr, 0, sizeof(cl_mem), &Mb);
+            clSetKernelArg(k_table_hash_lr, 1, sizeof(cl_mem), &LRb);
+            clSetKernelArg(k_table_hash_lr, 2, sizeof(cl_mem), &Yb);
+            clSetKernelArg(k_table_hash_lr, 3, sizeof(cl_mem), &Mb_out);
+            clSetKernelArg(k_table_hash_lr, 4, sizeof(uint32_t), &kmask);
+            clSetKernelArg(k_table_hash_lr, 5, sizeof(uint32_t), &n_match_u32);
+            clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &n_total_u32);
+
+            size_t local = (size_t)g_hash_local;
+            size_t global = ((total_matches + local - 1) / local) * local;
+            clEnqueueNDRangeKernel(gpu.queue, k_table_hash_lr, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+            gpu.finish();
+
+            Y_results.resize(total_matches);
+            M_results.resize(total_matches * N_META);
+            clEnqueueReadBuffer(gpu.queue, Yb, CL_TRUE, 0, total_matches * sizeof(uint32_t), Y_results.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(gpu.queue, Mb_out, CL_TRUE, 0, total_matches * N_META * sizeof(uint32_t), M_results.data(), 0, nullptr, nullptr);
+
+            clReleaseMemObject(Mb); clReleaseMemObject(LRb);
+            clReleaseMemObject(Yb); clReleaseMemObject(Mb_out);
+
+            M_curr_flat = std::move(M_results);
+        }
+
+        auto t_hash_end = std::chrono::high_resolution_clock::now();
+        double hash_ms = std::chrono::duration<double, std::milli>(t_hash_end - t_hash_start).count();
+
+        // --- Build matches = (Y, match_idx) and sort by Y ---
+        std::vector<std::pair<uint32_t, uint32_t>> matches(total_matches);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < total_matches; i++) {
+            matches[i] = {Y_results[i], (uint32_t)i};
+        }
+
+        // Convert LR pairs from original positions to sorted positions (for PD)
+        LR[t].resize(total_matches);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < total_matches; i++) {
+            LR[t][i] = {inv_map[lr_pairs[i].first], inv_map[lr_pairs[i].second]};
+        }
+
+        radix_sort_pairs(matches, ksize);
+        auto t_sort_end = std::chrono::high_resolution_clock::now();
+
+        // --- Build PD in sorted order ---
+        PD[t].resize(total_matches);
+        #pragma omp parallel for schedule(static)
+        for(size_t k = 0; k < total_matches; k++) {
+            uint32_t match_idx = matches[k].second;
+            uint32_t sorted_L = LR[t][match_idx].first;
+            uint32_t sorted_R = LR[t][match_idx].second;
+            uint16_t delta = (uint16_t)(sorted_R - sorted_L - 1);  // CUDA reference: delta = R - L - 1
+            PD[t][k] = {sorted_L, delta};
+        }
+
+        // --- X pairs for table 2 ---
+        if(t == 2) {
+            // sorted_entries already moved to `entries`, but we have inv_map + lr_pairs
+            // sorted_to_x[sorted_pos] = X_values[orig_idx at that sorted_pos]
+            // entries[sorted_pos] = (Y, orig_idx) after bitmap_match
+            x_pairs_flat.resize(total_matches * 2);
+            #pragma omp parallel for schedule(static)
+            for(size_t k = 0; k < total_matches; k++) {
+                uint32_t match_idx = matches[k].second;
+                uint32_t sorted_L = LR[t][match_idx].first;
+                uint32_t sorted_R = LR[t][match_idx].second;
+                x_pairs_flat[k * 2]     = X_values[entries[sorted_L].second];
+                x_pairs_flat[k * 2 + 1] = X_values[entries[sorted_R].second];
+            }
+        }
+
+        // entries = matches (Y, idx into M_next) — pre-sorted by Y for next table
+        entries = std::move(matches);
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t_end - t_table).count();
+        double sort_ms = std::chrono::duration<double, std::milli>(t_sort_end - t_hash_end).count();
+
+        std::cout << "[T" << t << "] " << total_matches << " matches (match=" << bm_ms
+                  << "ms hash=" << hash_ms << "ms sort=" << sort_ms
+                  << "ms total=" << total_ms << "ms)" << std::endl;
+
         if(entries.empty()) break;
     }
-    // Save final Y values
-    result.final_Y.resize(entries.size());
-    for(size_t i = 0; i < entries.size(); i++) {
-        result.final_Y[i] = entries[i].Y;
+
+    // --- Download final M from GPU (resident mode) ---
+    if(gpu_resident && M_curr_gpu && entries.size() > 0) {
+        size_t n = entries.size();
+        M_curr_flat.resize(n * N_META);
+        clEnqueueReadBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
+            n * N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
+        clReleaseMemObject(M_curr_gpu);
+        clReleaseMemObject(M_out_gpu);
+        this->M_curr_gpu = nullptr;
+        this->M_out_gpu = nullptr;
     }
 
-    // Download final M from GPU for plot writer (GPU-resident path)
-    if(use_gpu_resident && M_curr_gpu && entries.size() > 0) {
-        size_t n = entries.size();
-        std::vector<uint32_t> M_final(n * N_META);
-        clEnqueueReadBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
-            n * N_META * sizeof(uint32_t), M_final.data(), 0, nullptr, nullptr);
+    // --- Convert to PlotData for plot_writer ---
+    result.final_Y.resize(entries.size());
+    #pragma omp parallel for schedule(static)
+    for(size_t i = 0; i < entries.size(); i++) {
+        result.final_Y[i] = entries[i].first;
+    }
+
+    // Build final table entries (PlotEntry) for plot_writer metadata table
+    {
+        std::vector<PlotEntry> final_entries(entries.size());
         #pragma omp parallel for schedule(static)
-        for(size_t i = 0; i < n; i++) {
+        for(size_t i = 0; i < entries.size(); i++) {
+            final_entries[i].Y = entries[i].first;
+            final_entries[i].orig_idx = entries[i].second;
             for(int j = 0; j < N_META; j++) {
-                entries[i].M[j] = M_final[i * N_META + j];
+                final_entries[i].M[j] = M_curr_flat[entries[i].second * N_META + j];
             }
         }
+        result.table_entries.push_back(final_entries);
     }
+
+    // PD data: pd_data[0] = PD[2], pd_data[1] = PD[3], ..., pd_data[7] = PD[9]
+    for(int t = 2; t <= N_TABLE; t++) {
+        result.pd_data.push_back(PD[t]);
+    }
+
+    // X pairs
+    result.x_pairs = std::move(x_pairs_flat);
+
+    auto t_total = std::chrono::high_resolution_clock::now();
+    double pipeline_ms = std::chrono::duration<double, std::milli>(t_total - t0).count();
+    std::cout << "Pipeline time: " << pipeline_ms / 1000.0 << "s" << std::endl;
 }
 
 } // namespace mmx
