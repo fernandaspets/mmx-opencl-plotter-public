@@ -16,7 +16,7 @@ void PlotWriter::compute_header(
 
     header->version = 0;
     header->ksize = ksize;
-    header->xbits = xbits;
+    header->xbits = ksize - xbits;  // header stores bits_kept
     header->has_meta = has_meta;
     header->seed = hash_t();
     header->park_size_x = PARK_SIZE_X;
@@ -304,7 +304,7 @@ void PlotWriter::encode_x_park(std::vector<uint8_t>& park,
     std::vector<uint64_t> bit_buf(max_bytes * 2 / sizeof(uint64_t) + 4, 0);
     uint64_t bit_offset = 0;
 
-    const uint32_t shift = ksize - xbits;  // bits to drop (compression)
+    const uint32_t shift = xbits;  // compression level = bits to drop
 
     for(size_t i = start * 2; i < (start + count) * 2 && i < x_pairs.size(); i += 2) {
         write_bits(bit_buf, x_pairs[i] >> shift, bit_offset, x2size);

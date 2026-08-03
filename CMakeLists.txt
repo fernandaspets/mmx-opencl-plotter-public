@@ -122,6 +122,6 @@ set_target_properties(test_pid_derive PROPERTIES
 )
 
 # === MAIN PLOTTER ===
-add_executable(mmx_opencl_plotter src/main.cpp ${GPU_SOURCES} src/plot_pipeline.cpp src/plot_writer.cpp)
+add_executable(mmx_opencl_plotter src/main.cpp ${GPU_SOURCES} src/plot_pipeline.cpp src/plot_writer.cpp src/gpu_manager.cpp src/multi_pipeline.cpp)
 target_include_directories(mmx_opencl_plotter PRIVATE src)
 target_link_libraries(mmx_opencl_plotter PRIVATE ${OpenCL_LIBRARIES} mmx_iface vnx_base_static)

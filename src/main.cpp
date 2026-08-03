@@ -1,7 +1,9 @@
 // mmx_opencl_plotter — MMX OpenCL Plotter
 // Usage: mmx_opencl_plotter <plot_id_hex> <farmer_key_hex> [output_dir] [options]
 #include "gpu_device.h"
+#include "gpu_manager.h"
 #include "plot_pipeline.h"
+#include "multi_pipeline.h"
 #include "plot_writer.h"
 #include <mmx/PlotHeader.hxx>
 #include <mmx/hash_t.hpp>
@@ -21,6 +23,7 @@ int main(int argc, char** argv) {
         std::cerr << "  --k N           Set plot k-size (default: 26, range " << mmx::MIN_KSIZE << "-" << mmx::MAX_KSIZE << ")" << std::endl;
         std::cerr << "  --limit N       Limit entries (test mode)" << std::endl;
         std::cerr << "  --device N      GPU device index (default: 0)" << std::endl;
+        std::cerr << "  --num-gpus N    Number of GPUs to use (default: 1)" << std::endl;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for fast plotting" << std::endl;
         std::cerr << "  --no-meta       SSD mode (no metadata table, ~55% smaller)" << std::endl;
         std::cerr << "  --clevel N      Compression level 0-15 (default: 0)" << std::endl;
@@ -35,6 +38,7 @@ int main(int argc, char** argv) {
     uint32_t clevel = 0;  // compression level C0
     uint64_t limit = 0;
     int device_id = 0;
+    int num_gpus = 1;
     bool has_meta = true;
 
     for(int i = 3; i < argc; i++) {
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
         if(arg == "--k" && i+1 < argc) ksize = std::stoi(argv[++i]);
         else if(arg == "--limit" && i+1 < argc) limit = std::stoull(argv[++i]);
         else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
+        else if(arg == "--num-gpus" && i+1 < argc) num_gpus = std::stoi(argv[++i]);
         else if(arg == "--ramdisk" && i+1 < argc) ramdisk_dir = argv[++i];
         else if(arg == "--no-meta") has_meta = false;
         else if(arg == "--clevel" && i+1 < argc) clevel = std::stoi(argv[++i]);
@@ -84,16 +89,29 @@ int main(int argc, char** argv) {
     std::cout << "  Mode: " << (has_meta ? "HDD" : "SSD") << std::endl;
 
     // GPU init
-    mmx::GPUDevice gpu;
-    try { gpu.init(device_id); gpu.print_info(); }
-    catch(const std::exception& e) {
-        std::cerr << "GPU init failed: " << e.what() << std::endl;
-        return 1;
+    std::unique_ptr<mmx::GPUManager> gpu_mgr;
+    std::unique_ptr<mmx::GPUDevice> single_gpu;
+    
+    if(num_gpus > 1) {
+        gpu_mgr = std::make_unique<mmx::GPUManager>();
+        gpu_mgr->init(device_id, num_gpus);
+    } else {
+        single_gpu = std::make_unique<mmx::GPUDevice>();
+        single_gpu->init(device_id);
+        single_gpu->print_info();
     }
 
     // Pipeline
-    mmx::PlotPipeline pipeline(gpu, ksize);
-    pipeline.init();
+    std::unique_ptr<mmx::MultiPipeline> multi_pipe;
+    std::unique_ptr<mmx::PlotPipeline> single_pipe;
+    
+    if(num_gpus > 1) {
+        multi_pipe = std::make_unique<mmx::MultiPipeline>(*gpu_mgr, ksize);
+        multi_pipe->init();
+    } else {
+        single_pipe = std::make_unique<mmx::PlotPipeline>(*single_gpu, ksize);
+        single_pipe->init();
+    }
 
     // Generate X values (0, 1, 2, ..., num_x-1)
     std::cout << "[F1] Generating " << num_x << " X values..." << std::endl;
@@ -108,8 +126,13 @@ int main(int argc, char** argv) {
 
     // Run pipeline
     mmx::PlotData result;
-    try { pipeline.run_full_pipeline(X_values, plot_id_raw, result); }
-    catch(const std::exception& e) {
+    try {
+        if(num_gpus > 1) {
+            multi_pipe->run_full_pipeline(X_values, plot_id_raw, result);
+        } else {
+            single_pipe->run_full_pipeline(X_values, plot_id_raw, result);
+        }
+    } catch(const std::exception& e) {
         std::cerr << "Pipeline failed: " << e.what() << std::endl;
         return 1;
     }
@@ -127,8 +150,8 @@ int main(int argc, char** argv) {
     }
 
     // Write plot file
-    uint32_t xbits_val = ksize - clevel;  // bits kept = ksize - C
-    std::cout << "\n[Plot] Writing (C" << clevel << ", xbits=" << xbits_val << ")..." << std::endl;
+    uint32_t xbits_val = clevel;  // compression level C
+    std::cout << "\n[Plot] Writing (C" << clevel << ", xbits=" << (ksize - clevel) << ")..." << std::endl;
     mmx::PlotWriter writer(ksize, xbits_val, has_meta);
 
     uint8_t fk_raw[33];
