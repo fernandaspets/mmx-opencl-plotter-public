@@ -153,6 +153,14 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             size_t hg=((nmt+63)/64)*64;
             clEnqueueNDRangeKernel(g.queue,ke,1,0,&hg,0,0,0,0);
             g.finish();
+            if(t==2){
+                std::vector<uint32_t> nbv(NL);
+                clEnqueueReadBuffer(g.queue,NB,CL_TRUE,0,NL*4,nbv.data(),0,0,0);
+                uint32_t bmax=0,bmaxi=0,sum=0,nz=0;
+                for(int di=0;di<NL;di++){if(nbv[di]>0)nz++;sum+=nbv[di];
+                    if(nbv[di]>bmax){bmax=nbv[di];bmaxi=di;}}
+                std::cout<<"[DBG] T2 NB: nz="<<nz<<" sum="<<sum<<" max="<<bmax<<" at "<<bmaxi<<" "<<(100.0*bmax/sum)<<"%\n";
+            }
         }
 
         lrT[t].resize(nmt*2);pdT[t].resize(nmt);
