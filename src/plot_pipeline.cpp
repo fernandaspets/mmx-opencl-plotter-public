@@ -433,7 +433,7 @@ void PlotPipeline::run_full_pipeline(
 
     result.table_entries.push_back(entries);
 
-    // F2-F9
+        // F2-F9
     for(int t = 2; t <= N_TABLE; t++) {
         std::vector<PDEntry> table_pd;
         
@@ -442,7 +442,6 @@ void PlotPipeline::run_full_pipeline(
         // Save sorted entries BEFORE processing for X-pair lookup
         std::vector<PlotEntry> prev_sorted_entries;
         if(t == 2) {
-            // Sort a copy to get the order that process_table will use
             prev_sorted_entries = entries;
             sort_entries_by_y(prev_sorted_entries);
         }
@@ -457,26 +456,11 @@ void PlotPipeline::run_full_pipeline(
         
         // For table 2: compute X pairs from original indices
         if(t == 2 && tt.n_matches > 0) {
-            // entries are sorted by Y from the PRECEDING process_table call
-            // Wait — entries in the NEW table are in match order, not sorted by Y!
-            // We need to track which match each sorted entry came from.
-            // The match pairs are: (sorted_pos_L, sorted_pos_R)
-            // sorted_pos_L refers to position in the SORTED previous table
-            // Let me use orig_idx to reconstruct:
-            // After process_table returns, entries[i] has orig_idx = match index
-            // We need to map: match_idx → (X_L, X_R) → (orig_idx of L in table 1, orig_idx of R in table 1)
-            // The PD table[0] has entries: (sorted_pos_L_in_prev, delta)
-            // For match i: sorted_pos_L = pd_data[0][i].first
-            //              sorted_pos_R = sorted_pos_L + pd_data[0][i].second + 1
-            // X value for sorted_pos_L = X_values[sorted_to_orig_map[sorted_pos_L]]
-            
-            // Build map from sorted position to original X value
             std::vector<uint32_t> sorted_to_x(prev_sorted_entries.size());
             for(size_t j = 0; j < prev_sorted_entries.size(); j++) {
                 sorted_to_x[j] = X_values[prev_sorted_entries[j].orig_idx];
             }
             
-            // Now for each match, get X values
             result.x_pairs.resize(tt.n_matches * 2);
             for(uint32_t j = 0; j < tt.n_matches; j++) {
                 auto& pd = result.pd_data.back()[j];
@@ -496,7 +480,6 @@ void PlotPipeline::run_full_pipeline(
         
         if(entries.empty()) break;
     }
-    
     // Save final Y values
     result.final_Y.resize(entries.size());
     for(size_t i = 0; i < entries.size(); i++) {
