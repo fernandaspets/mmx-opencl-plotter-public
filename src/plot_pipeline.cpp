@@ -695,6 +695,8 @@ TableTiming PlotPipeline::process_table(
             (*pd_out)[i] = {m.first, delta};
         }
     }
+    auto t_pd = std::chrono::high_resolution_clock::now();
+    double pd_ms = std::chrono::duration<double, std::milli>(t_pd - t4).count();
 
     // Build next table entries — Y + orig_idx only (M on GPU or downloaded here)
     entries.resize(n_matches);
@@ -716,13 +718,20 @@ TableTiming PlotPipeline::process_table(
             entries[i].orig_idx = (uint32_t)i;
         }
     }
+    auto t_be = std::chrono::high_resolution_clock::now();
+    double be_ms = std::chrono::duration<double, std::milli>(t_be - t_pd).count();
 
     // Sort entries by Y so next table finds them pre-sorted (skip redundant sort)
     // Only needed for non-bitmap path (matches are in hash order, not Y order)
     sort_entries_by_y(entries);
 
     auto t5 = std::chrono::high_resolution_clock::now();
+    double sort_ms = std::chrono::duration<double, std::milli>(t5 - t_be).count();
     timing.build_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
+    // Emit breakdown if build > 50ms
+    if(timing.build_ms > 50) {
+        std::cerr << " [bld: pd=" << pd_ms << " be=" << be_ms << " sort=" << sort_ms << "]";
+    }
 
     return timing;
 }
