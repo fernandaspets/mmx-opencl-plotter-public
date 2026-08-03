@@ -72,6 +72,14 @@ set_target_properties(test_f1 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
 
+# Table hash kernel test (requires GPU)
+add_executable(test_table_hash tests/test_table_hash.cpp ${GPU_SOURCES})
+target_link_libraries(test_table_hash PRIVATE ${OpenCL_LIBRARIES})
+add_test(NAME test_table_hash COMMAND test_table_hash)
+set_target_properties(test_table_hash PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+)
+
 # Test with MMX deps
 add_executable(test_pid_derive tests/test_pid_derive.cpp)
 target_link_libraries(test_pid_derive PRIVATE
