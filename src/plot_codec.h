@@ -59,7 +59,8 @@ inline std::pair<uint32_t, uint32_t> encode_symbol(uint8_t sym) {
     const uint32_t mod = sym % 3;
 
     if(index > 15) {
-        throw std::logic_error("encode_symbol: symbol out of range: " + std::to_string(sym));
+        throw std::logic_error("encode_symbol: symbol out of range: " + std::to_string(sym)
+            + " (full plot required for small deltas)");
     }
     uint32_t out = uint32_t(-1) >> (32 - 2 * index);
     out |= mod << (2 * index);

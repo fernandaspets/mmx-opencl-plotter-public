@@ -116,5 +116,7 @@ set_target_properties(test_pid_derive PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
 )
 
-# === MAIN PLOTTER (to be implemented) ===
-# add_executable(mmx_opencl_plotter src/main.cpp ...)
+# === MAIN PLOTTER ===
+add_executable(mmx_opencl_plotter src/main.cpp ${GPU_SOURCES} src/plot_pipeline.cpp src/plot_writer.cpp)
+target_include_directories(mmx_opencl_plotter PRIVATE src)
+target_link_libraries(mmx_opencl_plotter PRIVATE ${OpenCL_LIBRARIES} mmx_iface vnx_base_static)

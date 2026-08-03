@@ -2,6 +2,7 @@
 #include <mmx/PlotHeader.hxx>
 #include <vnx/Output.h>
 #include <fstream>
+#include <cmath>
 #include <algorithm>
 #include <omp.h>
 
@@ -26,9 +27,9 @@ void PlotWriter::compute_header(
     // Maximum bytes per park
     header->park_bytes_x = cdiv(PARK_SIZE_X * LPX2SIZE, 8);
     header->park_bytes_meta = cdiv(PARK_SIZE_META * ksize * N_META_OUT, 8);
-    header->park_bytes_y = 4 + cdiv((PARK_SIZE_Y - 1) * (uint64_t)MAX_AVG_YDELTA_BITS, 8);
+    header->park_bytes_y = 4 + (uint32_t)std::ceil((PARK_SIZE_Y - 1) * MAX_AVG_YDELTA_BITS / 8.0);
     header->park_bytes_pd = cdiv(PARK_SIZE_PD * ksize, 8)
-                          + cdiv(PARK_SIZE_PD * (uint64_t)MAX_AVG_OFFSET_BITS, 8);
+                          + (uint32_t)std::ceil(PARK_SIZE_PD * MAX_AVG_OFFSET_BITS / 8.0);
 
     header->entry_bits_x = LPX2SIZE;
     header->num_entries_y = num_entries;
@@ -83,7 +84,12 @@ void PlotWriter::write_file(
     const uint8_t* farmer_key_33,
     const PlotData& data)
 {
-    std::cout << "[Plot] Writing " << data.final_Y.size() << " entries to " << file_path << std::endl;
+    // Sort final Y values for delta encoding
+    std::vector<uint32_t> sorted_Y = data.final_Y;
+    std::sort(sorted_Y.begin(), sorted_Y.end());
+    const uint64_t num_entries = sorted_Y.size();
+    
+    std::cout << "[Plot] Writing " << num_entries << " entries to " << file_path << std::endl;
 
     // Create header
     auto header = PlotHeader::create();
@@ -143,8 +149,6 @@ void PlotWriter::write_file(
     std::ofstream out(file_path, std::ios::binary | std::ios::app);
     if(!out.good()) throw std::runtime_error("Cannot open " + file_path);
 
-    const uint64_t num_entries = data.final_Y.size();
-
     // Write Y table
     {
         const uint64_t num_parks = cdiv(num_entries, (uint64_t)PARK_SIZE_Y);
@@ -154,7 +158,7 @@ void PlotWriter::write_file(
             uint64_t start = p * PARK_SIZE_Y;
             uint64_t count = std::min((uint64_t)PARK_SIZE_Y, num_entries - start);
             std::vector<uint8_t> park(header->park_bytes_y, 0);
-            encode_y_park(park, &data.final_Y[start], count, header->park_bytes_y);
+            encode_y_park(park, &sorted_Y[start], count, header->park_bytes_y);
             out.write((char*)park.data(), header->park_bytes_y);
         }
     }
@@ -226,9 +230,12 @@ void PlotWriter::encode_y_park(std::vector<uint8_t>& park, const uint32_t* Y, si
     // Reset — write first Y at bit 0
     bit_offset = ksize;
 
-    // Y deltas
+    // Y deltas using encode_symbol
     for(size_t i = 1; i < count; i++) {
         uint32_t delta = Y[i] - Y[i-1];
+        if(delta > 255) {
+            throw std::runtime_error("Y delta too large: " + std::to_string(delta));
+        }
         auto [bits, nbits] = encode_symbol((uint8_t)delta);
         write_bits(bit_buf, bits, bit_offset, nbits);
         bit_offset += nbits;
@@ -252,7 +259,7 @@ void PlotWriter::encode_meta_park(std::vector<uint8_t>& park,
     uint64_t bit_offset = 0;
 
     for(size_t i = start; i < start + count && i < entries.size(); i++) {
-        for(int j = 0; j < N_META; j++) {
+        for(int j = 0; j < N_META_OUT; j++) {
             write_bits(bit_buf, entries[i].M[j], bit_offset, ksize);
             bit_offset += ksize;
         }
@@ -276,8 +283,9 @@ void PlotWriter::encode_pd_park(std::vector<uint8_t>& park,
     for(const auto& [pos, delta] : entries) {
         write_bits(bit_buf, pos, bit_offset, ksize);
         bit_offset += ksize;
-        write_bits(bit_buf, delta, bit_offset, 16);
-        bit_offset += 16;
+        auto [dbits, dnbits] = encode_symbol((uint8_t)delta);
+        write_bits(bit_buf, dbits, bit_offset, dnbits);
+        bit_offset += dnbits;
     }
 
     uint64_t byte_count = (bit_offset + 7) / 8;
