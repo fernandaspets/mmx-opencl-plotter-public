@@ -68,6 +68,7 @@ inline cl_int clSetKernelArgSVM(cl_kernel kernel, cl_uint idx, const void* svm_p
 #include <unistd.h>
 #include <omp.h>
 #include "parallel_prefix_sum.h"
+#include "parallel_prefix_sum.h"
 
 using namespace mmx;
 using namespace mmx::pos;
@@ -1905,16 +1906,13 @@ void compute_gpu_bulk(
                 LR_all[t][i] = {lr_sorted_host[i * 2], lr_sorted_host[i * 2 + 1]};
             }
             // Download Y_out (hash output Y) for sorting PD
-            auto sm_start = my_time_ms();
             std::vector<uint32_t> y_out_host(num_matches);
             clEnqueueReadBuffer(gpu_plotter.queue, Y_out, CL_TRUE, 0, num_matches * 4, y_out_host.data(), 0, nullptr, nullptr);
-            auto dl_end = my_time_ms();
             // Sort by Y_out (hash output Y) for PD in sorted order — same as flat pipeline
             std::vector<std::pair<uint32_t, uint32_t>> match_indices(num_matches);
             #pragma omp parallel for schedule(static)
             for(uint32_t i = 0; i < num_matches; i++) match_indices[i] = {y_out_host[i] & kmask, i};
             radix_sort_pairs(match_indices, KSIZE);
-            auto sort_end = my_time_ms();
             // Reorder LR_all[t] by sorted order (parallelized — was 1100ms sequential!)
             std::vector<std::pair<uint32_t, uint32_t>> LR_sorted_order(num_matches);
             #pragma omp parallel for schedule(static)
@@ -1922,7 +1920,6 @@ void compute_gpu_bulk(
                 LR_sorted_order[i] = LR_all[t][match_indices[i].second];
             }
             auto reorder_end = my_time_ms();
-            std::cerr << "  [T" << t << "] sort_matches: dl=" << (dl_end - sm_start) << "ms sort=" << (sort_end - dl_end) << "ms reorder=" << (reorder_end - sort_end) << "ms" << std::endl;
             // For T2: build X_pairs BEFORE moving LR_sorted_order
             if(t == 2 && !pos_t_host.empty()) {
                 plot.X_pairs.resize(num_matches);
