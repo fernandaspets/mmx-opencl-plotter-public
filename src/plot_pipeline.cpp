@@ -834,9 +834,9 @@ void PlotPipeline::run_full_pipeline(
         }
         // entries are now sorted by Y (T2: just sorted, T3+: from previous match sort)
         sorted_entries = entries;  // already sorted
-        // Bucket match on sorted entries
+        // Bucket match on sorted entries (LOGBUCKETS=6 like ocl2.0-svm)
         {
-            const int log_buckets = std::min(8, ksize - 1);
+            const int log_buckets = std::min(6, (int)ksize - 1);
             const int shift = ksize - log_buckets;
             const size_t num_buckets = 1u << log_buckets;
             std::vector<uint32_t> bucket_counts(num_buckets, 0);
@@ -847,6 +847,8 @@ void PlotPipeline::run_full_pipeline(
                 bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
             const int nthreads = std::min(omp_get_max_threads(), (int)num_buckets);
             std::vector<std::vector<std::pair<uint32_t, uint32_t>>> thread_lr(nthreads);
+            // Pre-allocate to avoid reallocation during emplace_back
+            for(int ti = 0; ti < nthreads; ti++) thread_lr[ti].reserve(n / nthreads * 2);
             #pragma omp parallel for schedule(dynamic, 1)
             for(size_t b = 0; b < num_buckets; b++) {
                 int ti = omp_get_thread_num();
