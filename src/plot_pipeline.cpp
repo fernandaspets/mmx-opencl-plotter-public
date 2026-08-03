@@ -740,7 +740,8 @@ void PlotPipeline::run_full_pipeline(
         }
     }
 
-    // Try GPU L1 pipeline
+    // Try GPU L1 pipeline (experimental — disabled by default)
+    /*
     {
         if(use_gpu_resident) {
             try {
@@ -765,6 +766,7 @@ void PlotPipeline::run_full_pipeline(
             }
         }
     }
+    */
 
     // F2-F9 (fallback)
     for(int t = 2; t <= N_TABLE; t++) {
