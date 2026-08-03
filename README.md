@@ -24,40 +24,23 @@ OpenCL implementation of the MMX proof-of-space plotter, designed for AMD GPUs
 - Phase 2 compaction (removes unreachable entries, remaps PD)
 - Both flat and chunked pipelines
 
-## Performance
 
-### Current Speeds (GPU-resident M_curr pipeline)
+### Current Performance (AMD RX 7900 XTX, 24GB VRAM)
 
-| K | Entries | AMD 7900 XTX | NVIDIA P40 | Pass |
-|---|---------|-------------|------------|------|
-| 22 | 4M  | 2.9s  | 5.3s  | 97.5% |
-| 23 | 8M  | 6.4s  | 10.1s | 94.1% |
-| 24 | 16M | 13.1s | 20.2s | 96.3% |
-| 25 | 32M | 27.4s | ~50s  | 100.6% |
+| K | Total Time | F1 | F2-F9 | Pass Rate | Plot Size |
+|---|-----------|-----|--------|-----------|-----------|
+| 18 | ~1.0s | 0.1s | 0.4s | 99.7% | ~65 MB |
+| 22 | 2.3s | 0.65s | 2.0s | 97.7% | ~260 MB |
+| 25 | 18.3s | 5.2s | 15.9s | 100.25% | 2.3 GB |
+| 26 | 37.0s | 10.2s | 32.2s | 101.2% | 4.6 GB |
 
-### ⚠️ Cross-Platform Sort Tradeoff (IMPORTANT for future AMD optimization)
+### GPU-Bulk Pipeline (--gpu-bulk)
 
-**The sort tiebreaker is vendor-specific. This is a known performance tradeoff:**
-
-- **AMD**: uses **Y-only sort** (no metadata tiebreaker). Fast — no M_curr download
-  from GPU needed per table. This is the fast path.
-- **NVIDIA**: uses **Y+metadata sort** (metadata tiebreaker required). Correct but
-  requires downloading M_curr from GPU before each table's sort (~1.8GB/table for k25).
-  Without the metadata tiebreaker, NVIDIA's OpenCL compiler produces hash outputs
-  where all Y values land in one bucket at T4, causing O(n²) matching hang.
-
-**Why AMD is faster**: AMD skips the M_curr download (saves ~1.8GB × 8 tables = 14.4GB
-of PCIe transfers for k25). The Y-only sort is also faster (no element-by-element
-metadata comparison for same-Y entries).
-
-**Future AMD speedup opportunity**: If we can make the Y-only sort work on NVIDIA
-(e.g., by doing the sort on GPU, or finding an alternative deterministic tiebreaker
-that doesn't need M_curr), both platforms could use the fast path. This would save
-~2s on k22 and ~5s on k25 on AMD (the larger buffer + clFinish overhead from the
-NVIDIA-compatible code path).
-
-**Key files**: The sort logic is in `plotter.cpp` — search for `use_meta_sort`.
-GPU vendor is detected via `clGetDeviceInfo(CL_DEVICE_VENDOR)`.
+| K | F2-F9 | Pass Rate | Notes |
+|---|--------|-----------|-------|
+| 18 | 0.43s | 99.7% | 10x faster than flat |
+| 22 | 2.2s | 97.4% | Similar to flat |
+| 25 | 17.6s | 100.25% | 1.1x slower than flat (extra counting sort) |
 
 ## Build
 
