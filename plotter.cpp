@@ -69,6 +69,7 @@ inline cl_int clSetKernelArgSVM(cl_kernel kernel, cl_uint idx, const void* svm_p
 #include <omp.h>
 #include "parallel_prefix_sum.h"
 #include "parallel_prefix_sum.h"
+#include "parallel_prefix_sum.h"
 
 using namespace mmx;
 using namespace mmx::pos;
