@@ -1953,7 +1953,7 @@ void compute_gpu_bulk(
     
     // Sort final entries by Y
     std::vector<std::pair<uint32_t, uint32_t>> sorted_entries(total_entries);
-    for(size_t i = 0; i < total_entries; i++) sorted_entries[i] = {final_Y[i], (uint32_t)i};
+    for(size_t i = 0; i < total_entries; i++) sorted_entries[i] = {final_Y[i] & kmask, (uint32_t)i};
     radix_sort_pairs(sorted_entries, KSIZE);
     
     // Build final_Y and final_meta
@@ -1982,7 +1982,7 @@ void compute_gpu_bulk(
     
     // TODO: build X_pairs (needs entries_map chain)
     
-    std::cout << "[GPU-Bulk] Done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
+        std::cout << "[GPU-Bulk] Done in " << (my_time_ms() - t0) / 1000.0 << " sec" << std::endl;
     
     // Cleanup
     clReleaseMemObject(Y_buf[0]); clReleaseMemObject(Y_buf[1]);
@@ -2484,7 +2484,7 @@ void compute_full_pipeline(
     
     auto t_copy_done = my_time_ms();
     std::cout << "[Final] " << plot.final_Y.size() << " entries          " << std::endl;
-    std::cerr << "[Final] copy=" << (t_copy_done-t_final_start) << "ms (no sort, no PD reorder needed)    \r" << std::flush;
+        std::cerr << "[Final] copy=" << (t_copy_done-t_final_start) << "ms (no sort, no PD reorder needed)    \r" << std::flush;
     
     // X pairs: build in sorted order directly (no reorder needed)
     // PD[t] is in sorted order, entries_map[t] is sorted->original.
