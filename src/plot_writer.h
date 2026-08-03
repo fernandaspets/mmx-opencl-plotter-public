@@ -13,14 +13,21 @@
 
 namespace mmx {
 
-// Plot file encoding constants (used in park encoding)
-constexpr int LPX2SIZE = 36;       // bits per X value in stored format
+// Plot file encoding constants
+constexpr int MAX_LPX2SIZE = 63;   // max bits for 2 * (ksize - 0) - 1 = 2*32-1 = 63
+
+// Compute bits per X pair from ksize and compression level (xbits = C)
+// Matches CUDA: X2SIZE = 2 * XBITS - 1 where XBITS = KSIZE - C
+inline uint32_t compute_x2size(uint32_t ksize, uint32_t xbits) {
+    uint32_t XBITS = ksize - xbits;
+    return 2 * XBITS - 1;
+}
 
 // Plot writer: fills PlotHeader + encodes parks + writes file
 class PlotWriter {
 public:
     PlotWriter(uint32_t ksize, uint32_t xbits = 0, bool has_meta = true)
-        : ksize(ksize), xbits(xbits), has_meta(has_meta) {}
+        : ksize(ksize), xbits(xbits), x2size(compute_x2size(ksize, xbits)), has_meta(has_meta) {}
 
     // Write a complete plot file given the pipeline results
     void write_file(
@@ -32,6 +39,7 @@ public:
 private:
     uint32_t ksize;
     uint32_t xbits;
+    uint32_t x2size;  // computed: 2 * (ksize - xbits) - 1
     bool has_meta;
 
     // Compute header fields

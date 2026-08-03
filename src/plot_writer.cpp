@@ -24,14 +24,14 @@ void PlotWriter::compute_header(
     header->park_size_pd = PARK_SIZE_PD;
     header->park_size_meta = PARK_SIZE_META;
 
-    // X pairs: two values per entry (X_L and X_R), each LPX2SIZE bits
-    header->park_bytes_x = cdiv(PARK_SIZE_X * LPX2SIZE * 2, 8);
+    // X pairs: two values per entry (X_L and X_R), each x2size bits
+    header->park_bytes_x = cdiv(PARK_SIZE_X * x2size * 2, 8);
     header->park_bytes_meta = cdiv(PARK_SIZE_META * ksize * N_META_OUT, 8);
     header->park_bytes_y = 4 + (uint32_t)std::ceil((PARK_SIZE_Y - 1) * MAX_AVG_YDELTA_BITS / 8.0);
     header->park_bytes_pd = cdiv(PARK_SIZE_PD * ksize, 8)
                           + (uint32_t)std::ceil(PARK_SIZE_PD * MAX_AVG_OFFSET_BITS / 8.0);
 
-    header->entry_bits_x = LPX2SIZE;
+    header->entry_bits_x = x2size;
     header->num_entries_y = num_entries;
 
     // Table offsets
@@ -304,11 +304,13 @@ void PlotWriter::encode_x_park(std::vector<uint8_t>& park,
     std::vector<uint64_t> bit_buf(max_bytes * 2 / sizeof(uint64_t) + 4, 0);
     uint64_t bit_offset = 0;
 
+    const uint32_t shift = ksize - xbits;  // bits to drop (compression)
+
     for(size_t i = start * 2; i < (start + count) * 2 && i < x_pairs.size(); i += 2) {
-        write_bits(bit_buf, x_pairs[i], bit_offset, LPX2SIZE);
-        bit_offset += LPX2SIZE;
-        write_bits(bit_buf, x_pairs[i+1], bit_offset, LPX2SIZE);
-        bit_offset += LPX2SIZE;
+        write_bits(bit_buf, x_pairs[i] >> shift, bit_offset, x2size);
+        bit_offset += x2size;
+        write_bits(bit_buf, x_pairs[i+1] >> shift, bit_offset, x2size);
+        bit_offset += x2size;
     }
 
     uint64_t byte_count = (bit_offset + 7) / 8;

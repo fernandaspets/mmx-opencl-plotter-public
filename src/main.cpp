@@ -23,6 +23,7 @@ int main(int argc, char** argv) {
         std::cerr << "  --device N      GPU device index (default: 0)" << std::endl;
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for fast plotting" << std::endl;
         std::cerr << "  --no-meta       SSD mode (no metadata table, ~55% smaller)" << std::endl;
+        std::cerr << "  --clevel N      Compression level 0-15 (default: 0)" << std::endl;
         return 1;
     }
 
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
     std::string output_dir = "./";
     std::string ramdisk_dir;
     uint32_t ksize = 26;
+    uint32_t clevel = 0;  // compression level C0
     uint64_t limit = 0;
     int device_id = 0;
     bool has_meta = true;
@@ -42,6 +44,7 @@ int main(int argc, char** argv) {
         else if(arg == "--device" && i+1 < argc) device_id = std::stoi(argv[++i]);
         else if(arg == "--ramdisk" && i+1 < argc) ramdisk_dir = argv[++i];
         else if(arg == "--no-meta") has_meta = false;
+        else if(arg == "--clevel" && i+1 < argc) clevel = std::stoi(argv[++i]);
         else output_dir = arg;
     }
 
@@ -75,6 +78,7 @@ int main(int argc, char** argv) {
     std::cout << "  Plot ID: " << plot_id.to_string() << std::endl;
     std::cout << "  Farmer Key: " << farmer_key.to_string() << std::endl;
     std::cout << "  K-Size: " << ksize << std::endl;
+    std::cout << "  Compression: C" << clevel << " (xbits=" << (ksize - clevel) << ")" << std::endl;
     std::cout << "  Entries: " << num_x << " (2^" << ksize << ")" << std::endl;
     std::cout << "  Output: " << output_path << std::endl;
     std::cout << "  Mode: " << (has_meta ? "HDD" : "SSD") << std::endl;
@@ -123,8 +127,9 @@ int main(int argc, char** argv) {
     }
 
     // Write plot file
-    std::cout << "\n[Plot] Writing to " << output_path << "..." << std::endl;
-    mmx::PlotWriter writer(ksize, ksize, has_meta);
+    uint32_t xbits_val = ksize - clevel;  // bits kept = ksize - C
+    std::cout << "\n[Plot] Writing (C" << clevel << ", xbits=" << xbits_val << ")..." << std::endl;
+    mmx::PlotWriter writer(ksize, xbits_val, has_meta);
 
     uint8_t fk_raw[33];
     std::memset(fk_raw, 0, 33);
