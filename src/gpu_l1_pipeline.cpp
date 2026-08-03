@@ -156,16 +156,11 @@ bool run_gpu_l1_pipeline(GPUDevice& g,int ksize,uint32_t n,
             if(t==2){
                 std::vector<uint32_t> nbv(NL),nb2(NL);
                 clEnqueueReadBuffer(g.queue,NB,CL_TRUE,0,NL*4,nbv.data(),0,0,0);
-                // Also check C_out directly (first entry of bucket 0)
-                std::vector<uint32_t> co(14);
-                clEnqueueReadBuffer(g.queue,aCO,CL_TRUE,0,14*4,co.data(),0,0,0);
-                uint32_t ychk=0;
-                for(int di=0;di<14;di++){std::cout<<co[di]<<" ";ychk^=co[di];}
-                std::cout<<" | Y="<<(ychk&KM)<<"\n";
-                uint32_t bmax=0,bmaxi=0,sum=0,nz=0;
-                for(int di=0;di<NL;di++){if(nbv[di]>0)nz++;sum+=nbv[di];
-                    if(nbv[di]>bmax){bmax=nbv[di];bmaxi=di;}}
-                std::cout<<"[DBG] T2 NB: nz="<<nz<<" sum="<<sum<<" max="<<bmax<<" at "<<bmaxi<<" "<<(100.0*bmax/sum)<<"%\n";
+                std::vector<uint32_t> co5(5*N_META);
+                clEnqueueReadBuffer(g.queue,aCO,CL_TRUE,0,5*N_META*4,co5.data(),0,0,0);
+                std::cout<<"[DBG] NB[0]="<<nbv[0]<<" C_out[0..4]:";
+                for(int di=0;di<5;di++)std::cout<<co5[di*N_META]<<" ";
+                std::cout<<"\n";
             }
         }
 

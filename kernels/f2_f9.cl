@@ -454,91 +454,39 @@ __kernel void gather_meta(
     }
 }
 
-// Kernel: eval_p1_tx — hash pairs (SHA-512), scatter to new buckets, write PD
-// ============================================================================
-// Each work-item processes one match (LR pair).
-// Hashes the metadata of both entries, computes new Y, scatters to new bucket.
-
+// Kernel: eval_p1_tx — TRIVIAL test: write index to C_out and 1 to NB
 __kernel void eval_p1_tx(
-    __global uint* Y_out,              // may be NULL (pass 0)
-    __global uint* C_out,              // metadata output
-    __global ulong* PD_out,    // PD/X2 bit-packed output
-    __global uint* bucket_size, // new bucket sizes
-    __global const uint* C_in,         // input metadata
-    __global const uint* PD_in,        // input PD (from match_p1)
-    __global const uint* X_in,         // input X (for table 2, pass 0 otherwise)
-    __global const uint2* LR_in,       // match pairs
-    __global const uint* num_found,    // number of matches
-    const ulong PD_0,                  // base PD offset for this bucket
+    __global uint* Y_out,
+    __global uint* C_out,
+    __global ulong* PD_out,
+    __global uint* bucket_size,
+    __global const uint* C_in,
+    __global const uint* PD_in,
+    __global const uint* X_in,
+    __global const uint2* LR_in,
+    __global const uint* num_found,
+    const ulong PD_0,
     const uint max_bucket_size,
     const uint x2size_arg,
     const uint xbits_arg,
-    const uint table,                  // current table number (2..9)
-    const uint write_y,                // 1 if Y_out should be written
-    const uint write_c,                // 1 if C_out should be written
-    const uint has_pd_in,              // 1 if PD_in is valid (t >= 3)
-    const uint has_x_in                // 1 if X_in is valid (t == 2)
+    const uint table,
+    const uint write_y,
+    const uint write_c,
+    const uint has_pd_in,
+    const uint has_x_in
 )
 {
     const uint x = get_global_id(0);
     if (x >= num_found[0]) return;
 
-    const uint2 LR_i = LR_in[x];
-    const uint P_1 = LR_i.x;
-    const uint P_2 = LR_i.y;
-
-    ulong msg64[64] = {};
-    for (int i = 0; i < N_META; i++) {
-        msg64[i / 2] |= (ulong)C_in[P_1 * N_META + i] << ((i % 2) * 32);
-        msg64[(N_META + i) / 2] |= (ulong)C_in[P_2 * N_META + i] << (((N_META + i) % 2) * 32);
-    }
-    ulong hash[8] = {};
-    sha512(msg64, 2 * N_META * 4, hash);
-
-    // Extract new Y and metadata
-    // SHA-512 produces 8 uint64s = 16 uint32s. CUDA stores as uint32_t[16].
-    // We extract uint32s: even index = lower 32 of hash[i/2], odd = upper 32.
-    uint Y_new = 0;
-    for (int i = 0; i < N_META; i++) {
-        uint h32 = (i % 2 == 0) ? (uint)hash[i/2] : (uint)(hash[i/2] >> 32);
-        Y_new ^= h32;
-    }
-    Y_new &= KMASK;
-
-    const uint index = Y_new >> (KSIZE - LOGBUCKETS);
-    if ((index >> LOGBUCKETS) == 0) {
-        const uint pos = atomic_add((__global volatile uint*)(bucket_size + index), 1);
-        if (pos < max_bucket_size) {
-            const ulong j = (ulong)index * max_bucket_size + pos;
-
-            if (write_y && Y_out) {
-                Y_out[j] = Y_new;
-            }
-            if (write_c && C_out) {
-                if (table < N_TABLE) {
-                    for (int i = 0; i < N_META; i++) {
-                        uint h32 = (i % 2 == 0) ? (uint)hash[i/2] : (uint)(hash[i/2] >> 32);
-                        C_out[j * N_META + i] = h32 & KMASK;
-                    }
-                } else {
-                    for (int i = 0; i < N_META_OUT; i++) {
-                        uint h32 = (i % 2 == 0) ? (uint)hash[i/2] : (uint)(hash[i/2] >> 32);
-                        C_out[j * N_META_OUT + i] = h32 & KMASK;
-                    }
-                }
-            }
-            if (has_pd_in && PD_in) {
-                atomic_write_bits(PD_out, PD_0 + PD_in[x], j * PDSIZE, PDSIZE);
-            }
-            if (has_x_in && X_in) {
-                atomic_write_bits(PD_out, X_in[P_1] >> (KSIZE - xbits_arg), j * x2size_arg, XBITS);
-                atomic_write_bits(PD_out, X_in[P_2] >> (KSIZE - xbits_arg), j * x2size_arg + XBITS, XBITS);
-            }
-        }
+    // Trivial: write to C_out and NB to verify kernel executes
+    if (write_c && C_out) {
+        // Write entry index to first metadata slot
+        C_out[x * N_META + 0] = x;
+        // Write 1 to bucket 0 to verify NB gets updated
+        atomic_add((__global volatile uint*)(bucket_size + 0), 1);
     }
 }
-
-// ============================================================================
 // Kernel: write_pd — remap PD to sorted order (for final tables)
 // ============================================================================
 
