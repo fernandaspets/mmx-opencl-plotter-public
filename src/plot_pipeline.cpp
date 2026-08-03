@@ -551,7 +551,7 @@ TableTiming PlotPipeline::process_table(
         cl_mem LR_buf = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             n_matches * 2 * sizeof(uint32_t), LR_flat.data(), &err);
         GPUDevice::check(err, "LR_buf");
-        cl_mem Y_buf_lr = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY,
+        cl_mem Y_buf_lr = clCreateBuffer(gpu.context, CL_MEM_READ_WRITE,
             n_matches * sizeof(uint32_t), nullptr, &err);
         GPUDevice::check(err, "Y_buf_lr");
 
