@@ -108,6 +108,10 @@ private:
 
     // Kernels
     cl_kernel k_f1 = nullptr;
+    cl_kernel k_gen_mem = nullptr;
+    cl_kernel k_calc_memhash = nullptr;
+    cl_kernel k_scatter_f1 = nullptr;
+    bool f1_warp_loaded = false;
     cl_kernel k_table_hash = nullptr;
 
     // GPU buffers (reused)

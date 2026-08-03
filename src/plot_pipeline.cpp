@@ -41,6 +41,21 @@ void PlotPipeline::load_kernels() {
     // F1 kernel
     gpu.load_program_from_file("f1", find_kernel("f1.cl"));
     k_f1 = gpu.get_kernel("compute_f1_kernel");
+    // Try loading warp-parallel F1 kernels (3-kernel pipeline)
+    try {
+        k_gen_mem = gpu.get_kernel("gen_mem_array_v2_kernel");
+        k_scatter_f1 = gpu.get_kernel("scatter_f1_v2_kernel");
+        try {
+            k_calc_memhash = gpu.get_kernel("calc_mem_hash_warp_kernel");
+            std::cout << "[OCL] Using warp-parallel calc_mem_hash (32 threads/entry)" << std::endl;
+        } catch(...) {
+            k_calc_memhash = gpu.get_kernel("calc_mem_hash_v2_kernel");
+        }
+        f1_warp_loaded = true;
+        std::cout << "[OCL] Split F1 kernels loaded (3-kernel pipeline)" << std::endl;
+    } catch(...) {
+        std::cout << "[OCL] Split F1 kernels not found, using monolithic F1" << std::endl;
+    }
 
     // Table hash kernel
     gpu.load_program_from_file("table_hash", find_kernel("table_hash.cl"));
@@ -132,10 +147,82 @@ void PlotPipeline::compute_f1(
 {
     const uint32_t num_x = X_values.size();
     const uint32_t xbits = 0;  // C0: no compression
+    Y_out.resize(num_x);
+    M_out.resize(num_x * N_META);
 
+    // Use warp-parallel F1 when available (3 kernels, 32 threads/entry)
+    if(f1_warp_loaded && k_gen_mem && k_calc_memhash && k_scatter_f1) {
+        const uint32_t SUB_BATCH = 131072;
+        const uint32_t x_base = X_values[0];
+        const uint32_t num_iter = 256;
+
+        ensure_f1_buffers(SUB_BATCH);
+        cl_int err;
+        err = clEnqueueWriteBuffer(gpu.queue, f1_ID_buf, CL_FALSE, 0,
+            8 * sizeof(uint32_t), plot_id, 0, nullptr, nullptr);
+        GPUDevice::check(err, "write ID");
+
+        cl_mem mem_buf = clCreateBuffer(gpu.context, CL_MEM_READ_WRITE,
+            (size_t)SUB_BATCH * 1024 * sizeof(uint32_t), nullptr, &err);
+        GPUDevice::check(err, "mem_buf");
+        cl_mem key_buf = clCreateBuffer(gpu.context, CL_MEM_READ_WRITE,
+            (size_t)SUB_BATCH * 16 * sizeof(uint32_t), nullptr, &err);
+        GPUDevice::check(err, "key_buf");
+        cl_mem hash_buf = clCreateBuffer(gpu.context, CL_MEM_READ_WRITE,
+            (size_t)SUB_BATCH * 32 * sizeof(uint32_t), nullptr, &err);
+        GPUDevice::check(err, "hash_buf");
+
+        uint32_t num_subs = (num_x + SUB_BATCH - 1) / SUB_BATCH;
+        for(uint32_t sb = 0; sb < num_subs; sb++) {
+            uint32_t offset = sb * SUB_BATCH;
+            uint32_t count = std::min(SUB_BATCH, num_x - offset);
+            uint32_t sub_x_base = x_base + offset;
+
+            clSetKernelArg(k_gen_mem, 0, sizeof(cl_mem), &mem_buf);
+            clSetKernelArg(k_gen_mem, 1, sizeof(cl_mem), &key_buf);
+            clSetKernelArg(k_gen_mem, 2, sizeof(cl_mem), &f1_ID_buf);
+            clSetKernelArg(k_gen_mem, 3, sizeof(uint32_t), &count);
+            clSetKernelArg(k_gen_mem, 4, sizeof(uint32_t), &sub_x_base);
+            size_t gs = ((count + 255) / 256) * 256;
+            clEnqueueNDRangeKernel(gpu.queue, k_gen_mem, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+
+            size_t local = 128;
+            size_t global = ((count * 32 + local - 1) / local) * local;
+            clSetKernelArg(k_calc_memhash, 0, sizeof(cl_mem), &mem_buf);
+            clSetKernelArg(k_calc_memhash, 1, sizeof(cl_mem), &hash_buf);
+            clSetKernelArg(k_calc_memhash, 2, sizeof(uint32_t), &count);
+            clSetKernelArg(k_calc_memhash, 3, sizeof(uint32_t), &num_iter);
+            clEnqueueNDRangeKernel(gpu.queue, k_calc_memhash, 1, nullptr, &global, &local, 0, nullptr, nullptr);
+
+            uint32_t total = num_x;
+            clSetKernelArg(k_scatter_f1, 0, sizeof(cl_mem), &key_buf);
+            clSetKernelArg(k_scatter_f1, 1, sizeof(cl_mem), &hash_buf);
+            clSetKernelArg(k_scatter_f1, 2, sizeof(cl_mem), &f1_Y_buf);
+            clSetKernelArg(k_scatter_f1, 3, sizeof(cl_mem), &f1_M_buf);
+            clSetKernelArg(k_scatter_f1, 4, sizeof(uint32_t), &kmask);
+            clSetKernelArg(k_scatter_f1, 5, sizeof(uint32_t), &count);
+            clSetKernelArg(k_scatter_f1, 6, sizeof(uint32_t), &sub_x_base);
+            clSetKernelArg(k_scatter_f1, 7, sizeof(uint32_t), &total);
+            clEnqueueNDRangeKernel(gpu.queue, k_scatter_f1, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
+            gpu.finish();
+
+            err = clEnqueueReadBuffer(gpu.queue, f1_Y_buf, CL_TRUE, 0,
+                count * sizeof(uint32_t), Y_out.data() + offset, 0, nullptr, nullptr);
+            GPUDevice::check(err, "read Y sub");
+            err = clEnqueueReadBuffer(gpu.queue, f1_M_buf, CL_TRUE, 0,
+                count * N_META * sizeof(uint32_t), M_out.data() + offset * N_META, 0, nullptr, nullptr);
+            GPUDevice::check(err, "read M sub");
+        }
+
+        clReleaseMemObject(mem_buf);
+        clReleaseMemObject(key_buf);
+        clReleaseMemObject(hash_buf);
+        return;
+    }
+
+    // Monolithic F1 fallback
     ensure_f1_buffers(num_x);
 
-    // Upload X values and plot ID
     cl_int err;
     err = clEnqueueWriteBuffer(gpu.queue, f1_X_buf, CL_FALSE, 0,
                                num_x * sizeof(uint32_t), X_values.data(), 0, nullptr, nullptr);
@@ -144,7 +231,6 @@ void PlotPipeline::compute_f1(
                                8 * sizeof(uint32_t), plot_id, 0, nullptr, nullptr);
     GPUDevice::check(err, "write ID");
 
-    // Set kernel args
     clSetKernelArg(k_f1, 0, sizeof(cl_mem), &f1_X_buf);
     clSetKernelArg(k_f1, 1, sizeof(cl_mem), &f1_ID_buf);
     clSetKernelArg(k_f1, 2, sizeof(cl_mem), &f1_Y_buf);
@@ -153,23 +239,22 @@ void PlotPipeline::compute_f1(
     clSetKernelArg(k_f1, 5, sizeof(uint32_t), &xbits);
     clSetKernelArg(k_f1, 6, sizeof(uint32_t), &num_x);
 
-    // Launch
     size_t local = 64;
     size_t global = ((num_x + local - 1) / local) * local;
     err = clEnqueueNDRangeKernel(gpu.queue, k_f1, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
     GPUDevice::check(err, "enqueue f1");
     gpu.finish();
 
-    // Read back
-    Y_out.resize(num_x);
-    M_out.resize(num_x * N_META);
     err = clEnqueueReadBuffer(gpu.queue, f1_Y_buf, CL_TRUE, 0,
                               num_x * sizeof(uint32_t), Y_out.data(), 0, nullptr, nullptr);
     GPUDevice::check(err, "read Y");
+    gpu.finish();
+
     err = clEnqueueReadBuffer(gpu.queue, f1_M_buf, CL_TRUE, 0,
                               num_x * N_META * sizeof(uint32_t), M_out.data(), 0, nullptr, nullptr);
     GPUDevice::check(err, "read M");
 }
+
 
 // Parallel LSD radix sort for (Y, index) pairs by Y.
 // 8-bit radix, 4 passes for 32-bit Y (but ksize bits are significant).
