@@ -740,6 +740,32 @@ void PlotPipeline::run_full_pipeline(
         }
     }
 
+    // Try GPU L1 pipeline
+    {
+        if(use_gpu_resident) {
+            try {
+                std::vector<std::vector<PDEntry>> l1_pd;
+                std::vector<uint32_t> l1_xp;
+                std::vector<PlotEntry> l1_ent;
+                std::vector<uint32_t> l1_fy;
+                bool ok = run_gpu_l1_pipeline(gpu, ksize, num_x,
+                    M_flat, X_values, l1_ent, l1_fy, l1_pd, l1_xp);
+                if(ok) {
+                    result.table_entries.push_back(l1_ent);
+                    result.final_Y = l1_fy;
+                    for(auto& pt : l1_pd) if(!pt.empty()) result.pd_data.push_back(pt);
+                    for(size_t i = 1; i < l1_xp.size(); i += 2) {
+                        result.x_pairs.push_back(l1_xp[i-1]);
+                        result.x_pairs.push_back(l1_xp[i]);
+                    }
+                    return;
+                }
+            } catch(const std::exception& e) {
+                std::cout << "[L1] " << e.what() << std::endl;
+            }
+        }
+    }
+
     // F2-F9 (fallback)
     for(int t = 2; t <= N_TABLE; t++) {
         std::vector<PDEntry> table_pd;
