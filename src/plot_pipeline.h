@@ -70,6 +70,9 @@ public:
     // Initialize kernels
     void init();
 
+    // Expose table hash kernel for multi-GPU use
+    cl_kernel get_table_hash_kernel() { return k_table_hash; }
+
     // Compute F1 with batch X values
     void compute_f1(
         const std::vector<uint32_t>& X_values,
@@ -92,6 +95,10 @@ public:
         const std::vector<uint32_t>& X_values,
         const uint32_t* plot_id,
         PlotData& result);
+
+    // Public sort/match for multi-GPU distribution
+    void sort_entries_by_y(std::vector<PlotEntry>& entries);
+    std::vector<MatchPair> match_entries(const std::vector<PlotEntry>& entries);
 
 private:
     GPUDevice& gpu;
@@ -119,13 +126,6 @@ private:
     void ensure_f1_buffers(size_t num_x);
     void ensure_hash_buffers(size_t num_matches);
     void load_kernels();
-
-    // Sort entries by Y
-    void sort_entries_by_y(std::vector<PlotEntry>& entries);
-
-    // Match Y,Y+1 pairs
-    std::vector<MatchPair> match_entries(
-        const std::vector<PlotEntry>& entries);
 };
 
 } // namespace mmx
