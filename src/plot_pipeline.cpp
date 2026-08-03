@@ -740,6 +740,7 @@ void PlotPipeline::run_full_pipeline(
         }
     }
 
+    std::cerr << "[DBG] entering L1 block use_gpu_resident=" << use_gpu_resident << "\n";
     // GPU L1 pipeline v2 — global eval (NVIDIA tested)
     {
         if(use_gpu_resident) {
