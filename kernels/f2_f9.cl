@@ -428,6 +428,32 @@ __kernel void match_p1(
 }
 
 // ============================================================================
+
+// ============================================================================
+// Kernel: gather_meta — copy C_in[P1] and C_in[P2] to compact output buffer
+// Used as workaround for AMD driver bug with large-buffer random reads in eval
+// Output: meta[x * 2 * N_META + i] = C_in[LR.x * N_META + i] for i=0..N_META-1
+//         meta[x * 2 * N_META + N_META + i] = C_in[LR.y * N_META + i]
+// ============================================================================
+
+__kernel void gather_meta(
+    __global uint* meta_out,
+    __global const uint* C_in,
+    __global const uint2* LR_in,
+    __global const uint* num_found)
+{
+    const uint x = get_global_id(0);
+    if (x >= num_found[0]) return;
+    
+    const uint2 LR = LR_in[x];
+    for (int i = 0; i < N_META; i++) {
+        // Pack as TWO consecutive entries: left at 2*x, right at 2*x+1
+        // Then LR for eval will be (2*x, 2*x+1)
+        meta_out[(x * 2) * N_META + i] = C_in[LR.x * N_META + i];
+        meta_out[(x * 2 + 1) * N_META + i] = C_in[LR.y * N_META + i];
+    }
+}
+
 // Kernel: eval_p1_tx — hash pairs (SHA-512), scatter to new buckets, write PD
 // ============================================================================
 // Each work-item processes one match (LR pair).
@@ -461,13 +487,26 @@ __kernel void eval_p1_tx(
     const uint P_1 = LR_i.x;
     const uint P_2 = LR_i.y;
 
-    // Hash C_in[P_1] || C_in[P_2] using SHA-512
-    // Pack pairs of uint32 metadata into ulong64s (little-endian, matching CUDA reinterpret cast)
-    // Total message: 2 * N_META * 4 = 2 * N_META * 4 bytes
+    // AMD OpenCL driver workaround: load through local memory to prevent
+    // optimizer from merging/coalescing random global reads
+    // (Driver returns wrong data for large-buffer random reads, verified
+    //  by SHA-512 output having 98% concentration in one bucket vs CPU reference)
+    // 7168 uint32 = 28672 bytes LDS per work-group (within 48KB limit)
+    __local uint lr_buf[7168];
+    const uint lid = get_local_id(0);
+    const uint base = lid * 2 * N_META;
+    for (int i = 0; i < N_META; i++) {
+        lr_buf[base + i] = C_in[P_1 * N_META + i];
+        lr_buf[base + N_META + i] = C_in[P_2 * N_META + i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Now pack into msg64 from local memory (preventing optimizer from
+    // re-reading global memory with incorrect coalescing)
     ulong msg64[64] = {};
     for (int i = 0; i < N_META; i++) {
-        msg64[i / 2] |= (ulong)C_in[P_1 * N_META + i] << ((i % 2) * 32);
-        msg64[(N_META + i) / 2] |= (ulong)C_in[P_2 * N_META + i] << (((N_META + i) % 2) * 32);
+        msg64[i / 2] |= (ulong)lr_buf[base + i] << ((i % 2) * 32);
+        msg64[(N_META + i) / 2] |= (ulong)lr_buf[base + N_META + i] << (((N_META + i) % 2) * 32);
     }
     ulong hash[8] = {};
     sha512(msg64, 2 * N_META * 4, hash);

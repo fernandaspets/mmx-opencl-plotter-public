@@ -740,8 +740,7 @@ void PlotPipeline::run_full_pipeline(
         }
     }
 
-    // Try GPU L1 pipeline (experimental — disabled by default)
-    /*
+    // GPU L1 pipeline v2 — global eval (NVIDIA tested)
     {
         if(use_gpu_resident) {
             try {
@@ -759,6 +758,7 @@ void PlotPipeline::run_full_pipeline(
                         result.x_pairs.push_back(l1_xp[i-1]);
                         result.x_pairs.push_back(l1_xp[i]);
                     }
+                    std::cout << "[L1v2] Pipeline complete" << std::endl;
                     return;
                 }
             } catch(const std::exception& e) {
@@ -766,7 +766,6 @@ void PlotPipeline::run_full_pipeline(
             }
         }
     }
-    */
 
     // F2-F9 (fallback)
     for(int t = 2; t <= N_TABLE; t++) {
