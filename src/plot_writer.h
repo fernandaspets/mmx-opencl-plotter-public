@@ -34,7 +34,8 @@ public:
         const std::string& file_path,
         const uint8_t* plot_id_32,
         const uint8_t* farmer_key_33,
-        const PlotData& data);
+        const PlotData& data,
+        const uint8_t* contract_32 = nullptr);  // optional contract for NFT
 
 private:
     uint32_t ksize;

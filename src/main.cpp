@@ -5,6 +5,9 @@
 #include "plot_pipeline.h"
 #include "multi_pipeline.h"
 #include "plot_writer.h"
+#include "pid_derive.h"
+#include <mmx/addr_t.hpp>
+#include <vnx/vnx.h>
 #include <mmx/PlotHeader.hxx>
 #include <mmx/hash_t.hpp>
 #include <mmx/pubkey_t.hpp>
@@ -27,6 +30,9 @@ int main(int argc, char** argv) {
         std::cerr << "  --ramdisk DIR   Use tmpfs at DIR for fast plotting" << std::endl;
         std::cerr << "  --no-meta       SSD mode (no metadata table, ~55% smaller)" << std::endl;
         std::cerr << "  --clevel N      Compression level 0-15 (default: 0)" << std::endl;
+        std::cerr << "  --nft           NFT plot (requires --contract)" << std::endl;
+        std::cerr << "  --contract HEX  Contract address for NFT plot" << std::endl;
+        std::cerr << "  --derive        Derive plot_id from seed (arg1) + farmer_key (arg2)" << std::endl;
         return 1;
     }
 
@@ -40,6 +46,9 @@ int main(int argc, char** argv) {
     int device_id = 0;
     int num_gpus = 1;
     bool has_meta = true;
+    bool is_nft = false;
+    bool do_derive = false;
+    std::string contract_str;
 
     for(int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -50,6 +59,9 @@ int main(int argc, char** argv) {
         else if(arg == "--ramdisk" && i+1 < argc) ramdisk_dir = argv[++i];
         else if(arg == "--no-meta") has_meta = false;
         else if(arg == "--clevel" && i+1 < argc) clevel = std::stoi(argv[++i]);
+        else if(arg == "--nft") is_nft = true;
+        else if(arg == "--contract" && i+1 < argc) contract_str = argv[++i];
+        else if(arg == "--derive") do_derive = true;
         else output_dir = arg;
     }
 
@@ -58,12 +70,53 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Parse hex keys
+    // Parse keys: first arg is plot_id_hex (or seed_hex if --derive)
     mmx::hash_t plot_id;
     mmx::pubkey_t farmer_key;
+    mmx::addr_t contract_addr;
+    bool have_contract = false;
+    
     try {
-        plot_id.from_string(pid_str);
-        farmer_key.from_string(fk_str);
+        if(do_derive) {
+            // First arg is seed, derive plot_id from seed+farm+ksize
+            mmx::hash_t seed;
+            seed.from_string(pid_str);
+            farmer_key.from_string(fk_str);
+            
+            if(is_nft) {
+                if(contract_str.empty()) {
+                    std::cerr << "Error: NFT plot requires --contract <hex>" << std::endl;
+                    return 1;
+                }
+                // Parse contract as hex bytes → hash_t → addr_t
+                std::vector<uint8_t> raw = vnx::from_hex_string(contract_str);
+                if(raw.size() != 32) {
+                    std::cerr << "Error: contract must be 32 hex bytes (64 hex chars)" << std::endl;
+                    return 1;
+                }
+                std::array<uint8_t, 32> arr;
+                std::memcpy(arr.data(), raw.data(), 32);
+                contract_addr = mmx::addr_t(mmx::hash_t(arr));
+                have_contract = true;
+            }
+            
+            plot_id = mmx::derive_plot_id(seed, ksize, farmer_key, is_nft, 
+                have_contract ? std::optional<mmx::addr_t>(contract_addr) : std::nullopt);
+        } else {
+            plot_id.from_string(pid_str);
+            farmer_key.from_string(fk_str);
+            if(is_nft || !contract_str.empty()) {
+                std::vector<uint8_t> raw = vnx::from_hex_string(contract_str);
+                if(raw.size() != 32) {
+                    std::cerr << "Error: contract must be 32 hex bytes (64 hex chars)" << std::endl;
+                    return 1;
+                }
+                std::array<uint8_t, 32> arr;
+                std::memcpy(arr.data(), raw.data(), 32);
+                contract_addr = mmx::addr_t(mmx::hash_t(arr));
+                have_contract = true;
+            }
+        }
     } catch(const std::exception& e) {
         std::cerr << "Error parsing keys: " << e.what() << std::endl;
         return 1;
@@ -87,6 +140,8 @@ int main(int argc, char** argv) {
     std::cout << "  Entries: " << num_x << " (2^" << ksize << ")" << std::endl;
     std::cout << "  Output: " << output_path << std::endl;
     std::cout << "  Mode: " << (has_meta ? "HDD" : "SSD") << std::endl;
+    if(is_nft) std::cout << "  Type: NFT" << std::endl;
+    if(have_contract) std::cout << "  Contract: " << contract_addr.to_string() << std::endl;
 
     // GPU init
     std::unique_ptr<mmx::GPUManager> gpu_mgr;
@@ -162,7 +217,8 @@ int main(int argc, char** argv) {
         writer.write_file(output_path,
             (const uint8_t*)plot_id.data(),
             fk_raw,
-            result);
+            result,
+            have_contract ? (const uint8_t*)contract_addr.data() : nullptr);
     } catch(const std::exception& e) {
         std::cerr << "Write failed: " << e.what() << std::endl;
         return 1;

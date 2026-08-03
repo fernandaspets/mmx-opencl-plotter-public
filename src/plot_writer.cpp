@@ -82,7 +82,8 @@ void PlotWriter::write_file(
     const std::string& file_path,
     const uint8_t* plot_id_32,
     const uint8_t* farmer_key_33,
-    const PlotData& data)
+    const PlotData& data,
+    const uint8_t* contract_32)
 {
     // Sort final Y values for delta encoding
     std::vector<uint32_t> sorted_Y = data.final_Y;
@@ -105,6 +106,13 @@ void PlotWriter::write_file(
     
     std::vector<uint8_t> fk_vec(farmer_key_33, farmer_key_33 + 33);
     header->farmer_key = pubkey_t(fk_vec);
+    
+    // Store contract if provided (NFT plot)
+    if(contract_32) {
+        std::array<uint8_t, 32> contract_arr;
+        std::memcpy(contract_arr.data(), contract_32, 32);
+        header->contract = addr_t(hash_t(contract_arr));
+    }
 
     // First write: measure header size
     {
