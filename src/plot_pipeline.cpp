@@ -374,78 +374,92 @@ static void radix_sort_pairs(std::vector<std::pair<uint32_t, uint32_t>>& entries
 
 void PlotPipeline::sort_entries_by_y(std::vector<PlotEntry>& entries)
 {
-	const size_t n = entries.size();
+    const size_t n = entries.size();
     if(n < 2) return;
 
-    // Check if already sorted (skip for t>2 since entries are sorted by Y from previous match)
-    // Sample every 64th entry to check ordering
-    bool needs_sort = false;
-    for(size_t i = 64; i < n && !needs_sort; i += 64) {
-        if(entries[i].Y < entries[i-64].Y) needs_sort = true;
+    // Check if already sorted (sample every 64th entry)
+    bool sorted = true;
+    for(size_t i = 64; i < n && sorted; i += 64) {
+        if(entries[i].Y < entries[i-64].Y) sorted = false;
     }
-    if(!needs_sort && n > 256) return;
+    if(sorted && n > 256) return;
 
-    // 8-bit radix sort (bucket sort by top LOGBUCKETS bits of Y)
-    constexpr int LOGBUCKETS = 8;
-    const int shift = ksize - LOGBUCKETS;
-    const size_t num_buckets = 1u << LOGBUCKETS;
+    // 8-bit radix sort: scatter by top 8 bits, sort within buckets
+    constexpr int NB = 256;
+    const int shift = ksize - 8;
+    const size_t num_buckets = NB;
 
-    // Count per bucket
-    std::vector<uint32_t> bucket_counts(num_buckets, 0);
-    for(const auto& e : entries) {
-        uint32_t b = std::min(e.Y >> shift, (uint32_t)num_buckets - 1);
-        bucket_counts[b]++;
+    // Count per bucket (parallel)
+    std::vector<uint32_t> bc(NB, 0);
+    #pragma omp parallel for reduction(+:bc[:NB]) schedule(static)
+    for(size_t i = 0; i < n; i++) {
+        uint32_t b = std::min(entries[i].Y >> shift, (uint32_t)(NB - 1));
+        bc[b]++;
     }
 
     // Prefix sum
-    std::vector<uint32_t> bucket_offsets(num_buckets + 1, 0);
-    for(size_t i = 0; i < num_buckets; i++) {
-        bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
-    }
+    std::vector<uint32_t> bo(NB + 1, 0);
+    uint32_t sum = 0;
+    for(size_t i = 0; i < NB; i++) { bo[i] = sum; sum += bc[i]; }
+    bo[NB] = sum;
 
-    // Scatter into buckets (parallel with padded per-thread counters)
-    std::vector<PlotEntry> sorted(n);
+    // Scatter into buckets (parallel with padded per-thread offsets)
     const int nthr = omp_get_max_threads();
-    const int pad = 64 / sizeof(uint32_t);  // 64-byte cache line
-    std::vector<uint32_t> thr_pos(nthr * (num_buckets + pad), 0);
+    const int pad = 16;  // cache line padding in uint32s
+    std::vector<uint32_t> to(nthr * (NB + pad), 0);
     
     #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < n; i++) {
         int ti = omp_get_thread_num();
-        uint32_t b = std::min(entries[i].Y >> shift, (uint32_t)num_buckets - 1);
-        thr_pos[ti * (num_buckets + pad) + b]++;
+        uint32_t b = std::min(entries[i].Y >> shift, (uint32_t)(NB - 1));
+        to[ti * (NB + pad) + b]++;
     }
-    
-    // Prefix sum across threads
-    for(uint32_t b = 0; b < num_buckets; b++) {
-        uint32_t sum = bucket_offsets[b];
+    for(uint32_t b = 0; b < NB; b++) {
+        uint32_t base = bo[b];
         for(int t = 0; t < nthr; t++) {
-            uint32_t cnt = thr_pos[t * (num_buckets + pad) + b];
-            thr_pos[t * (num_buckets + pad) + b] = sum;
-            sum += cnt;
+            uint32_t c = to[t * (NB + pad) + b];
+            to[t * (NB + pad) + b] = base;
+            base += c;
         }
     }
-    
-    // Scatter using per-thread offsets
+
+    std::vector<PlotEntry> sorted(n);
     #pragma omp parallel for schedule(static)
     for(size_t i = 0; i < n; i++) {
         int ti = omp_get_thread_num();
-        uint32_t b = std::min(entries[i].Y >> shift, (uint32_t)num_buckets - 1);
-        uint32_t pos = thr_pos[ti * (num_buckets + pad) + b]++;
+        uint32_t b = std::min(entries[i].Y >> shift, (uint32_t)(NB - 1));
+        uint32_t pos = to[ti * (NB + pad) + b]++;
         sorted[pos] = entries[i];
     }
 
-    // Sort within each bucket (parallel)
-    #pragma omp parallel for schedule(dynamic, 8)
-    for(size_t b = 0; b < num_buckets; b++) {
-        uint32_t start = bucket_offsets[b];
-        uint32_t cnt = bucket_counts[b];
+    // Sort indices within each bucket (parallel, 8 bytes per pair instead of 64)
+    std::vector<uint32_t> idx(n);
+    std::iota(idx.begin(), idx.end(), 0u);
+    #pragma omp parallel for schedule(dynamic, 4)
+    for(size_t b = 0; b < NB; b++) {
+        uint32_t start = bo[b];
+        uint32_t cnt = bc[b];
         if(cnt > 1) {
-            std::sort(sorted.begin() + start, sorted.begin() + start + cnt,
-                [](const PlotEntry& a, const PlotEntry& b) {
-                    if(a.Y != b.Y) return a.Y < b.Y;
-                    return a.M < b.M;  // metadata as tiebreaker
-                });
+            std::sort(idx.begin() + start, idx.begin() + start + cnt,
+                [&](uint32_t a, uint32_t b) { return sorted[a].Y < sorted[b].Y; });
+        }
+    }
+    // Permute sorted entries using idx
+    for(size_t b = 0; b < NB; b++) {
+        uint32_t start = bo[b];
+        uint32_t cnt = bc[b];
+        if(cnt > 1) {
+            // Apply permutation
+            for(uint32_t i = 0; i < cnt; i++) {
+                uint32_t j = idx[start + i];
+                while(j != start + i) {
+                    std::swap(sorted[start + i], sorted[j]);
+                    uint32_t next = idx[start + j - start];
+                    idx[start + j - start] = j;
+                    j = next;
+                }
+                idx[start + i] = j;
+            }
         }
     }
 
