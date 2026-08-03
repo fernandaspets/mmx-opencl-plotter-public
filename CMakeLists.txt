@@ -86,6 +86,11 @@ target_link_libraries(test_sha512_gpu PRIVATE ${OpenCL_LIBRARIES} ssl crypto)
 add_test(NAME test_sha512_gpu COMMAND test_sha512_gpu)
 set_target_properties(test_sha512_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_full_pipeline tests/test_full_pipeline.cpp ${GPU_SOURCES} src/plot_pipeline.cpp)
+target_link_libraries(test_full_pipeline PRIVATE ${OpenCL_LIBRARIES})
+add_test(NAME test_full_pipeline COMMAND test_full_pipeline)
+set_target_properties(test_full_pipeline PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_table_pipeline tests/test_table_pipeline.cpp ${GPU_SOURCES})
 target_link_libraries(test_table_pipeline PRIVATE ${OpenCL_LIBRARIES} ssl crypto)
 add_test(NAME test_table_pipeline COMMAND test_table_pipeline)
