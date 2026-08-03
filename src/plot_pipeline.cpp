@@ -524,25 +524,9 @@ TableTiming PlotPipeline::process_table(
 
     if(matches.empty()) return timing;
 
-    // Extract L_meta, R_meta for GPU hash
     const size_t n_matches = matches.size();
 
-    std::vector<uint32_t> L_meta(n_matches * N_META);
-    std::vector<uint32_t> R_meta(n_matches * N_META);
-
-    #pragma omp parallel for schedule(static)
-    for(size_t i = 0; i < n_matches; i++) {
-        const auto& m = matches[i];
-        const auto& entry_L = entries[m.first];
-        const auto& entry_R = entries[m.second];
-        for(int j = 0; j < N_META; j++) {
-            L_meta[i * N_META + j] = entry_L.M[j];
-            R_meta[i * N_META + j] = entry_R.M[j];
-        }
-    }
-
     auto t3 = std::chrono::high_resolution_clock::now();
-    timing.extract_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     // GPU hash — use hash_table_entries_lr when available (GPU-resident M_curr)
     ensure_hash_buffers(n_matches);
@@ -560,6 +544,8 @@ TableTiming PlotPipeline::process_table(
             LR_flat[i * 2]     = entries[m.first].orig_idx;
             LR_flat[i * 2 + 1] = entries[m.second].orig_idx;
         }
+        auto t_ext = std::chrono::high_resolution_clock::now();
+        timing.extract_ms = std::chrono::duration<double, std::milli>(t_ext - t3).count();
 
         // Upload LR pairs (2 uint32s per match vs 28 for L_meta + 28 for R_meta)
         cl_mem LR_buf = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -585,29 +571,33 @@ TableTiming PlotPipeline::process_table(
         GPUDevice::check(err, "enqueue hash_lr");
         gpu.finish();
 
-        // Download Y_out + M_out for entry population
-        M_out.resize(n_matches * N_META);
+        // Download Y_out only — M_out stays on GPU
+        M_out.clear();  // signal legacy path: avoid M_out download
         err = clEnqueueReadBuffer(gpu.queue, Y_buf_lr, CL_TRUE, 0,
             n_matches * sizeof(uint32_t), Y_out.data(), 0, nullptr, nullptr);
         GPUDevice::check(err, "read Y_lr");
-        err = clEnqueueReadBuffer(gpu.queue, M_out_gpu, CL_TRUE, 0,
-            n_matches * N_META * sizeof(uint32_t), M_out.data(), 0, nullptr, nullptr);
-        GPUDevice::check(err, "read M_lr");
 
         clReleaseMemObject(LR_buf);
         clReleaseMemObject(Y_buf_lr);
 
-        // Ensure M_out_gpu capacity for next table — realloc both if needed
-        if(n_matches > gpu_resident_capacity) {
-            ensure_gpu_resident_buffers(n_matches * 12 / 10);
-            clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
-                n_matches * N_META * sizeof(uint32_t), M_out.data(), 0, nullptr, nullptr);
-        } else {
-            // Swap M buffers (M_out → M_curr) — regular case
-            std::swap(M_curr_gpu, M_out_gpu);
-        }
+        // Swap M buffers (M_out → M_curr) — no data copy!
+        std::swap(M_curr_gpu, M_out_gpu);
     } else {
         // Legacy path: extract L_meta/R_meta on CPU, upload to GPU
+        std::vector<uint32_t> L_meta(n_matches * N_META);
+        std::vector<uint32_t> R_meta(n_matches * N_META);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            const auto& m = matches[i];
+            const auto& entry_L = entries[m.first];
+            const auto& entry_R = entries[m.second];
+            for(int j = 0; j < N_META; j++) {
+                L_meta[i * N_META + j] = entry_L.M[j];
+                R_meta[i * N_META + j] = entry_R.M[j];
+            }
+        }
+        auto t_ext = std::chrono::high_resolution_clock::now();
+        timing.extract_ms = std::chrono::duration<double, std::milli>(t_ext - t3).count();
         err = clEnqueueWriteBuffer(gpu.queue, hash_L_buf, CL_FALSE, 0,
                                    n_matches * N_META * sizeof(uint32_t), L_meta.data(), 0, nullptr, nullptr);
         GPUDevice::check(err, "write L");
@@ -651,14 +641,24 @@ TableTiming PlotPipeline::process_table(
         }
     }
 
-    // Build next table entries with original indices
+    // Build next table entries — Y + orig_idx only (M on GPU or downloaded here)
     entries.resize(n_matches);
-    #pragma omp parallel for schedule(static)
-    for(size_t i = 0; i < n_matches; i++) {
-        entries[i].Y = Y_out[i];
-        entries[i].orig_idx = (uint32_t)i;  // tracks position in this table's match list
-        for(int j = 0; j < N_META; j++) {
-            entries[i].M[j] = M_out[i * N_META + j];
+    if(!M_out.empty()) {
+        // Legacy path: M_out already downloaded, populate M
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            entries[i].Y = Y_out[i];
+            entries[i].orig_idx = (uint32_t)i;
+            for(int j = 0; j < N_META; j++) {
+                entries[i].M[j] = M_out[i * N_META + j];
+            }
+        }
+    } else {
+        // GPU-resident path: M stays on GPU, only Y + orig_idx
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n_matches; i++) {
+            entries[i].Y = Y_out[i];
+            entries[i].orig_idx = (uint32_t)i;
         }
     }
 
@@ -766,6 +766,20 @@ void PlotPipeline::run_full_pipeline(
     result.final_Y.resize(entries.size());
     for(size_t i = 0; i < entries.size(); i++) {
         result.final_Y[i] = entries[i].Y;
+    }
+
+    // Download final M from GPU for plot writer (GPU-resident path)
+    if(use_gpu_resident && M_curr_gpu && entries.size() > 0) {
+        size_t n = entries.size();
+        std::vector<uint32_t> M_final(n * N_META);
+        clEnqueueReadBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
+            n * N_META * sizeof(uint32_t), M_final.data(), 0, nullptr, nullptr);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n; i++) {
+            for(int j = 0; j < N_META; j++) {
+                entries[i].M[j] = M_final[i * N_META + j];
+            }
+        }
     }
 }
 

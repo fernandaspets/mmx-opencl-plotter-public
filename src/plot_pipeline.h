@@ -132,6 +132,9 @@ private:
     bool use_gpu_resident = false;
     int g_hash_local = 64;
     size_t gpu_resident_capacity = 0;
+    cl_kernel k_count_by_Y = nullptr;
+    cl_kernel k_scatter_by_Y = nullptr;
+    cl_kernel k_compute_offsets = nullptr;
 
     size_t f1_buf_size = 0;
     size_t hash_buf_size = 0;
