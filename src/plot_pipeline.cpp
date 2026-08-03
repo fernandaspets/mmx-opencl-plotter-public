@@ -1,4 +1,5 @@
 #include "plot_pipeline.h"
+#include <omp.h>
 #include <fstream>
 #include <cassert>
 
@@ -170,10 +171,75 @@ void PlotPipeline::compute_f1(
     GPUDevice::check(err, "read M");
 }
 
+// Parallel LSD radix sort for (Y, index) pairs by Y.
+// 8-bit radix, 4 passes for 32-bit Y (but ksize bits are significant).
+static void radix_sort_pairs(std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t ksize) {
+    const size_t n = entries.size();
+    if(n < 2) return;
+    const int passes = (ksize + 7) / 8;  // number of 8-bit radix passes
+    const int num_threads = omp_get_max_threads();
+    std::vector<std::pair<uint32_t, uint32_t>> temp(n);
+    for(int pass = 0; pass < passes; pass++) {
+        const int shift = pass * 8;
+        const uint32_t mask = 0xFF;
+        // Count per digit
+        std::vector<uint32_t> counts(256 * num_threads, 0);
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n; i++) {
+            int ti = omp_get_thread_num();
+            uint32_t digit = (entries[i].first >> shift) & mask;
+            counts[ti * 256 + digit]++;
+        }
+        // Prefix sum
+        for(int ti = 0; ti < num_threads; ti++) {
+            uint32_t sum = 0;
+            for(int d = 0; d < 256; d++) {
+                uint32_t c = counts[ti * 256 + d];
+                counts[ti * 256 + d] = sum;
+                sum += c;
+            }
+        }
+        std::vector<uint32_t> base(256, 0);
+        for(int d = 0; d < 256; d++) {
+            for(int ti = 0; ti < num_threads; ti++) {
+                base[d] += counts[ti * 256 + d];
+            }
+        }
+        uint32_t total = 0;
+        for(int d = 0; d < 256; d++) {
+            uint32_t c = base[d];
+            base[d] = total;
+            total += c;
+        }
+        for(int ti = 0; ti < num_threads; ti++) {
+            for(int d = 0; d < 256; d++) {
+                counts[ti * 256 + d] += base[d];
+            }
+        }
+        // Scatter
+        #pragma omp parallel for schedule(static)
+        for(size_t i = 0; i < n; i++) {
+            int ti = omp_get_thread_num();
+            uint32_t digit = (entries[i].first >> shift) & mask;
+            uint32_t pos = counts[ti * 256 + digit]++;
+            temp[pos] = entries[i];
+        }
+        std::swap(entries, temp);
+    }
+}
+
 void PlotPipeline::sort_entries_by_y(std::vector<PlotEntry>& entries)
 {
 	const size_t n = entries.size();
     if(n < 2) return;
+
+    // Check if already sorted (skip for t>2 since entries are sorted by Y from previous match)
+    // Sample every 64th entry to check ordering
+    bool needs_sort = false;
+    for(size_t i = 64; i < n && !needs_sort; i += 64) {
+        if(entries[i].Y < entries[i-64].Y) needs_sort = true;
+    }
+    if(!needs_sort && n > 256) return;
 
     // 8-bit radix sort (bucket sort by top LOGBUCKETS bits of Y)
     constexpr int LOGBUCKETS = 8;
@@ -395,6 +461,10 @@ TableTiming PlotPipeline::process_table(
             entries[i].M[j] = M_out[i * N_META + j];
         }
     }
+
+    // Sort entries by Y so next table finds them pre-sorted (skip redundant sort)
+    // Only needed for non-bitmap path (matches are in hash order, not Y order)
+    sort_entries_by_y(entries);
 
     auto t5 = std::chrono::high_resolution_clock::now();
     timing.build_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
