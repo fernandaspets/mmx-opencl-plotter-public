@@ -140,14 +140,17 @@ static void radix_sort_pairs(std::vector<std::pair<uint32_t, uint32_t>>& entries
     if(n <= 1) return;
     
     const int nthreads = omp_get_max_threads();
-    const int num_passes = (ksize + 7) / 8;  // e.g. k26 → 4 passes
+    // Use 11-bit passes for fewer iterations (e.g. k25 → 3 passes instead of 4)
+    const int BITS_PER_PASS = 8;
+    const int num_passes = (ksize + BITS_PER_PASS - 1) / BITS_PER_PASS;
     
     std::vector<std::pair<uint32_t, uint32_t>> temp(n);
     
     for(int pass = 0; pass < num_passes; pass++) {
-        const uint32_t shift = pass * 8;
-        const uint32_t mask = (pass == num_passes - 1) ? ((1u << (ksize - shift)) - 1) : 0xFF;
-        const int num_bins = (pass == num_passes - 1) ? (1u << (ksize - shift)) : 256;
+        const uint32_t shift = pass * BITS_PER_PASS;
+        const uint32_t bits_this_pass = std::min((uint32_t)BITS_PER_PASS, ksize - shift);
+        const uint32_t mask = (1u << bits_this_pass) - 1;
+        const int num_bins = 1u << bits_this_pass;
         if(num_bins <= 0) break;
         
         // Per-thread histograms
@@ -2399,6 +2402,7 @@ void compute_full_pipeline(
         // else: M_curr_flat stays stale. Final step will download from GPU.
         
         // Build matches vector (Y, index into M_next) — parallel
+        auto t_post_hash = my_time_ms();
         std::vector<std::pair<uint32_t, uint32_t>> matches(total_matches);
         #pragma omp parallel for schedule(static)
         for(size_t i = 0; i < total_matches; i++) {
@@ -2427,7 +2431,8 @@ void compute_full_pipeline(
                 total_matches * MY_N_META * sizeof(uint32_t), M_curr_flat.data(), 0, nullptr, nullptr);
         }
         // Sort matches by Y
-                if(use_gpu_sort && gpu_plotter.k_bucket_count) {
+        auto t_pre_sort = my_time_ms();
+        if(use_gpu_sort && gpu_plotter.k_bucket_count) {
             std::vector<uint32_t> Y_arr(matches.size());
             std::vector<uint32_t> val_arr(matches.size());
             #pragma omp parallel for schedule(static)
@@ -2443,7 +2448,6 @@ void compute_full_pipeline(
         } else {
             radix_sort_pairs(matches, KSIZE);
         }
-        auto t_sort_start = my_time_ms();
         auto t_sort_end = my_time_ms();
         // Build entries_map[t] + PD[t] in single pass
         entries_map[t] = std::vector<uint32_t>(matches.size());
@@ -2458,7 +2462,7 @@ void compute_full_pipeline(
             plot.PD[t][k] = {sorted_L, sorted_R - sorted_L};
         }
         auto t_pd_end = my_time_ms();
-        if(t == 4) std::cerr << "[T" << t << "] sort_matches=" << (t_sort_end - t_sort_start) << "ms build_pd=" << (t_pd_end - t_sort_end) << "ms" << std::flush;
+        if(t == 4) std::cerr << "[T" << t << "] post_hash=" << (t_pre_sort - t_post_hash) << "ms sort=" << (t_sort_end - t_pre_sort) << "ms build_pd=" << (t_pd_end - t_sort_end) << "ms" << std::flush;
         std::cerr << "[Debug] PD[" << t << "] saved with " << plot.PD[t].size() << " entries (sorted order)" << std::flush;
         // entries already sorted — next table iteration skips the sort
         entries = std::move(matches);
