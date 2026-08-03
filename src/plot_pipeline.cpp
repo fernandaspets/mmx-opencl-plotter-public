@@ -140,8 +140,40 @@ bool PlotPipeline::init_hash_lr_kernel() {
     use_gpu_resident = true;
     char vendor[256] = {};
     clGetDeviceInfo(gpu.device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, nullptr);
-    g_hash_local = (strstr(vendor, "NVIDIA") != nullptr) ? 64 : 256;
+    bool is_nvidia = (strstr(vendor, "NVIDIA") != nullptr);
+    g_hash_local = is_nvidia ? 64 : 256;
+    // Also parse OpenCL version — NVIDIA OpenCL 1.2 may not support global atomics in our kernel
     std::cout << "[OCL] GPU-resident M_curr: hash_table_entries_lr (local=" << g_hash_local << ")" << std::endl;
+    
+    // Test the kernel with a tiny invocation to verify it works
+    ensure_gpu_resident_buffers(64);
+    cl_mem test_LR = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY, 4*sizeof(uint32_t), nullptr, nullptr);
+    cl_mem test_Y = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY, 2*sizeof(uint32_t), nullptr, nullptr);
+    uint32_t test_mask = 0x3F;
+    uint32_t test_nmatch = 2;
+    uint32_t test_ntotal = 64;
+    clSetKernelArg(k_table_hash_lr, 0, sizeof(cl_mem), &M_curr_gpu);
+    clSetKernelArg(k_table_hash_lr, 1, sizeof(cl_mem), &test_LR);
+    clSetKernelArg(k_table_hash_lr, 2, sizeof(cl_mem), &test_Y);
+    clSetKernelArg(k_table_hash_lr, 3, sizeof(cl_mem), &M_out_gpu);
+    clSetKernelArg(k_table_hash_lr, 4, sizeof(uint32_t), &test_mask);
+    clSetKernelArg(k_table_hash_lr, 5, sizeof(uint32_t), &test_nmatch);
+    clSetKernelArg(k_table_hash_lr, 6, sizeof(uint32_t), &test_ntotal);
+    size_t local = (size_t)g_hash_local;
+    size_t global = 2;
+    cl_int err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash_lr, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
+    if(err != CL_SUCCESS) {
+        std::cout << "[OCL] hash_table_entries_lr failed test invocation (err=" << err << "), falling back to legacy" << std::endl;
+        use_gpu_resident = false;
+        k_table_hash_lr = nullptr;
+        clReleaseMemObject(test_LR);
+        clReleaseMemObject(test_Y);
+        return false;
+    }
+    gpu.finish();
+    clReleaseMemObject(test_LR);
+    clReleaseMemObject(test_Y);
+    std::cout << "[OCL] hash_table_entries_lr verified OK" << std::endl;
     return true;
 }
 
