@@ -150,7 +150,12 @@ bool PlotPipeline::init_hash_lr_kernel() {
     
     // Test the kernel with a tiny invocation to verify it works
     ensure_gpu_resident_buffers(64);
-    cl_mem test_LR = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY, 4*sizeof(uint32_t), nullptr, nullptr);
+    // Write test metadata to M_curr_gpu (avoids AMD driver crash on uninitialized buffer reads)
+    std::vector<uint32_t> test_meta(64 * N_META, 0);
+    for(int i = 0; i < 64 * N_META; i++) test_meta[i] = (uint32_t)(i * 2654435761u);
+    clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0, 64 * N_META * sizeof(uint32_t), test_meta.data(), 0, nullptr, nullptr);
+    uint32_t test_lr_data[4] = {0, 1, 2, 3};
+    cl_mem test_LR = clCreateBuffer(gpu.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 4*sizeof(uint32_t), test_lr_data, nullptr);
     cl_mem test_Y = clCreateBuffer(gpu.context, CL_MEM_WRITE_ONLY, 2*sizeof(uint32_t), nullptr, nullptr);
     uint32_t test_mask = 0x3F;
     uint32_t test_nmatch = 2;
@@ -574,7 +579,11 @@ TableTiming PlotPipeline::process_table(
             if(gpu_ok) std::cout << "[GPU-Res] hash enabled (NVIDIA)" << std::endl;
             else std::cout << "[GPU-Res] hash disabled (AMD driver large-buffer bug)" << std::endl;
         }
-        if(!gpu_ok) use_gpu_lr = false;
+        if(!gpu_ok) { use_gpu_lr = false; }
+        else {
+            // Ensure buffers have enough capacity for this table (entries grow)
+            ensure_gpu_resident_buffers(std::max(entries.size(), n_matches));
+        }
     }
     if(use_gpu_lr) {
         // Ensure buffers have enough capacity for this table (entries grow)<
