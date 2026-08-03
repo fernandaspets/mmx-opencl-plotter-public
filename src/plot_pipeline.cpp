@@ -744,14 +744,16 @@ void PlotPipeline::run_full_pipeline(
 
     result.table_entries.push_back(entries);
 
-    // Initialize GPU-resident hash if available
+    // Initialize GPU-resident hash if available and upload F1 metadata
     if(!use_gpu_resident) {
         init_hash_lr_kernel();
-        if(false) { // L1 pipeline disabled — fallback is faster
-            ensure_gpu_resident_buffers(num_x);
-            clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
-                num_x * N_META * sizeof(uint32_t), M_flat.data(), 0, nullptr, nullptr);
-        }
+    }
+    if(use_gpu_resident && M_curr_gpu && k_table_hash_lr) {
+        // Allocate buffers for the actual data size and upload F1 metadata
+        ensure_gpu_resident_buffers(num_x);
+        clEnqueueWriteBuffer(gpu.queue, M_curr_gpu, CL_TRUE, 0,
+            num_x * N_META * sizeof(uint32_t), M_flat.data(), 0, nullptr, nullptr);
+        std::cout << "[GPU-Res] Uploaded F1 metadata to GPU: " << num_x << " entries" << std::endl;
     }
 
     std::cerr << "[DBG] entering L1 block use_gpu_resident=" << use_gpu_resident << "\n";
