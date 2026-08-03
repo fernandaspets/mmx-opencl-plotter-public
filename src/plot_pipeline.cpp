@@ -1,5 +1,8 @@
 #include "plot_pipeline.h"
 #include <omp.h>
+
+// GPU L1 pipeline (defined in gpu_l1_pipeline.cpp)
+namespace mmx { extern bool run_gpu_l1_pipeline(GPUDevice&, int, uint32_t, const std::vector<uint32_t>&, const std::vector<uint32_t>&, std::vector<PlotEntry>&, std::vector<uint32_t>&, std::vector<std::vector<PDEntry>>&, std::vector<uint32_t>&); }
 #include <fstream>
 #include <cassert>
 
@@ -713,7 +716,35 @@ void PlotPipeline::run_full_pipeline(
         }
     }
 
-    // F2-F9
+    // Try GPU L1-bucket pipeline (f2_f9 kernels)
+    bool l1_ok = false;
+    if(use_gpu_resident) {
+        try {
+            std::vector<std::vector<PDEntry>> l1_pd;
+            std::vector<uint32_t> l1_xp;
+            std::vector<PlotEntry> l1_entries;
+            std::vector<uint32_t> l1_fy;
+            l1_ok = run_gpu_l1_pipeline(gpu, ksize, num_x,
+                M_flat, X_values, l1_entries, l1_fy, l1_pd, l1_xp);
+            if(l1_ok) {
+                result.table_entries.push_back(l1_entries);
+                result.final_Y = l1_fy;
+                for(size_t ti = 2; ti < l1_pd.size(); ti++) {
+                    result.pd_data.push_back(l1_pd[ti]);
+                }
+                for(size_t i = 1; i < l1_xp.size(); i += 2) {
+                    result.x_pairs.push_back(l1_xp[i-1]);
+                    result.x_pairs.push_back(l1_xp[i]);
+                }
+                std::cout << "[L1] GPU pipeline complete" << std::endl;
+                return;
+            }
+        } catch(const std::exception& e) {
+            std::cout << "[L1] Error: " << e.what() << ", falling back" << std::endl;
+        }
+    }
+
+    // F2-F9 (fallback)
     for(int t = 2; t <= N_TABLE; t++) {
         std::vector<PDEntry> table_pd;
         

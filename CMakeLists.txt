@@ -69,7 +69,7 @@ set_target_properties(test_plot_codec PROPERTIES
 )
 
 # GPU device source (shared by GPU tests)
-set(GPU_SOURCES src/gpu_device.cpp)
+set(GPU_SOURCES src/gpu_device.cpp src/gpu_l1_pipeline.cpp)
 
 # F1 kernel test (requires GPU)
 add_executable(test_f1 tests/test_f1.cpp ${GPU_SOURCES})
