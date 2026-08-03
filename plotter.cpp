@@ -963,6 +963,7 @@ public:
     // Replaces CPU radix_sort_pairs — saves ~230ms/table for k25
     cl_kernel k_bucket_count = nullptr;
     cl_kernel k_bucket_scatter = nullptr;
+    cl_kernel k_compute_offsets = nullptr;
     cl_kernel k_match_sorted = nullptr;
     cl_program match_program = nullptr;
     cl_program bucket_sort_program = nullptr;
@@ -988,6 +989,7 @@ public:
         }
         k_bucket_count = clCreateKernel(bucket_sort_program, "count_by_Y", &err);
         k_bucket_scatter = clCreateKernel(bucket_sort_program, "scatter_by_Y", &err);
+        k_compute_offsets = clCreateKernel(bucket_sort_program, "compute_offsets", &err);
         std::cout << "[OCL] Bucket sort kernels loaded" << std::endl;
     }
     
@@ -1795,7 +1797,7 @@ void compute_gpu_bulk(
         // Zero counts and atomic_buf
         clEnqueueFillBuffer(gpu_plotter.queue, counts, &zero, 4, 0, (size_t)num_bins * 4, 0, nullptr, nullptr);
         clEnqueueFillBuffer(gpu_plotter.queue, atomic_buf, &zero, 4, 0, (size_t)num_bins * 4, 0, nullptr, nullptr);
-        clFinish(gpu_plotter.queue);
+        
                 
         // Count per Y
         clSetKernelArg(gpu_plotter.k_bucket_count, 0, sizeof(cl_mem), &Y_buf[0]);
@@ -1805,8 +1807,8 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_bucket_count, 4, sizeof(uint32_t), &num_bins);
         clSetKernelArg(gpu_plotter.k_bucket_count, 5, sizeof(uint32_t), &n_u32);
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_count, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
-        clFinish(gpu_plotter.queue);
-                
+        clFinish(gpu_plotter.queue);  // need count done before prefix sum read
+        
         // Prefix sum on CPU (2^K entries)
         std::vector<uint32_t> h_counts(num_bins);
         clEnqueueReadBuffer(gpu_plotter.queue, counts, CL_TRUE, 0, (size_t)num_bins * 4, h_counts.data(), 0, nullptr, nullptr);
@@ -1814,10 +1816,9 @@ void compute_gpu_bulk(
         uint32_t sum = 0;
         for(uint32_t b = 0; b < num_bins; b++) { h_offsets[b] = sum; sum += h_counts[b]; }
         clEnqueueWriteBuffer(gpu_plotter.queue, offsets, CL_FALSE, 0, (size_t)num_bins * 4, h_offsets.data(), 0, nullptr, nullptr);
-        clFinish(gpu_plotter.queue);
-                
+        
         // Scatter to sorted positions
-                clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[0]);
+        clSetKernelArg(gpu_plotter.k_bucket_scatter, 0, sizeof(cl_mem), &Y_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 1, sizeof(cl_mem), &pos_buf[0]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 2, sizeof(cl_mem), &Y_buf[1]);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 3, sizeof(cl_mem), &pos_buf[1]);
@@ -1826,10 +1827,10 @@ void compute_gpu_bulk(
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 6, sizeof(uint32_t), &kmask_u32);
         clSetKernelArg(gpu_plotter.k_bucket_scatter, 7, sizeof(uint32_t), &n_u32);
         clEnqueueNDRangeKernel(gpu_plotter.queue, gpu_plotter.k_bucket_scatter, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
-        clFinish(gpu_plotter.queue);
-                
+        clFinish(gpu_plotter.queue);  // need scatter done before match
         
         clReleaseMemObject(atomic_buf);
+        // Keep counts and offsets on GPU for match kernel (freed after match)
         // Keep counts and offsets on GPU for match kernel (freed after match)
         // Sorted data is in Y_buf[1], pos_buf[1]
         

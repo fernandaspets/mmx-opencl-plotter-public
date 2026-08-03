@@ -34,3 +34,29 @@ __kernel void scatter_by_Y(
     Y_out[global_pos] = Y_in[i];
     val_out[global_pos] = val_in[i];
 }
+
+// Compute offsets from sorted data: offsets[Y] = first position of Y in sorted array
+// Each work-item checks if it's the first entry with its Y value
+__kernel void compute_offsets(
+    __global const uint* Y_sorted,      // sorted Y values
+    __global uint* offsets,             // output: offset per Y (must be zeroed)
+    const uint kmask,
+    const uint count)
+{
+    const uint i = get_global_id(0);
+    if(i >= count) return;
+    
+    uint Y = Y_sorted[i] & kmask;
+    
+    // First entry always sets its offset
+    if(i == 0) {
+        offsets[Y] = 0;
+        return;
+    }
+    
+    // Check if this is the first entry with this Y value
+    uint prev_Y = Y_sorted[i - 1] & kmask;
+    if(Y != prev_Y) {
+        offsets[Y] = i;
+    }
+}
