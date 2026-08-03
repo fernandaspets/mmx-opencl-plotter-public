@@ -190,7 +190,8 @@ __kernel void scatter_2(
     __global const uint* Y_in,         // may be NULL (pass 0)
     __global const uint* C_in,
     const uint bucket_size_in,
-    const uint max_bucket_size_2)
+    const uint max_bucket_size_2,
+    const uint bucket_offset)          // global index offset for this bucket
 {
     const uint x = get_global_id(0);
     if (x >= bucket_size_in) return;
@@ -210,7 +211,7 @@ __kernel void scatter_2(
     const uint pos = atomic_add((__global volatile uint*)(bucket_size_out + index), 1);
     if (pos < max_bucket_size_2) {
         const uint j = index * max_bucket_size_2 + pos;
-        PY_out[j] = ((ulong)Y_i << (64 - KSIZE)) | (ulong)x;
+        PY_out[j] = ((ulong)Y_i << (64 - KSIZE)) | (ulong)(x + bucket_offset);
     }
 }
 
