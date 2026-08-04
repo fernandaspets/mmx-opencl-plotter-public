@@ -1,0 +1,3 @@
+/home/ubman/mmx-app/opencl-plotter/build_ocl2/CMakeFiles/mmx_opencl_plotter.dir
+/home/ubman/mmx-app/opencl-plotter/build_ocl2/CMakeFiles/edit_cache.dir
+/home/ubman/mmx-app/opencl-plotter/build_ocl2/CMakeFiles/rebuild_cache.dir

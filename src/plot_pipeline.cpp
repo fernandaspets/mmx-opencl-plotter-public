@@ -114,7 +114,7 @@ void PlotPipeline::ensure_hash_buffers(size_t num_matches) {
 }
 
 bool PlotPipeline::init_hash_lr_kernel() {
-    // Reload table_hash.cl to pick up hash_table_entries_lr kernel
+    // Reload table_hash.cl to pick up hash_table_lr kernel
     for(const auto& path : {"kernels/table_hash.cl", "../kernels/table_hash.cl", "../../kernels/table_hash.cl"}) {
         std::ifstream f(path);
         if(f.good()) {
@@ -123,9 +123,9 @@ bool PlotPipeline::init_hash_lr_kernel() {
                 gpu.load_program_from_file("table_hash", path);
                 // Re-create both kernels from reloaded program
                 k_table_hash = gpu.get_kernel("hash_table_entries");
-                k_table_hash_lr = gpu.get_kernel("hash_table_entries_lr");
+                k_table_hash_lr = gpu.get_kernel("hash_table_lr");
                 if(k_table_hash_lr) {
-                    std::cout << "[OCL] hash_table_entries_lr loaded successfully" << std::endl;
+                    std::cout << "[OCL] hash_table_lr loaded successfully" << std::endl;
                     break;
                 }
             } catch(const std::exception& e) {
@@ -135,7 +135,7 @@ bool PlotPipeline::init_hash_lr_kernel() {
         }
     }
     if(!k_table_hash_lr) {
-        std::cout << "[OCL] hash_table_entries_lr not available, using legacy hash" << std::endl;
+        std::cout << "[OCL] hash_table_lr not available, using legacy hash" << std::endl;
         return false;
     }
     use_gpu_resident = true;
@@ -144,7 +144,7 @@ bool PlotPipeline::init_hash_lr_kernel() {
     bool is_nvidia = (strstr(vendor, "NVIDIA") != nullptr);
     g_hash_local = is_nvidia ? 64 : 256;
     // Also parse OpenCL version — NVIDIA OpenCL 1.2 may not support global atomics in our kernel
-    std::cout << "[OCL] GPU-resident M_curr: hash_table_entries_lr (local=" << g_hash_local << ")" << std::endl;
+    std::cout << "[OCL] GPU-resident M_curr: hash_table_lr (local=" << g_hash_local << ")" << std::endl;
     
     // Test the kernel with a tiny invocation to verify it works
     ensure_gpu_resident_buffers(64);
@@ -169,7 +169,7 @@ bool PlotPipeline::init_hash_lr_kernel() {
     size_t global = 2;
     cl_int err = clEnqueueNDRangeKernel(gpu.queue, k_table_hash_lr, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
     if(err != CL_SUCCESS) {
-        std::cout << "[OCL] hash_table_entries_lr failed test invocation (err=" << err << "), falling back to legacy" << std::endl;
+        std::cout << "[OCL] hash_table_lr failed test invocation (err=" << err << "), falling back to legacy" << std::endl;
         use_gpu_resident = false;
         k_table_hash_lr = nullptr;
         clReleaseMemObject(test_LR);
@@ -179,7 +179,7 @@ bool PlotPipeline::init_hash_lr_kernel() {
     gpu.finish();
     clReleaseMemObject(test_LR);
     clReleaseMemObject(test_Y);
-    std::cout << "[OCL] hash_table_entries_lr verified OK" << std::endl;
+    std::cout << "[OCL] hash_table_lr verified OK" << std::endl;
     return true;
 }
 
@@ -577,7 +577,7 @@ TableTiming PlotPipeline::process_table(
 
     auto t3 = std::chrono::high_resolution_clock::now();
 
-    // GPU hash — use hash_table_entries_lr when available (GPU-resident M_curr)
+    // GPU hash — use hash_table_lr when available (GPU-resident M_curr)
     ensure_hash_buffers(n_matches);
 
     cl_int err;
@@ -798,7 +798,7 @@ void PlotPipeline::run_full_pipeline(
         init_hash_lr_kernel();
     }
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
-    bool gpu_resident = use_gpu_resident && k_table_hash_lr != nullptr;
+    bool gpu_resident = false; // disabled: AMD large-buffer corruption
     if(gpu_resident) {
         // Allocate 1.1x for growth (entries grow ~2% per table) — allocate ONCE, never resize
         // (resizing releases and recreates buffers, losing M_curr data)
