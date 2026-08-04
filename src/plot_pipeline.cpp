@@ -264,7 +264,8 @@ void PlotPipeline::compute_f1(
             clSetKernelArg(k_scatter_f1, 6, sizeof(uint32_t), &sub_x_base);
             clSetKernelArg(k_scatter_f1, 7, sizeof(uint32_t), &total);
             clEnqueueNDRangeKernel(gpu.queue, k_scatter_f1, 1, nullptr, &gs, nullptr, 0, nullptr, nullptr);
-            gpu.finish();
+            // No gpu.finish() here — in-order queue handles kernel deps.
+            // CL_TRUE on readback blocks until all kernels complete.
 
             err = clEnqueueReadBuffer(gpu.queue, f1_Y_buf, CL_TRUE, 0,
                 count * sizeof(uint32_t), Y_out.data() + offset, 0, nullptr, nullptr);
