@@ -798,7 +798,7 @@ void PlotPipeline::run_full_pipeline(
         init_hash_lr_kernel();
     }
     cl_mem M_curr_gpu = nullptr, M_out_gpu = nullptr;
-    bool gpu_resident = false; // disabled: AMD large-buffer corruption
+    bool gpu_resident = use_gpu_resident && k_table_hash_lr != nullptr;
     if(gpu_resident) {
         // Allocate 1.1x for growth (entries grow ~2% per table) — allocate ONCE, never resize
         // (resizing releases and recreates buffers, losing M_curr data)
